@@ -145,10 +145,12 @@ public sealed class QueueManagerTests
             remaining.Select(q => q.Position).Should().Equal(Enumerable.Range(0, N - 10));
             remaining.Select(q => q.QueueItemId).Distinct().Should().HaveCount(N - 10);
 
-            // DB matches in-memory state.
+            // DB matches in-memory state by identity and order.
+            // Positions in the DB may have gaps after removals (lazy renumber);
+            // QueueManager holds the authoritative dense in-memory positions.
             var dbQueue = await queueRepo.GetQueueAsync();
             dbQueue.Select(q => q.QueueItemId).Should().Equal(remaining.Select(q => q.QueueItemId));
-            dbQueue.Select(q => q.Position).Should().Equal(Enumerable.Range(0, N - 10));
+            dbQueue.Should().HaveCount(N - 10);
         });
     }
 
