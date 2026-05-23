@@ -31,8 +31,12 @@ RUN apt-get update \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Non-root user matching typical Unraid user UID/GID
-RUN useradd --system --create-home --uid 1000 earworm
+# Non-root user matching typical Unraid user UID/GID.
+# Ubuntu Noble base ships with a placeholder `ubuntu` user at UID 1000, so we
+# remove it first before creating our own at the same UID. The `|| true` keeps
+# the build going if Microsoft ever drops that default in a future image.
+RUN (userdel -r ubuntu 2>/dev/null || true) \
+ && useradd --system --create-home --uid 1000 earworm
 
 WORKDIR /app
 COPY --from=build /app/publish .
