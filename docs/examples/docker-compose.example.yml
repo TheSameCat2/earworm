@@ -49,11 +49,11 @@ services:
         max-file: "3"
 
   earworm:
-    # Replace YOUR_GITHUB_USERNAME with the actual owner of the published
-    # image. For production, pin to a specific version tag (e.g.
-    # ghcr.io/.../earworm:v1.0.0) for predictable upgrades. :latest is fine
-    # for casual self-hosting.
-    image: ghcr.io/YOUR_GITHUB_USERNAME/earworm:latest
+    # If you forked and republished to your own GHCR, swap the image owner
+    # below. For production, consider pinning to a specific version tag
+    # (e.g. ghcr.io/TheSameCat2/earworm:v1.0.0) for predictable upgrades.
+    # :latest is fine for casual self-hosting.
+    image: ghcr.io/TheSameCat2/earworm:latest
     container_name: earworm
     restart: unless-stopped
     depends_on:

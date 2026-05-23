@@ -32,26 +32,23 @@ You don't need to clone the repo. There's a pre-built image on GitHub Container 
 ```fish
 # 1. Pick the example that fits your setup
 #    Generic (any Linux host):
-curl -O https://raw.githubusercontent.com/YOURUSER/earworm/main/docs/examples/docker-compose.example.yml -o docker-compose.yml
+curl -O https://raw.githubusercontent.com/TheSameCat2/earworm/main/docs/examples/docker-compose.example.yml -o docker-compose.yml
 #    Unraid:
-# curl -O https://raw.githubusercontent.com/YOURUSER/earworm/main/docs/examples/docker-compose.unraid.yml -o docker-compose.yml
+# curl -O https://raw.githubusercontent.com/TheSameCat2/earworm/main/docs/examples/docker-compose.unraid.yml -o docker-compose.yml
 
 # 2. Set up secrets
-curl -O https://raw.githubusercontent.com/YOURUSER/earworm/main/.env.example -o .env
+curl -O https://raw.githubusercontent.com/TheSameCat2/earworm/main/.env.example -o .env
 $EDITOR .env
 
 # 3. Grab the two config files the bot + Lavalink need
 mkdir -p conf/lavalink
 curl -o conf/earworm.yaml \
-  https://raw.githubusercontent.com/YOURUSER/earworm/main/conf/earworm.example.yaml
+  https://raw.githubusercontent.com/TheSameCat2/earworm/main/conf/earworm.example.yaml
 curl -o conf/lavalink/application.yml \
-  https://raw.githubusercontent.com/YOURUSER/earworm/main/conf/lavalink/application.yml
+  https://raw.githubusercontent.com/TheSameCat2/earworm/main/conf/lavalink/application.yml
 $EDITOR conf/earworm.yaml   # set Discord.GuildId + Dj.Tts.VoiceId
 
-# 4. Edit docker-compose.yml: replace YOUR_GITHUB_USERNAME with the actual
-#    image owner (the user/org that publishes the image)
-
-# 5. Launch
+# 4. Launch
 docker compose up -d
 docker compose logs -f earworm
 ```

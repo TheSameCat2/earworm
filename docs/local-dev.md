@@ -12,7 +12,7 @@ Running earworm from source on your dev machine. The bot itself runs as a regula
 ## 1. Clone and build
 
 ```fish
-git clone https://github.com/YOURUSER/earworm.git
+git clone https://github.com/TheSameCat2/earworm.git
 cd earworm
 dotnet build src/Earworm/Earworm.csproj
 ```

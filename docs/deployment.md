@@ -51,7 +51,7 @@ sudo mkdir -p /mnt/user/appdata/earworm/{data,conf}
 sudo chown -R $USER:$USER /mnt/user/appdata/earworm
 
 # Clone the repo somewhere convenient (not necessarily the mount path).
-git clone https://github.com/YOURUSER/earworm.git
+git clone https://github.com/TheSameCat2/earworm.git
 cd earworm
 ```
 
@@ -84,12 +84,14 @@ The Lavalink plugin config (`conf/lavalink/application.yml`) is **mounted direct
 
 ## 3. Build (or pull) and launch
 
-If you're using the **pull-from-GHCR** path, edit your copy of `docker-compose.example.yml` (or `docker-compose.unraid.yml`) to replace `YOUR_GITHUB_USERNAME` in the image line with the actual owner, then:
+If you're using the **pull-from-GHCR** path with the upstream image:
 
 ```bash
 docker compose pull            # pulls the latest published image
 docker compose up -d
 ```
+
+If you forked and want to host your own build, update the `image:` line in your compose file to point at your own GHCR namespace before running `docker compose pull`.
 
 If you're **building from source**, use the root compose file:
 

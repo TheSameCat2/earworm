@@ -57,7 +57,7 @@ services:
         max-file: "3"
 
   earworm:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/earworm:latest
+    image: ghcr.io/TheSameCat2/earworm:latest
     container_name: earworm
     restart: unless-stopped
     depends_on:
