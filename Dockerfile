@@ -3,7 +3,7 @@
 # ------------------------------------------------------------
 # Build stage
 # ------------------------------------------------------------
-FROM mcr.microsoft.com/dotnet/sdk:10.0-bookworm-slim AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS build
 WORKDIR /src
 
 # Copy csproj first for layer-cache friendliness
@@ -20,7 +20,7 @@ RUN dotnet publish -c Release \
 # ------------------------------------------------------------
 # Runtime stage
 # ------------------------------------------------------------
-FROM mcr.microsoft.com/dotnet/aspnet:10.0-bookworm-slim AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble AS runtime
 
 # Only curl + ca-certs needed at runtime. Audio decoding and source
 # resolution (yt-dlp, ffmpeg) live entirely in the sibling Lavalink
