@@ -1,0 +1,26 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# .NET build artifacts
+bin/
+obj/
+*.user
+
+# Local data (sqlite, cache, backups)
+data/
+
+# Local config overrides — example file in conf/ is tracked
+conf/earworm.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Design docs (kept locally for reference, not published — see docs/architecture.md)
+*.docx
+
+# Test-run dump captures
+tests/**/dump*.txt

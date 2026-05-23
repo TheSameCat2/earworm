@@ -1,0 +1,80 @@
+# Build the bot's Docker image and publish to GitHub Container Registry (GHCR)
+# so users can `docker pull ghcr.io/<owner>/earworm:latest` without cloning.
+#
+# Triggers:
+#   - push to main → publish :latest + :main-<sha>
+#   - push of a vX.Y.Z tag → publish :X.Y.Z, :X.Y, :latest
+#   - pull_request → build only (don't push) as a smoke check
+#   - workflow_dispatch → manual rebuild
+#
+# One-time setup the repo owner needs to do AFTER the first successful push:
+#   1. Go to https://github.com/<owner>/<repo>/pkgs/container/<image>
+#   2. Package settings → Change visibility → Public
+#   (GHCR images default to private; without this, `docker pull` will require
+#   a GitHub PAT.)
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # PRs from forks can't write to GHCR (no secret access); only push from
+        # the main branch and tagged releases. PRs still build for validation.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=main-,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # amd64 covers x86 servers (Unraid, most VPSes); arm64 covers Pi 4/5,
+          # Apple Silicon Mac hosts, and Oracle ARM free tier. Drop arm64 here
+          # if build time becomes a problem.
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

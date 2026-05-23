@@ -1,0 +1,130 @@
+# ============================================================
+# earworm configuration — copy to earworm.yaml and edit
+#
+# NOTE on key style: PascalCase keys are required because
+# Microsoft.Extensions.Configuration's binder is case-insensitive
+# but doesn't transform snake_case → PascalCase. The C# config
+# record uses PascalCase, so the yaml must too. If you copy this
+# file and rename keys to snake_case, your overrides will silently
+# do nothing and the defaults will apply.
+# ============================================================
+
+Discord:
+  # The Discord guild (server) ID earworm runs in. Slash
+  # commands register here at startup for instant updates.
+  GuildId: "REQUIRED — your server ID"
+
+  # Optional: a channel to mirror "now playing" embeds into.
+  # If unset, no embed is posted.
+  NowPlayingChannelId: null
+
+Audio:
+  # Legacy keys from the pre-Lavalink era. Currently unused —
+  # audio quality is governed by Lavalink's application.yml.
+  # Kept here for forward compatibility.
+  BitrateKbps: 128
+  LoudnessLufs: -14.0
+  CrossfadeSeconds: 5
+  CrossfadeMinTrackSeconds: 15
+
+Queue:
+  # Maximum total tracks allowed in the queue. null = no cap.
+  LengthCap: null
+
+  # Maximum duration of a single queued track, in seconds.
+  # Tracks longer than this are rejected at queue time.
+  PerTrackLengthCapSeconds: null
+
+  # Maximum consecutive tracks a single user may have queued
+  # at once. Anti-spam.
+  PerRequesterContiguousCap: null
+
+Dj:
+  # Gemini model for text generation. Verify your API key has
+  # access — see docs/troubleshooting.md if you get a 404 here.
+  GeminiModel: "gemini-2.5-flash"
+
+  # Cadence: commentary fires at a random interval between
+  # 1 and MaxGapTracks. 1 = every track; larger = sparser.
+  MaxGapTracks: 4
+
+  # Persona prompt template. {track_metadata} is substituted
+  # with the upcoming track's title / artist.
+  PersonaPrompt: |
+    You are a casual west-coast radio DJ briefly introducing
+    the next track. Keep it under 30 words. Be warm and
+    upbeat but not over-the-top. Don't invent facts about
+    the song or artist — only state what's in the metadata.
+    Next track: {track_metadata}.
+
+  Tts:
+    # ElevenLabs voice ID. From your ElevenLabs voice library.
+    VoiceId: "REQUIRED — your chosen voice ID"
+
+    # ElevenLabs model. "turbo_v2_5" is fastest/cheapest;
+    # "eleven_multilingual_v2" is higher fidelity.
+    ModelId: "eleven_turbo_v2_5"
+
+    # Voice tuning knobs.
+    Stability: 0.5
+    SimilarityBoost: 0.75
+
+  # Where the bot writes rendered TTS .mp3 files before Lavalink
+  # fetches them. Files are deleted after playback.
+  TtsScratchDirectory: "./data/tts"
+
+  # URL Lavalink uses to fetch staged TTS files. Must be reachable
+  # from the Lavalink container, NOT the bot's perspective.
+  #   - Local dev (Lavalink in Docker, bot on host):
+  #     "http://host.docker.internal:8080", AND run Lavalink with
+  #     --add-host host.docker.internal:host-gateway.
+  #   - Docker compose: overridden by docker-compose.yml to
+  #     "http://earworm:8080" (the bot's service name).
+  TtsServeBaseUrl: "http://host.docker.internal:8080"
+
+Cache:
+  # Legacy from the pre-Lavalink era. Lavalink handles its own
+  # caching internally. Kept so EarwormConfig binding doesn't break.
+  Directory: "./data/cache"
+  SizeCapGb: 100
+
+Persistence:
+  # SQLite database path. In Docker: /data/earworm.db.
+  SqlitePath: "./data/earworm.db"
+
+  # How many history rows to keep. Oldest are pruned per-insert.
+  HistoryRetentionCount: 100
+
+  # Max N accepted by /history <N>. Defaults to 20 when omitted.
+  HistoryMaxN: 100
+
+  # Reserved for SQLite backup automation (not yet implemented).
+  BackupIntervalHours: 24
+  BackupRetentionCount: 7
+
+AutoBehavior:
+  # Seconds the bot waits after the voice channel goes empty
+  # before auto-disconnecting.
+  EmptyChannelGraceSeconds: 120
+
+  # Seconds the bot stays in voice with the queue empty
+  # before auto-disconnecting.
+  IdleDisconnectSeconds: 120
+
+Ops:
+  # HTTP port for /health, /metrics, /tts/{id}.
+  HttpPort: 8080
+
+  # Reserved — unused after Lavalink pivot.
+  MaxConcurrentDownloads: 2
+
+Lavalink:
+  # In docker-compose this is "lavalink" (the service name on
+  # the shared bridge). For local-dev against a Lavalink
+  # container exposed on the host loopback, use "localhost".
+  Host: "localhost"
+  Port: 2333
+
+  # CHANGE THIS FOR PRODUCTION. Must match LAVALINK_SERVER_PASSWORD
+  # on the Lavalink container.
+  Password: "youshallnotpass"

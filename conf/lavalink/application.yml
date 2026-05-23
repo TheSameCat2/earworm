@@ -1,0 +1,74 @@
+# Lavalink v4 configuration for earworm.
+#
+# Key facts about Lavalink v4:
+#   - YouTube is NOT enabled out of the box. We pull it via the youtube-source
+#     plugin (lavalink-devs/youtube-source on GitHub) and DISABLE Lavalink's
+#     legacy built-in YouTube source (lavaplayer's, which Google broke).
+#   - SoundCloud, Bandcamp, Twitch, Vimeo, and HTTP (for arbitrary audio URLs,
+#     including Discord message attachments) are built-in.
+#   - The "http" source is what lets us load Discord attachment audio
+#     files directly without any extra glue.
+
+server:
+  port: ${SERVER_PORT:2333}
+  address: ${SERVER_ADDRESS:0.0.0.0}
+
+plugins:
+  youtube:
+    enabled: true
+    # Currently-recommended client mix (May 2026). MUSIC handles YouTube Music
+    # links; ANDROID_VR is the least rate-limited path for general video
+    # playback; WEB + WEBEMBEDDED fall back for cases the mobile clients can't
+    # cover. ANDROID_TESTSUITE is deprecated upstream and dropped.
+    clients: ["MUSIC", "ANDROID_VR", "WEB", "WEBEMBEDDED"]
+
+lavalink:
+  plugins:
+    # youtube-source plugin replaces the legacy YouTube path. Plugin versions
+    # break when YouTube ships new player JS — keep this on a recent release
+    # and bump when you see "Must find sig function from script" errors.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"
+      snapshot: false
+  server:
+    password: "${LAVALINK_SERVER_PASSWORD}"
+    sources:
+      youtube: false           # disable the legacy lavaplayer YouTube source
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true               # needed for Discord attachment URLs
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: false
+      timescale: false
+      tremolo: false
+      vibrato: false
+      distortion: false
+      rotation: false
+      channelMix: false
+      lowPass: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: true
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO
+  request:
+    enabled: true
+  logback:
+    rollingpolicy:
+      max-file-size: 1GB
+      max-history: 30

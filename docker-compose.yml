@@ -1,0 +1,88 @@
+services:
+  lavalink:
+    # fredboat/lavalink:dev tracks the v4 development branch of Lavalink —
+    # current and actively maintained, with voice gateway v8 support that
+    # the in-process DSharpPlus.VoiceNext path never got.
+    image: fredboat/lavalink:dev
+    container_name: earworm-lavalink
+    restart: unless-stopped
+    environment:
+      _JAVA_OPTIONS: "-Xmx512M"
+      SERVER_PORT: 2333
+      SERVER_ADDRESS: 0.0.0.0
+      LAVALINK_SERVER_PASSWORD: "${LAVALINK_PASSWORD:?required}"
+    volumes:
+      # application.yml holds source plugin config (youtube, soundcloud, http)
+      # and Lavalink server tuning. Read-only mount.
+      - ./conf/lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      # Plugin jars are downloaded by Lavalink at startup if listed in
+      # application.yml; persist them so we don't re-download on every restart.
+      - earworm-lavalink-plugins:/opt/Lavalink/plugins
+    # Bot reaches Lavalink via the internal docker network on service name.
+    # No host port published — Lavalink is an internal-only dependency.
+    networks:
+      - earworm-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  earworm:
+    image: earworm:latest
+    container_name: earworm
+    restart: unless-stopped
+    depends_on:
+      - lavalink
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    environment:
+      EARWORM_DISCORD_BOT_TOKEN:  "${EARWORM_DISCORD_BOT_TOKEN:?required}"
+      EARWORM_GEMINI_API_KEY:     "${EARWORM_GEMINI_API_KEY:?required}"
+      EARWORM_ELEVENLABS_API_KEY: "${EARWORM_ELEVENLABS_API_KEY:?required}"
+      EARWORM_LOG_LEVEL:          "${EARWORM_LOG_LEVEL:-Warning}"
+      EARWORM_METRICS_ENABLED:    "${EARWORM_METRICS_ENABLED:-false}"
+      # Lavalink overrides — bot config defaults to "localhost" for dev; in
+      # compose we use the service name. Password matches what Lavalink reads
+      # from LAVALINK_PASSWORD above.
+      EARWORM_Lavalink__Host:     "lavalink"
+      EARWORM_Lavalink__Port:     "2333"
+      EARWORM_Lavalink__Password: "${LAVALINK_PASSWORD:?required}"
+      # In compose Lavalink reaches the bot at http://earworm:8080 via the
+      # shared docker network. host.docker.internal isn't needed.
+      EARWORM_Dj__TtsServeBaseUrl: "http://earworm:8080"
+      TZ:                         "${TZ:-UTC}"
+      DOTNET_RUNNING_IN_CONTAINER: "true"
+
+    volumes:
+      - /mnt/user/appdata/earworm/data:/data
+      - /mnt/user/appdata/earworm/conf:/app/conf:ro
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    networks:
+      - earworm-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+networks:
+  earworm-net:
+    driver: bridge
+
+volumes:
+  earworm-lavalink-plugins:

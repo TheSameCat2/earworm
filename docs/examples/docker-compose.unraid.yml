@@ -1,0 +1,111 @@
+# earworm — Docker Compose for Unraid hosting
+#
+# Tuned for Unraid's conventions:
+#   - Bind mounts under /mnt/user/appdata/earworm/ (the Unraid appdata share)
+#   - Health endpoint visible in Unraid's Docker UI via the HEALTHCHECK in the
+#     base image (configured in Dockerfile)
+#   - Log size caps so the container won't fill the cache drive
+#
+# Setup steps for Unraid:
+#   1. SSH or open a terminal on the Unraid host:
+#        mkdir -p /mnt/user/appdata/earworm/{data,conf}
+#        chown -R nobody:users /mnt/user/appdata/earworm
+#   2. Copy conf/earworm.example.yaml and conf/lavalink/application.yml from
+#      the GitHub repo into /mnt/user/appdata/earworm/conf/
+#   3. Rename earworm.example.yaml → earworm.yaml and fill in Discord.GuildId
+#      and Dj.Tts.VoiceId
+#   4. Stash this compose file somewhere on the array, e.g.
+#      /mnt/user/appdata/_compose/earworm/docker-compose.yml
+#   5. Create the matching .env in the same directory as this file:
+#        EARWORM_DISCORD_BOT_TOKEN=...
+#        EARWORM_GEMINI_API_KEY=...
+#        EARWORM_ELEVENLABS_API_KEY=...
+#        LAVALINK_PASSWORD=<a long random string>
+#   6. Install the Compose Manager plugin if you haven't already, add this
+#      file as a new stack, and start it.
+#
+# Or via terminal: `docker compose up -d` from this file's directory.
+#
+# Notes:
+#   - The lavalink plugin jar persists in a docker-managed volume
+#     (earworm-lavalink-plugins). It's regenerable if you nuke it — Lavalink
+#     re-downloads on startup.
+#   - The bot's /health endpoint is published to 127.0.0.1:8080 on the host.
+#     If you want to monitor from another machine on the LAN, change to
+#     "0.0.0.0:8080:8080" — but consider whether you actually want that
+#     exposed first.
+
+services:
+  lavalink:
+    image: fredboat/lavalink:dev
+    container_name: earworm-lavalink
+    restart: unless-stopped
+    environment:
+      _JAVA_OPTIONS: "-Xmx512M"
+      SERVER_PORT: 2333
+      SERVER_ADDRESS: 0.0.0.0
+      LAVALINK_SERVER_PASSWORD: "${LAVALINK_PASSWORD:?required}"
+    volumes:
+      - /mnt/user/appdata/earworm/conf/lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      - earworm-lavalink-plugins:/opt/Lavalink/plugins
+    networks:
+      - earworm-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  earworm:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/earworm:latest
+    container_name: earworm
+    restart: unless-stopped
+    depends_on:
+      - lavalink
+
+    environment:
+      EARWORM_DISCORD_BOT_TOKEN:    "${EARWORM_DISCORD_BOT_TOKEN:?required}"
+      EARWORM_GEMINI_API_KEY:       "${EARWORM_GEMINI_API_KEY:?required}"
+      EARWORM_ELEVENLABS_API_KEY:   "${EARWORM_ELEVENLABS_API_KEY:?required}"
+      EARWORM_LOG_LEVEL:            "${EARWORM_LOG_LEVEL:-Warning}"
+      EARWORM_METRICS_ENABLED:      "${EARWORM_METRICS_ENABLED:-false}"
+      EARWORM_Lavalink__Host:       "lavalink"
+      EARWORM_Lavalink__Port:       "2333"
+      EARWORM_Lavalink__Password:   "${LAVALINK_PASSWORD:?required}"
+      EARWORM_Dj__TtsServeBaseUrl:  "http://earworm:8080"
+      TZ:                           "${TZ:-America/Los_Angeles}"
+      DOTNET_RUNNING_IN_CONTAINER:  "true"
+
+    volumes:
+      # Unraid appdata conventions. Use Unraid's "Shares" UI to see disk usage.
+      - /mnt/user/appdata/earworm/data:/data
+      - /mnt/user/appdata/earworm/conf:/app/conf:ro
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    networks:
+      - earworm-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+networks:
+  earworm-net:
+    driver: bridge
+
+volumes:
+  # Docker-managed volume (lives under /var/lib/docker/volumes by default on
+  # Unraid). Holds Lavalink's downloaded plugin jars. Wipe if you want to
+  # force a clean plugin re-download — Lavalink will fetch them on next start.
+  earworm-lavalink-plugins:

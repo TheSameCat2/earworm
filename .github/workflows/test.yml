@@ -1,0 +1,32 @@
+# Build + run the test suite on every push and PR.
+# The CompositionRootTests in particular catches DI wiring bugs that would
+# otherwise crash the bot at startup, so failing here means we don't ship.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build (warnings as errors)
+        run: dotnet build src/Earworm/Earworm.csproj --no-restore --configuration Release -warnaserror
+
+      - name: Run tests
+        run: dotnet test --no-restore --configuration Release --verbosity normal

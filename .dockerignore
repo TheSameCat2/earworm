@@ -1,0 +1,10 @@
+# Ignore local build artifacts and IDE settings
+**/bin/
+**/obj/
+tests/
+.git/
+.idea/
+.vscode/
+*.user
+.env
+conf/earworm.yaml

@@ -1,0 +1,139 @@
+using System;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using DSharpPlus;
+using DSharpPlus.Entities;
+using DSharpPlus.EventArgs;
+using Earworm.Domain.Queue;
+using Earworm.Persistence.Repositories;
+
+namespace Earworm.Discord;
+
+public sealed class MessageListener : IDisposable
+{
+    private readonly DiscordClient _discordClient;
+    private readonly VoiceManager _voiceManager;
+    private readonly TrackQueuingService _trackQueuingService;
+    private readonly ISettingsRepository _settingsRepository;
+    private readonly ILogger<MessageListener> _logger;
+
+    public MessageListener(
+        DiscordClient discordClient,
+        VoiceManager voiceManager,
+        TrackQueuingService trackQueuingService,
+        ISettingsRepository settingsRepository,
+        ILogger<MessageListener> logger)
+    {
+        _discordClient = discordClient ?? throw new ArgumentNullException(nameof(discordClient));
+        _voiceManager = voiceManager ?? throw new ArgumentNullException(nameof(voiceManager));
+        _trackQueuingService = trackQueuingService ?? throw new ArgumentNullException(nameof(trackQueuingService));
+        _settingsRepository = settingsRepository ?? throw new ArgumentNullException(nameof(settingsRepository));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        _discordClient.MessageCreated += OnMessageCreatedAsync;
+    }
+
+    private Task OnMessageCreatedAsync(DiscordClient sender, MessageCreateEventArgs e)
+    {
+        if (e.Author.IsBot || e.Guild == null) return Task.CompletedTask;
+        if (!e.MentionedUsers.Any(u => u.Id == sender.CurrentUser.Id)) return Task.CompletedTask;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var member = await e.Guild.GetMemberAsync(e.Author.Id);
+                if (member == null) return;
+
+                var voiceChannel = member.VoiceState?.Channel;
+                if (voiceChannel == null)
+                {
+                    await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":x:"));
+                    await e.Message.RespondAsync("⚠️ You must be in a voice channel to queue music.");
+                    return;
+                }
+
+                // Extract query (strip bot mention).
+                var content = e.Message.Content;
+                var mentionPattern = $"<@!?{sender.CurrentUser.Id}>";
+                var query = Regex.Replace(content, mentionPattern, "").Trim();
+
+                // Prefer attachment URL if any audio file is attached. Lavalink can
+                // load Discord attachment URLs directly via the HTTP source.
+                var attachment = e.Message.Attachments.FirstOrDefault(a =>
+                    a.FileName.EndsWith(".mp3", StringComparison.OrdinalIgnoreCase) ||
+                    a.FileName.EndsWith(".m4a", StringComparison.OrdinalIgnoreCase) ||
+                    a.FileName.EndsWith(".ogg", StringComparison.OrdinalIgnoreCase) ||
+                    a.FileName.EndsWith(".wav", StringComparison.OrdinalIgnoreCase) ||
+                    a.FileName.EndsWith(".flac", StringComparison.OrdinalIgnoreCase));
+                if (attachment != null)
+                {
+                    query = attachment.Url;
+                }
+
+                if (string.IsNullOrWhiteSpace(query))
+                {
+                    await e.Message.RespondAsync("🎶 Hello! Mention me with a song name, YouTube/SoundCloud link, or upload an audio file to queue it.");
+                    return;
+                }
+
+                // Playlist gating (DJ only).
+                if (_trackQueuingService.IsPlaylistUrl(query))
+                {
+                    var djRoleId = await _settingsRepository.GetDjRoleIdAsync();
+                    bool isDj = member.Permissions.HasPermission(Permissions.Administrator)
+                        || (djRoleId.HasValue && member.Roles.Any(r => r.Id == djRoleId.Value));
+                    if (!isDj)
+                    {
+                        await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":x:"));
+                        await e.Message.RespondAsync("⚠️ Playlist queuing is restricted to DJs or Administrators.");
+                        return;
+                    }
+                }
+
+                await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":hourglass:"));
+
+                _logger.LogInformation("Resolving query/URL '{Query}' from user {User}", query, e.Author.Username);
+                await _trackQueuingService.ResolveAndQueueAsync(
+                    query,
+                    member.Id.ToString(),
+                    member.DisplayName,
+                    e.Guild.Id.ToString());
+
+                await e.Message.DeleteOwnReactionAsync(DiscordEmoji.FromName(sender, ":hourglass:"));
+                await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":white_check_mark:"));
+
+                // Auto-join voice if not connected.
+                var botChannelId = e.Guild.CurrentMember?.VoiceState?.Channel?.Id;
+                if (botChannelId == null)
+                {
+                    _logger.LogInformation("Bot not in voice; auto-joining {ChannelName}", voiceChannel.Name);
+                    await _voiceManager.JoinChannelAsync(voiceChannel);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error handling music request from message.");
+                try
+                {
+                    await e.Message.DeleteOwnReactionAsync(DiscordEmoji.FromName(sender, ":hourglass:"));
+                    await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":x:"));
+                    await e.Message.RespondAsync($"⚠️ Failed to queue song: {ex.Message}");
+                }
+                catch (Exception inner)
+                {
+                    _logger.LogError(inner, "Could not send failure reaction/response.");
+                }
+            }
+        });
+
+        return Task.CompletedTask;
+    }
+
+    public void Dispose()
+    {
+        _discordClient.MessageCreated -= OnMessageCreatedAsync;
+    }
+}

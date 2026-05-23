@@ -1,0 +1,112 @@
+# earworm — generic Docker Compose example
+#
+# This file is for hosting earworm on any Docker-capable Linux box using the
+# pre-built image from GitHub Container Registry. No need to clone the repo
+# or build anything yourself.
+#
+# Setup:
+#   1. Copy this file to a directory on your host, e.g. /opt/earworm/
+#   2. Copy conf/earworm.example.yaml and conf/lavalink/application.yml from
+#      the GitHub repo into a conf/ subdirectory next to this file
+#   3. Rename conf/earworm.example.yaml → conf/earworm.yaml and edit the two
+#      required values (Discord.GuildId, Dj.Tts.VoiceId)
+#   4. Create a .env file next to this compose file with these variables:
+#        EARWORM_DISCORD_BOT_TOKEN=...
+#        EARWORM_GEMINI_API_KEY=...
+#        EARWORM_ELEVENLABS_API_KEY=...
+#        LAVALINK_PASSWORD=<a long random string>
+#   5. docker compose up -d
+#
+# Expected directory layout:
+#   /opt/earworm/
+#   ├── docker-compose.yml       (this file)
+#   ├── .env                     (your secrets — do not commit anywhere)
+#   ├── conf/
+#   │   ├── earworm.yaml         (renamed from earworm.example.yaml)
+#   │   └── lavalink/
+#   │       └── application.yml
+#   └── data/                    (created automatically on first run)
+
+services:
+  lavalink:
+    image: fredboat/lavalink:dev
+    container_name: earworm-lavalink
+    restart: unless-stopped
+    environment:
+      _JAVA_OPTIONS: "-Xmx512M"
+      SERVER_PORT: 2333
+      SERVER_ADDRESS: 0.0.0.0
+      LAVALINK_SERVER_PASSWORD: "${LAVALINK_PASSWORD:?required}"
+    volumes:
+      - ./conf/lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      - earworm-lavalink-plugins:/opt/Lavalink/plugins
+    networks:
+      - earworm-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  earworm:
+    # Replace YOUR_GITHUB_USERNAME with the actual owner of the published
+    # image. For production, pin to a specific version tag (e.g.
+    # ghcr.io/.../earworm:v1.0.0) for predictable upgrades. :latest is fine
+    # for casual self-hosting.
+    image: ghcr.io/YOUR_GITHUB_USERNAME/earworm:latest
+    container_name: earworm
+    restart: unless-stopped
+    depends_on:
+      - lavalink
+
+    environment:
+      EARWORM_DISCORD_BOT_TOKEN:    "${EARWORM_DISCORD_BOT_TOKEN:?required}"
+      EARWORM_GEMINI_API_KEY:       "${EARWORM_GEMINI_API_KEY:?required}"
+      EARWORM_ELEVENLABS_API_KEY:   "${EARWORM_ELEVENLABS_API_KEY:?required}"
+      EARWORM_LOG_LEVEL:            "${EARWORM_LOG_LEVEL:-Warning}"
+      EARWORM_METRICS_ENABLED:      "${EARWORM_METRICS_ENABLED:-false}"
+      # Lavalink connection. Bot reaches the sibling container at the service
+      # name (lavalink) on the shared bridge network.
+      EARWORM_Lavalink__Host:       "lavalink"
+      EARWORM_Lavalink__Port:       "2333"
+      EARWORM_Lavalink__Password:   "${LAVALINK_PASSWORD:?required}"
+      # Lavalink fetches DJ TTS audio from the bot at this URL — also via
+      # service name, on the shared network.
+      EARWORM_Dj__TtsServeBaseUrl:  "http://earworm:8080"
+      TZ:                           "${TZ:-UTC}"
+      DOTNET_RUNNING_IN_CONTAINER:  "true"
+
+    volumes:
+      # Persistent state: SQLite db, TTS scratch dir.
+      - ./data:/data
+      # Read-only config mount. Edit earworm.yaml in conf/ and restart the
+      # bot for changes to take effect.
+      - ./conf:/app/conf:ro
+
+    ports:
+      # Health endpoint, bound to localhost-only on the host so curl works
+      # locally for monitoring but it isn't exposed to the LAN.
+      - "127.0.0.1:8080:8080"
+
+    networks:
+      - earworm-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+networks:
+  earworm-net:
+    driver: bridge
+
+volumes:
+  earworm-lavalink-plugins:
