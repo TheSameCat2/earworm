@@ -1,3 +1,5 @@
+![earworm — your community's soundtrack](docs/images/earworm-banner.jpg)
+
 # 🎧 earworm
 
 A Discord music bot with an AI DJ that actually talks. Drop YouTube links, mention the bot, queue a thousand tracks if you want — and every few songs a generated radio voice ducks in to introduce the next one. Built on Lavalink so the audio path is rock-solid even when Discord shuffles their voice gateway.
