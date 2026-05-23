@@ -33,6 +33,7 @@ public class PlayerEngine : IDisposable
     private readonly AudioTransitionController _transitions;
     private readonly EarwormConfig _config;
     private readonly ILogger<PlayerEngine> _logger;
+    private readonly ShutdownLifetime _shutdown;
 
     private readonly ulong _guildId;
     private readonly object _stateLock = new();
@@ -79,7 +80,8 @@ public class PlayerEngine : IDisposable
         IMetricsRepository metricsRepository,
         AudioTransitionController transitions,
         EarwormConfig config,
-        ILogger<PlayerEngine> logger)
+        ILogger<PlayerEngine> logger,
+        ShutdownLifetime shutdown)
     {
         _audioService = audioService;
         _queueManager = queueManager;
@@ -89,6 +91,7 @@ public class PlayerEngine : IDisposable
         _transitions = transitions;
         _config = config;
         _logger = logger;
+        _shutdown = shutdown;
 
         if (!ulong.TryParse(_config.Discord.GuildId, out _guildId))
         {
@@ -103,10 +106,13 @@ public class PlayerEngine : IDisposable
 
     private void OnTrackQueued(QueueItem item)
     {
+        var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
+
                 var player = await TryGetPlayerAsync();
                 if (player == null)
                 {
@@ -123,17 +129,22 @@ public class PlayerEngine : IDisposable
 
                 await PlayNextAsync(player);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown: swallow.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error handling TrackQueued event.");
             }
-        });
+        }, ct);
     }
 
     private Task OnLavalinkTrackEndedAsync(object sender, TrackEndedEventArgs e)
     {
         if (e.Player.GuildId != _guildId) return Task.CompletedTask;
 
+        var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
             try
@@ -185,11 +196,15 @@ public class PlayerEngine : IDisposable
                     }
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown: swallow.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in Lavalink TrackEnded handler.");
             }
-        });
+        }, ct);
 
         return Task.CompletedTask;
     }
@@ -220,7 +235,7 @@ public class PlayerEngine : IDisposable
             {
                 try
                 {
-                    preroll = await _preTrackHook(next, CancellationToken.None);
+                    preroll = await _preTrackHook(next, _shutdown.Token);
                 }
                 catch (Exception ex)
                 {

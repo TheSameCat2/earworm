@@ -9,6 +9,7 @@ using Lavalink4NET.Tracks;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
+using Earworm;
 using Earworm.Config;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
@@ -53,7 +54,8 @@ public sealed class PlayerEngineTests
             metricsRepo,
             transitions,
             config,
-            NullLogger<PlayerEngine>.Instance);
+            NullLogger<PlayerEngine>.Instance,
+            new ShutdownLifetime());
     }
 
     private static Task InvokePlayNextAsync(PlayerEngine engine, LavalinkPlayer? player)

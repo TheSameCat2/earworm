@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -79,6 +80,20 @@ public static class Program
         // the SQLite write channel and checkpoints WAL on Dispose.
         await using var serviceProvider = services.BuildServiceProvider();
         var logger = serviceProvider.GetRequiredService<ILogger<object>>();
+        var shutdownLifetime = serviceProvider.GetRequiredService<ShutdownLifetime>();
+
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            logger.LogCritical(e.Exception, "Unobserved task exception (secondary fault in fire-and-forget work).");
+            e.SetObserved();
+        };
+
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            var ex = e.ExceptionObject as Exception;
+            logger.LogCritical(ex, "Unhandled AppDomain exception. IsTerminating={Terminating}", e.IsTerminating);
+        };
+
         var client = serviceProvider.GetRequiredService<DiscordClient>();
 
         // Slash commands. UseSlashCommands accepts a ServiceProvider; command
@@ -111,7 +126,15 @@ public static class Program
             Environment.Exit(1);
         }
 
-        await serviceProvider.GetRequiredService<QueueManager>().InitializeAsync();
+        try
+        {
+            await serviceProvider.GetRequiredService<QueueManager>().InitializeAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(ex, "Queue initialization failed. Shutting down.");
+            Environment.Exit(1);
+        }
 
         // Wire DJ commentary hook into PlayerEngine (avoids ctor-cycle DI).
         var djEngine = serviceProvider.GetRequiredService<DJEngine>();
@@ -170,6 +193,7 @@ public static class Program
         {
             e.Cancel = true;
             logger.LogInformation("Shutdown requested (SIGINT).");
+            shutdownLifetime.Cancel();
             tcs.TrySetResult();
         };
         // Docker `stop` sends SIGTERM, not SIGINT. Without this handler the
@@ -180,6 +204,7 @@ public static class Program
         {
             ctx.Cancel = true;
             logger.LogInformation("Shutdown requested (SIGTERM).");
+            shutdownLifetime.Cancel();
             tcs.TrySetResult();
         });
 
@@ -202,6 +227,7 @@ public static class Program
     public static void ConfigureServices(IServiceCollection services, EarwormConfig config, string botToken)
     {
         services.AddSingleton(config);
+        services.AddSingleton<ShutdownLifetime>();
 
         services.AddLogging(builder =>
         {
