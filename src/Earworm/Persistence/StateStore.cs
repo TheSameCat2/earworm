@@ -16,6 +16,7 @@ public sealed class StateStore : IDisposable
     private readonly Channel<IWriteJob> _writeChannel;
     private readonly Task _writeWorkerTask;
     private readonly CancellationTokenSource _cts = new();
+    private IWriteJob? _currentJob;
 
     public string ConnectionString => _connectionString;
 
@@ -34,7 +35,9 @@ public sealed class StateStore : IDisposable
 
         // Build SQLite connection string
         _connectionString = $"Data Source={sqlitePath};";
-        
+
+        ApplyDbScopedPragmas();
+
         // Single-writer write job channel
         _writeChannel = Channel.CreateUnbounded<IWriteJob>(new UnboundedChannelOptions
         {
@@ -60,16 +63,35 @@ public sealed class StateStore : IDisposable
         return connection;
     }
 
+    private void ApplyDbScopedPragmas()
+    {
+        try
+        {
+            using var bootstrap = new SqliteConnection(_connectionString);
+            bootstrap.Open();
+            using var cmd = bootstrap.CreateCommand();
+            cmd.CommandText = @"
+                PRAGMA journal_mode = WAL;
+                PRAGMA cache_size = -64000;
+                PRAGMA auto_vacuum = INCREMENTAL;
+            ";
+            cmd.ExecuteNonQuery();
+            _logger.LogInformation("StateStore DB-scoped pragmas applied.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to apply DB-scoped pragmas at startup.");
+            throw;
+        }
+    }
+
     private void ApplyPragmas(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = @"
-            PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA temp_store = MEMORY;
-            PRAGMA cache_size = -64000;
-            PRAGMA auto_vacuum = INCREMENTAL;
             PRAGMA busy_timeout = 5000;
         ";
         cmd.ExecuteNonQuery();
@@ -102,6 +124,7 @@ public sealed class StateStore : IDisposable
         catch (Exception ex)
         {
             _logger.LogCritical(ex, "Failed to open persistent writer connection to SQLite.");
+            FailChannelAndDrain(ex);
             return;
         }
 
@@ -115,7 +138,20 @@ public sealed class StateStore : IDisposable
         {
             await foreach (var job in _writeChannel.Reader.ReadAllAsync(_cts.Token))
             {
-                await job.ExecuteAsync(connection);
+                _currentJob = job;
+                try
+                {
+                    await job.ExecuteAsync(connection);
+                }
+                catch (Exception jobEx)
+                {
+                    _logger.LogError(jobEx, "Write job execution threw outside its TCS contract.");
+                    job.Fault(jobEx);
+                }
+                finally
+                {
+                    _currentJob = null;
+                }
 
                 if (++writesSinceVacuum >= writesPerVacuum)
                 {
@@ -136,14 +172,30 @@ public sealed class StateStore : IDisposable
         catch (OperationCanceledException)
         {
             _logger.LogInformation("StateStore single-writer worker canceled.");
+            _writeChannel.Writer.TryComplete();
+            FailChannelAndDrain(new OperationCanceledException("StateStore writer canceled."));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unhandled exception in StateStore single-writer worker loop.");
+            FailChannelAndDrain(ex);
         }
         finally
         {
             _logger.LogInformation("StateStore single-writer worker shutting down.");
+        }
+    }
+
+    private void FailChannelAndDrain(Exception ex)
+    {
+        _writeChannel.Writer.TryComplete(ex);
+
+        var inFlight = System.Threading.Interlocked.Exchange(ref _currentJob, null);
+        inFlight?.Fault(ex);
+
+        while (_writeChannel.Reader.TryRead(out var pending))
+        {
+            pending.Fault(ex);
         }
     }
 
@@ -170,6 +222,7 @@ public sealed class StateStore : IDisposable
     private interface IWriteJob
     {
         Task ExecuteAsync(SqliteConnection connection);
+        void Fault(Exception ex);
     }
 
     private sealed class WriteJob<T> : IWriteJob
@@ -186,13 +239,15 @@ public sealed class StateStore : IDisposable
             try
             {
                 var result = await _func(connection);
-                _tcs.SetResult(result);
+                _tcs.TrySetResult(result);
             }
             catch (Exception ex)
             {
-                _tcs.SetException(ex);
+                _tcs.TrySetException(ex);
             }
         }
+
+        public void Fault(Exception ex) => _tcs.TrySetException(ex);
     }
 
     private sealed class VoidWriteJob : IWriteJob
@@ -209,12 +264,14 @@ public sealed class StateStore : IDisposable
             try
             {
                 await _action(connection);
-                _tcs.SetResult();
+                _tcs.TrySetResult();
             }
             catch (Exception ex)
             {
-                _tcs.SetException(ex);
+                _tcs.TrySetException(ex);
             }
         }
+
+        public void Fault(Exception ex) => _tcs.TrySetException(ex);
     }
 }
