@@ -156,37 +156,40 @@ public sealed class VoiceManager : IDisposable
     private void CheckChannelEmptyState(DiscordChannel botChannel)
     {
         ulong guildId = botChannel.Guild.Id;
-        int nonBots = botChannel.Users.Count(u => !u.IsBot);
+        bool hasNonBot = botChannel.Users.Any(u => !u.IsBot);
 
-        if (nonBots == 0)
+        if (!hasNonBot)
         {
-            if (_emptyChannelTimers.ContainsKey(guildId)) return;
-
             int graceSeconds = _config.AutoBehavior.EmptyChannelGraceSeconds;
-            _logger.LogInformation("Voice channel empty; starting grace timer of {Seconds}s.", graceSeconds);
 
             var cts = new CancellationTokenSource();
-            if (_emptyChannelTimers.TryAdd(guildId, cts))
+            var stored = _emptyChannelTimers.GetOrAdd(guildId, cts);
+            if (!ReferenceEquals(stored, cts))
             {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(graceSeconds), cts.Token);
-                        _logger.LogInformation("Empty-channel grace expired; auto-disconnecting.");
-                        await LeaveChannelAsync(guildId);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        _logger.LogInformation("Empty-channel timer cancelled for guild {GuildId}.", guildId);
-                    }
-                    finally
-                    {
-                        _emptyChannelTimers.TryRemove(guildId, out _);
-                        cts.Dispose();
-                    }
-                }, cts.Token);
+                cts.Dispose();
+                return;
             }
+
+            _logger.LogInformation("Voice channel empty; starting grace timer of {Seconds}s.", graceSeconds);
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(graceSeconds), cts.Token);
+                    _logger.LogInformation("Empty-channel grace expired; auto-disconnecting.");
+                    await LeaveChannelAsync(guildId);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogInformation("Empty-channel timer cancelled for guild {GuildId}.", guildId);
+                }
+                finally
+                {
+                    _emptyChannelTimers.TryRemove(guildId, out _);
+                    cts.Dispose();
+                }
+            });
         }
         else
         {
@@ -223,33 +226,36 @@ public sealed class VoiceManager : IDisposable
 
     private void StartIdleTimer(ulong guildId)
     {
-        if (_idleTimers.ContainsKey(guildId)) return;
-
         int idleSeconds = _config.AutoBehavior.IdleDisconnectSeconds;
-        _logger.LogInformation("Queue empty; starting idle disconnect timer of {Seconds}s.", idleSeconds);
 
         var cts = new CancellationTokenSource();
-        if (_idleTimers.TryAdd(guildId, cts))
+        var stored = _idleTimers.GetOrAdd(guildId, cts);
+        if (!ReferenceEquals(stored, cts))
         {
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(idleSeconds), cts.Token);
-                    _logger.LogInformation("Idle timer expired; auto-disconnecting.");
-                    await LeaveChannelAsync(guildId);
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogInformation("Idle timer cancelled for guild {GuildId}.", guildId);
-                }
-                finally
-                {
-                    _idleTimers.TryRemove(guildId, out _);
-                    cts.Dispose();
-                }
-            }, cts.Token);
+            cts.Dispose();
+            return;
         }
+
+        _logger.LogInformation("Queue empty; starting idle disconnect timer of {Seconds}s.", idleSeconds);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(idleSeconds), cts.Token);
+                _logger.LogInformation("Idle timer expired; auto-disconnecting.");
+                await LeaveChannelAsync(guildId);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Idle timer cancelled for guild {GuildId}.", guildId);
+            }
+            finally
+            {
+                _idleTimers.TryRemove(guildId, out _);
+                cts.Dispose();
+            }
+        });
     }
 
     private void CancelEmptyChannelTimer(ulong guildId)
