@@ -10,6 +10,7 @@ using Xunit;
 using DSharpPlus;
 using Lavalink4NET;
 using Earworm.Config;
+using Earworm;
 using Earworm.Discord;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
@@ -56,7 +57,8 @@ public sealed class VoiceManagerTests
             Substitute.For<IMetricsRepository>(),
             new AudioTransitionController(config, NullLogger<AudioTransitionController>.Instance),
             config,
-            NullLogger<PlayerEngine>.Instance);
+            NullLogger<PlayerEngine>.Instance,
+            new ShutdownLifetime());
 
     private static VoiceManager BuildVoiceManager(out ConcurrentDictionary<ulong, CancellationTokenSource> idleTimers)
     {

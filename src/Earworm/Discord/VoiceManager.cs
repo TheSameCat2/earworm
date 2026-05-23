@@ -213,8 +213,7 @@ public sealed class VoiceManager : IDisposable
             {
                 if (ulong.TryParse(track.GuildId, out ulong guildId))
                 {
-                    var queue = _queueManager.GetQueue();
-                    if (queue.Count == 0) StartIdleTimer(guildId);
+                    if (_queueManager.Count == 0) StartIdleTimer(guildId);
                 }
             }
             catch (Exception ex)
