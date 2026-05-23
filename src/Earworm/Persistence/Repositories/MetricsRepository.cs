@@ -19,6 +19,48 @@ public sealed class MetricsRepository : IMetricsRepository
         "requests_search"
     };
 
+    // Precomputed at type-init so the SQL strings are stable identities across calls,
+    // allowing Microsoft.Data.Sqlite's prepared-statement cache to reuse plans.
+    private static readonly IReadOnlyDictionary<string, string> UserUpsertSqlByColumn =
+        BuildUpsertDict(forUser: true);
+
+    private static readonly IReadOnlyDictionary<string, string> GlobalUpsertSqlByColumn =
+        BuildUpsertDict(forUser: false);
+
+    private static IReadOnlyDictionary<string, string> BuildUpsertDict(bool forUser)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var col in new[]
+        {
+            "tracks_queued", "tracks_completed", "listening_seconds",
+            "requests_youtube", "requests_soundcloud", "requests_mp3_upload", "requests_search"
+        })
+        {
+            dict[col] = forUser
+                ? $@"
+                    INSERT INTO metrics_per_user (user_id, display_name_last_seen, {col}, updated_at)
+                    VALUES ($userId, $displayName, $amount, $updatedAt)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        display_name_last_seen = excluded.display_name_last_seen,
+                        {col} = {col} + excluded.{col},
+                        updated_at = excluded.updated_at;"
+                : $@"
+                    INSERT INTO metrics_global (metric_key, metric_value, updated_at)
+                    VALUES ($key, $amount, $updatedAt)
+                    ON CONFLICT(metric_key) DO UPDATE SET
+                        metric_value = metric_value + excluded.metric_value,
+                        updated_at = excluded.updated_at;";
+        }
+        return dict;
+    }
+
+    private const string GlobalUpsertSql = @"
+        INSERT INTO metrics_global (metric_key, metric_value, updated_at)
+        VALUES ($key, $amount, $updatedAt)
+        ON CONFLICT(metric_key) DO UPDATE SET
+            metric_value = metric_value + excluded.metric_value,
+            updated_at = excluded.updated_at;";
+
     private readonly StateStore _stateStore;
 
     public MetricsRepository(StateStore stateStore)
@@ -31,13 +73,7 @@ public sealed class MetricsRepository : IMetricsRepository
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
-            cmd.CommandText = @"
-                INSERT INTO metrics_global (metric_key, metric_value, updated_at)
-                VALUES ($key, $amount, $updatedAt)
-                ON CONFLICT(metric_key) DO UPDATE SET 
-                    metric_value = metric_value + excluded.metric_value,
-                    updated_at = excluded.updated_at;
-            ";
+            cmd.CommandText = GlobalUpsertSql;
             cmd.Parameters.AddWithValue("$key", key);
             cmd.Parameters.AddWithValue("$amount", amount);
             cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -78,7 +114,7 @@ public sealed class MetricsRepository : IMetricsRepository
 
     public async Task IncrementUserMetricAsync(string userId, string displayName, string column, long amount = 1)
     {
-        if (!WhitelistedColumns.Contains(column))
+        if (!UserUpsertSqlByColumn.TryGetValue(column, out var sql))
         {
             throw new ArgumentException($"Invalid user metric column: {column}", nameof(column));
         }
@@ -86,21 +122,72 @@ public sealed class MetricsRepository : IMetricsRepository
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
-            // Since column is strictly whitelisted above, we can safely interpolate it.
-            cmd.CommandText = $@"
-                INSERT INTO metrics_per_user (user_id, display_name_last_seen, {column}, updated_at)
-                VALUES ($userId, $displayName, $amount, $updatedAt)
-                ON CONFLICT(user_id) DO UPDATE SET 
-                    display_name_last_seen = excluded.display_name_last_seen,
-                    {column} = {column} + excluded.{column},
-                    updated_at = excluded.updated_at;
-            ";
+            cmd.CommandText = sql;
             cmd.Parameters.AddWithValue("$userId", userId);
             cmd.Parameters.AddWithValue("$displayName", displayName);
             cmd.Parameters.AddWithValue("$amount", amount);
             cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
             await cmd.ExecuteNonQueryAsync();
+        });
+    }
+
+    public async Task IncrementBatchAsync(IReadOnlyCollection<MetricIncrement> increments)
+    {
+        if (increments.Count == 0) return;
+
+        // Validate all columns before entering the write channel.
+        foreach (var inc in increments)
+        {
+            if (inc.UserId is null)
+            {
+                // Global increments use a free-form key (not column-whitelisted).
+                continue;
+            }
+            if (!UserUpsertSqlByColumn.ContainsKey(inc.Column))
+            {
+                throw new ArgumentException($"Invalid user metric column: {inc.Column}", nameof(increments));
+            }
+        }
+
+        await _stateStore.SubmitWriteAsync(async connection =>
+        {
+            using var transaction = connection.BeginTransaction();
+            try
+            {
+                long updatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                foreach (var inc in increments)
+                {
+                    using var cmd = connection.CreateCommand();
+                    cmd.Transaction = transaction;
+
+                    if (inc.UserId is null)
+                    {
+                        cmd.CommandText = GlobalUpsertSql;
+                        cmd.Parameters.AddWithValue("$key", inc.Column);
+                        cmd.Parameters.AddWithValue("$amount", inc.Amount);
+                        cmd.Parameters.AddWithValue("$updatedAt", updatedAt);
+                    }
+                    else
+                    {
+                        cmd.CommandText = UserUpsertSqlByColumn[inc.Column];
+                        cmd.Parameters.AddWithValue("$userId", inc.UserId);
+                        cmd.Parameters.AddWithValue("$displayName", inc.DisplayName ?? string.Empty);
+                        cmd.Parameters.AddWithValue("$amount", inc.Amount);
+                        cmd.Parameters.AddWithValue("$updatedAt", updatedAt);
+                    }
+
+                    await cmd.ExecuteNonQueryAsync();
+                }
+
+                transaction.Commit();
+            }
+            catch
+            {
+                transaction.Rollback();
+                throw;
+            }
         });
     }
 

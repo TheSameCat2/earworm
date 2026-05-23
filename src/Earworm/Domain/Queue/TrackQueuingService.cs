@@ -113,9 +113,12 @@ public sealed class TrackQueuingService
 
         try
         {
-            await _metrics.IncrementUserMetricAsync(userId, displayName, bucket, 1);
-            await _metrics.IncrementUserMetricAsync(userId, displayName, "tracks_queued", 1);
-            await _metrics.IncrementGlobalMetricAsync("tracks_queued", 1);
+            await _metrics.IncrementBatchAsync(new[]
+            {
+                new MetricIncrement(bucket, 1, userId, displayName),
+                new MetricIncrement("tracks_queued", 1, userId, displayName),
+                new MetricIncrement("tracks_queued", 1),
+            });
         }
         catch (Exception ex)
         {

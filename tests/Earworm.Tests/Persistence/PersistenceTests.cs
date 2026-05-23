@@ -445,6 +445,56 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task MetricsRepository_IncrementBatchAsync_ShouldApplyAllIncrementsInOneRoundTrip()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var repo = new MetricsRepository(stateStore);
+
+            // 5 increments: 2 user (different columns), 1 user listening_seconds, 2 global.
+            var batch = new List<MetricIncrement>
+            {
+                new MetricIncrement("tracks_queued",    2,   "userA", "Alice"),
+                new MetricIncrement("listening_seconds", 90, "userA", "Alice"),
+                new MetricIncrement("requests_youtube",  3,  "userA", "Alice"),
+                new MetricIncrement("tracks_queued",    2),
+                new MetricIncrement("listening_seconds", 90),
+            };
+
+            await repo.IncrementBatchAsync(batch);
+
+            // Per-user assertions
+            var userA = await repo.GetUserMetricsAsync("userA");
+            userA.Should().NotBeNull();
+            userA!.TracksQueued.Should().Be(2);
+            userA.ListeningSeconds.Should().Be(90);
+            userA.RequestsYoutube.Should().Be(3);
+
+            // Global assertions
+            (await repo.GetGlobalMetricAsync("tracks_queued")).Should().Be(2);
+            (await repo.GetGlobalMetricAsync("listening_seconds")).Should().Be(90);
+
+            // A second batch accumulates correctly (upsert semantics)
+            await repo.IncrementBatchAsync(new[]
+            {
+                new MetricIncrement("tracks_queued", 1, "userA", "Alice"),
+                new MetricIncrement("tracks_queued", 1),
+            });
+
+            var userAAfter = await repo.GetUserMetricsAsync("userA");
+            userAAfter!.TracksQueued.Should().Be(3);
+            (await repo.GetGlobalMetricAsync("tracks_queued")).Should().Be(3);
+
+            // Invalid column should throw before reaching the DB
+            Func<Task> badBatch = async () => await repo.IncrementBatchAsync(new[]
+            {
+                new MetricIncrement("bad_column", 1, "userA", "Alice"),
+            });
+            await badBatch.Should().ThrowAsync<ArgumentException>();
+        });
+    }
+
+    [Fact]
     public async Task StateStore_ConcurrentWrites_ShouldExecuteSequentiallyWithoutLockingExceptions()
     {
         await RunTestWithDbAsync(async stateStore =>
