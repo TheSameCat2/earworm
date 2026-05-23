@@ -51,9 +51,9 @@ public sealed class QueueRepository : IQueueRepository
         return list;
     }
 
-    public async Task AddTrackAsync(QueueItem item)
+    public async Task<long> AddTrackAsync(QueueItem item)
     {
-        await _stateStore.SubmitWriteAsync(async connection =>
+        return await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var transaction = connection.BeginTransaction();
             try
@@ -71,15 +71,16 @@ public sealed class QueueRepository : IQueueRepository
                     }
                 }
 
-                // Insert new item
+                long newId;
                 using (var insCmd = connection.CreateCommand())
                 {
                     insCmd.Transaction = transaction;
                     insCmd.CommandText = @"
-                        INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds, 
+                        INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
                                            requested_by_user_id, requested_by_display_name, queued_at, guild_id)
-                        VALUES ($position, $sourceType, $sourceId, $title, $artist, $duration, 
-                                $userId, $displayName, $queuedAt, $guildId);
+                        VALUES ($position, $sourceType, $sourceId, $title, $artist, $duration,
+                                $userId, $displayName, $queuedAt, $guildId)
+                        RETURNING queue_item_id;
                     ";
                     insCmd.Parameters.AddWithValue("$position", nextPosition);
                     insCmd.Parameters.AddWithValue("$sourceType", item.SourceType);
@@ -92,10 +93,16 @@ public sealed class QueueRepository : IQueueRepository
                     insCmd.Parameters.AddWithValue("$queuedAt", item.QueuedAt.ToUnixTimeMilliseconds());
                     insCmd.Parameters.AddWithValue("$guildId", item.GuildId);
 
-                    await insCmd.ExecuteNonQueryAsync();
+                    var idObj = await insCmd.ExecuteScalarAsync();
+                    if (idObj == null || idObj == DBNull.Value)
+                    {
+                        throw new InvalidOperationException("INSERT ... RETURNING queue_item_id returned no rows.");
+                    }
+                    newId = Convert.ToInt64(idObj);
                 }
 
                 transaction.Commit();
+                return newId;
             }
             catch
             {
@@ -105,28 +112,45 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
-    public async Task RemoveTrackAsync(int position)
+    public async Task RemoveTrackAsync(long queueItemId)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var transaction = connection.BeginTransaction();
             try
             {
-                // Delete target position
+                int? targetPosition = null;
+                using (var posCmd = connection.CreateCommand())
+                {
+                    posCmd.Transaction = transaction;
+                    posCmd.CommandText = "SELECT position FROM queue WHERE queue_item_id = $id;";
+                    posCmd.Parameters.AddWithValue("$id", queueItemId);
+                    var val = await posCmd.ExecuteScalarAsync();
+                    if (val != null && val != DBNull.Value)
+                    {
+                        targetPosition = Convert.ToInt32(val);
+                    }
+                }
+
+                if (targetPosition == null)
+                {
+                    transaction.Commit();
+                    return;
+                }
+
                 using (var delCmd = connection.CreateCommand())
                 {
                     delCmd.Transaction = transaction;
-                    delCmd.CommandText = "DELETE FROM queue WHERE position = $position;";
-                    delCmd.Parameters.AddWithValue("$position", position);
+                    delCmd.CommandText = "DELETE FROM queue WHERE queue_item_id = $id;";
+                    delCmd.Parameters.AddWithValue("$id", queueItemId);
                     await delCmd.ExecuteNonQueryAsync();
                 }
 
-                // Shift all subsequent positions down
                 using (var shiftCmd = connection.CreateCommand())
                 {
                     shiftCmd.Transaction = transaction;
                     shiftCmd.CommandText = "UPDATE queue SET position = position - 1 WHERE position > $position;";
-                    shiftCmd.Parameters.AddWithValue("$position", position);
+                    shiftCmd.Parameters.AddWithValue("$position", targetPosition.Value);
                     await shiftCmd.ExecuteNonQueryAsync();
                 }
 
@@ -140,10 +164,8 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
-    public async Task MoveTrackAsync(int fromPosition, int toPosition)
+    public async Task MoveTrackAsync(long queueItemId, int toPosition)
     {
-        if (fromPosition == toPosition) return;
-
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var transaction = connection.BeginTransaction();
@@ -162,10 +184,11 @@ public sealed class QueueRepository : IQueueRepository
                     }
                 }
 
-                var targetItemIndex = items.FindIndex(x => x.Pos == fromPosition);
+                var targetItemIndex = items.FindIndex(x => x.Id == queueItemId);
                 if (targetItemIndex == -1)
                 {
-                    throw new InvalidOperationException($"No item found at position {fromPosition}");
+                    transaction.Commit();
+                    return;
                 }
 
                 var targetItem = items[targetItemIndex];
@@ -175,12 +198,14 @@ public sealed class QueueRepository : IQueueRepository
                 int clampedTo = Math.Max(0, Math.Min(toPosition, items.Count));
                 items.Insert(clampedTo, targetItem);
 
-                // Temporarily disable unique constraint by shifting to negative numbers or bulk update
-                // SQLite UNIQUE constraint is checked per statement, but standard transaction allows bulk updates.
-                // We'll update the positions one by one using negative offsets or distinct queries to prevent collision,
-                // or simply update them in order. To be safe from UNIQUE collisions, we can clear positions first to temp values,
-                // or update them from last to first (or first to last depending on shift direction), or do a simple trick:
-                // Set positions to negative of index first, then positive. This is 100% collision-free.
+                if (targetItemIndex == clampedTo)
+                {
+                    transaction.Commit();
+                    return;
+                }
+
+                // Two-phase position rewrite to avoid UNIQUE(position) collisions:
+                // phase 1 stages negative positions, phase 2 sets the final ones.
                 for (int i = 0; i < items.Count; i++)
                 {
                     using var updCmd = connection.CreateCommand();
