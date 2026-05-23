@@ -129,19 +129,21 @@ public sealed class PersistenceTests
             };
 
             // Act: Add Tracks
-            await repo.AddTrackAsync(item1);
-            await repo.AddTrackAsync(item2);
+            long id1 = await repo.AddTrackAsync(item1);
+            long id2 = await repo.AddTrackAsync(item2);
 
             // Assert Get Queue
             var queue = await repo.GetQueueAsync();
             queue.Should().HaveCount(2);
             queue[0].Position.Should().Be(0);
             queue[0].SourceId.Should().Be("t1");
+            queue[0].QueueItemId.Should().Be(id1);
             queue[1].Position.Should().Be(1);
             queue[1].SourceId.Should().Be("t2");
+            queue[1].QueueItemId.Should().Be(id2);
 
-            // Act: Move Track (t2 to position 0)
-            await repo.MoveTrackAsync(1, 0);
+            // Act: Move t2 to position 0 (by id, not by old position)
+            await repo.MoveTrackAsync(id2, 0);
 
             var queueAfterMove = await repo.GetQueueAsync();
             queueAfterMove[0].SourceId.Should().Be("t2");
@@ -149,8 +151,8 @@ public sealed class PersistenceTests
             queueAfterMove[1].SourceId.Should().Be("t1");
             queueAfterMove[1].Position.Should().Be(1);
 
-            // Act: Remove Track at 0
-            await repo.RemoveTrackAsync(0);
+            // Act: Remove t2 by ID
+            await repo.RemoveTrackAsync(id2);
 
             var queueAfterRemove = await repo.GetQueueAsync();
             queueAfterRemove.Should().HaveCount(1);

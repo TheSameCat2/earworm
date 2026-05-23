@@ -117,10 +117,10 @@ public sealed class QueueCommands : ApplicationCommandModule
         }
 
         int index = (int)position - 1;
-        var queue = _queue.GetQueue();
-        if (index >= queue.Count)
+        int queueCount = _queue.Count;
+        if (index >= queueCount)
         {
-            await ctx.EditResponseAsync(Text($"⚠️ Invalid position. The queue currently only has {queue.Count} tracks."));
+            await ctx.EditResponseAsync(Text($"⚠️ Invalid position. The queue currently only has {queueCount} tracks."));
             return;
         }
 

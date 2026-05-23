@@ -15,7 +15,7 @@ public class QueueManager
     private readonly ISnapshotRepository _snapshotRepository;
     private readonly EarwormConfig _config;
     private readonly ILogger<QueueManager> _logger;
-    
+
     private readonly List<QueueItem> _queue = new();
     private readonly object _lock = new();
 
@@ -67,6 +67,20 @@ public class QueueManager
     }
 
     /// <summary>
+    /// Cheap count accessor that avoids the per-call full-queue copy from <see cref="GetQueue"/>.
+    /// </summary>
+    public virtual int Count
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _queue.Count;
+            }
+        }
+    }
+
+    /// <summary>
     /// Adds a track to the queue, checking all configured constraints.
     /// </summary>
     public async Task AddTrackAsync(
@@ -79,9 +93,6 @@ public class QueueManager
         string requestedByDisplayName,
         string guildId)
     {
-        // Enforce caps
-        EnforceQueueCaps(durationSeconds, requestedByUserId);
-
         var item = new QueueItem
         {
             SourceType = sourceType,
@@ -95,63 +106,144 @@ public class QueueManager
             GuildId = guildId
         };
 
-        // Persist to SQLite
-        await _queueRepository.AddTrackAsync(item);
+        Task<long> writeTask;
+        QueueItem finalItem;
+        Action<QueueItem>? handler;
+        int pos;
 
-        // Update in-memory state
         lock (_lock)
         {
-            // Position is assigned by the repository (max position + 1)
-            int pos = _queue.Count;
-            var finalItem = item with { Position = pos };
+            EnforceQueueCapsLocked(durationSeconds, requestedByUserId);
+
+            pos = _queue.Count;
+            // SubmitWriteAsync only enqueues to an unbounded channel (no I/O),
+            // so we can safely call it under the lock and capture the Task.
+            writeTask = _queueRepository.AddTrackAsync(item);
+
+            finalItem = item with { Position = pos };
             _queue.Add(finalItem);
-            
-            _logger.LogInformation("Queued track: {Title} by {Artist} at position {Pos}", title, artist, pos);
-            TrackQueued?.Invoke(finalItem);
+
+            handler = TrackQueued;
         }
-    }
 
-    /// <summary>
-    /// Enforces queue limit constraints (throws InvalidOperationException on failure).
-    /// </summary>
-    private void EnforceQueueCaps(int? durationSeconds, string userId)
-    {
-        lock (_lock)
+        long newId;
+        try
         {
-            // 1. Total Queue Length Cap
-            if (_config.Queue.LengthCap.HasValue && _queue.Count >= _config.Queue.LengthCap.Value)
+            newId = await writeTask;
+        }
+        catch
+        {
+            // Best-effort rollback if persistence fails after in-memory append.
+            lock (_lock)
             {
-                throw new InvalidOperationException($"The queue is full (limit: {_config.Queue.LengthCap.Value} tracks).");
-            }
-
-            // 2. Per-Track Length Cap
-            if (_config.Queue.PerTrackLengthCapSeconds.HasValue && durationSeconds.HasValue && 
-                durationSeconds.Value > _config.Queue.PerTrackLengthCapSeconds.Value)
-            {
-                var capMinutes = TimeSpan.FromSeconds(_config.Queue.PerTrackLengthCapSeconds.Value).TotalMinutes;
-                throw new InvalidOperationException($"This track is too long (limit: {capMinutes:F1} minutes).");
-            }
-
-            // 3. Per-Requester Contiguous Cap (consecutive back-to-back)
-            if (_config.Queue.PerRequesterContiguousCap.HasValue)
-            {
-                int contiguous = 0;
-                for (int i = _queue.Count - 1; i >= 0; i--)
+                int idx = -1;
+                for (int i = 0; i < _queue.Count; i++)
                 {
-                    if (_queue[i].RequestedByUserId == userId)
+                    if (_queue[i].QueueItemId == 0
+                        && _queue[i].SourceId == finalItem.SourceId
+                        && _queue[i].QueuedAt == finalItem.QueuedAt)
                     {
-                        contiguous++;
-                    }
-                    else
-                    {
+                        idx = i;
                         break;
                     }
                 }
-
-                if (contiguous >= _config.Queue.PerRequesterContiguousCap.Value)
+                if (idx >= 0)
                 {
-                    throw new InvalidOperationException($"You already have {_config.Queue.PerRequesterContiguousCap.Value} consecutive tracks at the end of the queue. Wait for others to queue or for your tracks to play.");
+                    _queue.RemoveAt(idx);
+                    for (int i = idx; i < _queue.Count; i++)
+                    {
+                        _queue[i] = _queue[i] with { Position = i };
+                    }
                 }
+            }
+            throw;
+        }
+
+        QueueItem itemForEvent;
+        bool orphaned;
+        lock (_lock)
+        {
+            int idx = -1;
+            for (int i = 0; i < _queue.Count; i++)
+            {
+                if (_queue[i].QueueItemId == 0
+                    && _queue[i].SourceId == finalItem.SourceId
+                    && _queue[i].QueuedAt == finalItem.QueuedAt)
+                {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx >= 0)
+            {
+                _queue[idx] = _queue[idx] with { QueueItemId = newId };
+                itemForEvent = _queue[idx];
+                orphaned = false;
+            }
+            else
+            {
+                // In-memory item was removed (e.g. Dequeue/Clear) before we could
+                // backfill the row id; the row in the DB is now an orphan.
+                itemForEvent = finalItem with { QueueItemId = newId };
+                orphaned = true;
+            }
+        }
+
+        if (orphaned)
+        {
+            try
+            {
+                await _queueRepository.RemoveTrackAsync(newId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to clean up orphaned queue row {Id} after in-memory removal.", newId);
+            }
+            return;
+        }
+
+        _logger.LogInformation("Queued track: {Title} by {Artist} at position {Pos}", title, artist, pos);
+        handler?.Invoke(itemForEvent);
+    }
+
+    /// <summary>
+    /// Enforces queue limit constraints. Must be called while holding <see cref="_lock"/>.
+    /// </summary>
+    private void EnforceQueueCapsLocked(int? durationSeconds, string userId)
+    {
+        // 1. Total Queue Length Cap
+        if (_config.Queue.LengthCap.HasValue && _queue.Count >= _config.Queue.LengthCap.Value)
+        {
+            throw new InvalidOperationException($"The queue is full (limit: {_config.Queue.LengthCap.Value} tracks).");
+        }
+
+        // 2. Per-Track Length Cap
+        if (_config.Queue.PerTrackLengthCapSeconds.HasValue && durationSeconds.HasValue &&
+            durationSeconds.Value > _config.Queue.PerTrackLengthCapSeconds.Value)
+        {
+            var capMinutes = TimeSpan.FromSeconds(_config.Queue.PerTrackLengthCapSeconds.Value).TotalMinutes;
+            throw new InvalidOperationException($"This track is too long (limit: {capMinutes:F1} minutes).");
+        }
+
+        // 3. Per-Requester Contiguous Cap (consecutive back-to-back)
+        if (_config.Queue.PerRequesterContiguousCap.HasValue)
+        {
+            int contiguous = 0;
+            for (int i = _queue.Count - 1; i >= 0; i--)
+            {
+                if (_queue[i].RequestedByUserId == userId)
+                {
+                    contiguous++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (contiguous >= _config.Queue.PerRequesterContiguousCap.Value)
+            {
+                throw new InvalidOperationException($"You already have {_config.Queue.PerRequesterContiguousCap.Value} consecutive tracks at the end of the queue. Wait for others to queue or for your tracks to play.");
             }
         }
     }
@@ -162,6 +254,9 @@ public class QueueManager
     public async Task<QueueItem> RemoveTrackAsync(int position, string userId, bool isDj)
     {
         QueueItem itemToRemove;
+        Task writeTask;
+        Action<QueueItem>? handler;
+
         lock (_lock)
         {
             if (position < 0 || position >= _queue.Count)
@@ -176,24 +271,22 @@ public class QueueManager
             {
                 throw new InvalidOperationException("You can only remove tracks that you queued yourself. (Requires DJ role to remove others' tracks).");
             }
-        }
 
-        // Persist to SQLite
-        await _queueRepository.RemoveTrackAsync(position);
+            writeTask = _queueRepository.RemoveTrackAsync(itemToRemove.QueueItemId);
 
-        // Update in-memory state
-        lock (_lock)
-        {
             _queue.RemoveAt(position);
-            // Shift subsequent positions in-memory
             for (int i = position; i < _queue.Count; i++)
             {
                 _queue[i] = _queue[i] with { Position = i };
             }
-            
-            _logger.LogInformation("Removed track at position {Pos}: {Title}", position, itemToRemove.Title);
-            TrackRemoved?.Invoke(itemToRemove);
+
+            handler = TrackRemoved;
         }
+
+        await writeTask;
+
+        _logger.LogInformation("Removed track at position {Pos}: {Title}", position, itemToRemove.Title);
+        handler?.Invoke(itemToRemove);
 
         return itemToRemove;
     }
@@ -203,21 +296,22 @@ public class QueueManager
     /// </summary>
     public async Task MoveTrackAsync(int fromPosition, int toPosition)
     {
+        Task writeTask;
         lock (_lock)
         {
             if (fromPosition < 0 || fromPosition >= _queue.Count || toPosition < 0 || toPosition >= _queue.Count)
             {
                 throw new ArgumentOutOfRangeException("Queue position is out of bounds.");
             }
-        }
 
-        // Persist to SQLite
-        await _queueRepository.MoveTrackAsync(fromPosition, toPosition);
+            if (fromPosition == toPosition)
+            {
+                return;
+            }
 
-        // Update in-memory state
-        lock (_lock)
-        {
             var item = _queue[fromPosition];
+            writeTask = _queueRepository.MoveTrackAsync(item.QueueItemId, toPosition);
+
             _queue.RemoveAt(fromPosition);
             _queue.Insert(toPosition, item);
 
@@ -226,9 +320,11 @@ public class QueueManager
             {
                 _queue[i] = _queue[i] with { Position = i };
             }
-            
+
             _logger.LogInformation("Moved track from {FromPos} to {ToPos}: {Title}", fromPosition, toPosition, item.Title);
         }
+
+        await writeTask;
     }
 
     /// <summary>
@@ -236,15 +332,19 @@ public class QueueManager
     /// </summary>
     public async Task ClearQueueAsync()
     {
-        // Persist to SQLite
-        await _queueRepository.ClearQueueAsync();
-
+        Task writeTask;
+        Action? handler;
         lock (_lock)
         {
+            writeTask = _queueRepository.ClearQueueAsync();
             _queue.Clear();
-            _logger.LogInformation("Queue cleared.");
-            QueueCleared?.Invoke();
+            handler = QueueCleared;
         }
+
+        await writeTask;
+
+        _logger.LogInformation("Queue cleared.");
+        handler?.Invoke();
     }
 
     /// <summary>
@@ -252,17 +352,35 @@ public class QueueManager
     /// </summary>
     public virtual async Task<QueueItem?> DequeueAsync()
     {
+        QueueItem head;
+        Task writeTask;
+        Action<QueueItem>? handler;
+
         lock (_lock)
         {
             if (_queue.Count == 0)
             {
                 return null;
             }
+
+            head = _queue[0];
+            writeTask = _queueRepository.RemoveTrackAsync(head.QueueItemId);
+
+            _queue.RemoveAt(0);
+            for (int i = 0; i < _queue.Count; i++)
+            {
+                _queue[i] = _queue[i] with { Position = i };
+            }
+
+            handler = TrackRemoved;
         }
 
-        // We remove it from position 0 in the DB (which auto-shifts everything else down)
-        // Note: isDj=true bypasses permission check
-        return await RemoveTrackAsync(0, string.Empty, isDj: true);
+        await writeTask;
+
+        _logger.LogInformation("Dequeued track: {Title}", head.Title);
+        handler?.Invoke(head);
+
+        return head;
     }
 
     /// <summary>
@@ -285,13 +403,31 @@ public class QueueManager
             GuildId = item.GuildId
         };
 
-        await _queueRepository.AddTrackAsync(fresh);
-
+        Task<long> addTask;
         int lastPos;
         lock (_lock)
         {
             lastPos = _queue.Count;
+            addTask = _queueRepository.AddTrackAsync(fresh);
             _queue.Add(fresh with { Position = lastPos });
+        }
+
+        long newId = await addTask;
+
+        // Backfill the new row id so any subsequent ID-keyed operation
+        // (MoveTrackAsync below) sees it.
+        lock (_lock)
+        {
+            for (int i = 0; i < _queue.Count; i++)
+            {
+                if (_queue[i].QueueItemId == 0
+                    && _queue[i].SourceId == fresh.SourceId
+                    && _queue[i].QueuedAt == fresh.QueuedAt)
+                {
+                    _queue[i] = _queue[i] with { QueueItemId = newId };
+                    break;
+                }
+            }
         }
 
         if (lastPos > 0)
@@ -299,9 +435,18 @@ public class QueueManager
             await MoveTrackAsync(lastPos, 0);
         }
 
-        // Make sure listeners (the playback waker, etc.) still see the
-        // re-queue as a normal TrackQueued event.
-        TrackQueued?.Invoke(fresh with { Position = 0 });
+        QueueItem finalItem;
+        Action<QueueItem>? handler;
+        lock (_lock)
+        {
+            int idx = _queue.FindIndex(q => q.QueueItemId == newId);
+            finalItem = idx >= 0
+                ? _queue[idx]
+                : fresh with { QueueItemId = newId, Position = 0 };
+            handler = TrackQueued;
+        }
+
+        handler?.Invoke(finalItem);
     }
 
     /// <summary>
@@ -326,14 +471,18 @@ public class QueueManager
             return null;
         }
 
+        Action? handler;
+        int restoredCount;
         lock (_lock)
         {
             _queue.Clear();
             _queue.AddRange(restored.Value.QueueItems);
-            
-            _logger.LogInformation("Restored snapshot with {Count} tracks.", _queue.Count);
-            SnapshotRestored?.Invoke();
+            restoredCount = _queue.Count;
+            handler = SnapshotRestored;
         }
+
+        _logger.LogInformation("Restored snapshot with {Count} tracks.", restoredCount);
+        handler?.Invoke();
 
         return restored.Value.PlaybackState;
     }
