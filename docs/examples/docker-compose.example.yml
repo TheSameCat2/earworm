@@ -47,6 +47,14 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Healthcheck gates earworm's startup via service_healthy below. Lavalink
+    # downloads plugins on first boot (15-40s) before /version responds.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:2333/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   earworm:
     # If you forked and republished to your own GHCR, swap the image owner
@@ -57,7 +65,8 @@ services:
     container_name: earworm
     restart: unless-stopped
     depends_on:
-      - lavalink
+      lavalink:
+        condition: service_healthy
 
     environment:
       EARWORM_DISCORD_BOT_TOKEN:    "${EARWORM_DISCORD_BOT_TOKEN:?required}"

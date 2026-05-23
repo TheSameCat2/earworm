@@ -60,7 +60,7 @@ public sealed class ElevenLabsTtsProvider : ITtsProvider
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("audio/mpeg"));
         request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
-        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             string errContent = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -69,7 +69,15 @@ public sealed class ElevenLabsTtsProvider : ITtsProvider
         }
 
         _logger.LogInformation("TTS successfully rendered from ElevenLabs.");
-        // Read response stream
-        return await response.Content.ReadAsStreamAsync(cancellationToken);
+        // Buffer into memory so the HttpResponseMessage can be disposed before
+        // returning. TTS clips are short (tens to a few hundred KB), so the
+        // memory cost is trivial compared to leaking the HTTP connection.
+        var buffered = new MemoryStream();
+        await using (var src = await response.Content.ReadAsStreamAsync(cancellationToken))
+        {
+            await src.CopyToAsync(buffered, cancellationToken);
+        }
+        buffered.Position = 0;
+        return buffered;
     }
 }

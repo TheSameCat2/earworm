@@ -138,6 +138,13 @@ public sealed class MetricsRepository : IMetricsRepository
 
     private async Task<List<UserMetrics>> GetTopUsersInternalAsync(string orderByColumn, int limit)
     {
+        // orderByColumn is interpolated into SQL below; whitelist defensively in
+        // case a future caller passes a user-controlled string.
+        if (!WhitelistedColumns.Contains(orderByColumn))
+        {
+            throw new ArgumentException($"Invalid order-by column: {orderByColumn}", nameof(orderByColumn));
+        }
+
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 

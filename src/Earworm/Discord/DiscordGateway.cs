@@ -19,7 +19,12 @@ public sealed class DiscordGateway
     private readonly ILogger<DiscordGateway> _logger;
 
     public DiscordClient Client => _discordClient;
-    public bool IsReady { get; private set; }
+
+    // IsReady is written from the DSharpPlus gateway thread and read from the
+    // ASP.NET Core /health request thread. volatile guarantees the read sees
+    // the latest write without a lock.
+    private volatile bool _isReady;
+    public bool IsReady => _isReady;
 
     public DiscordGateway(DiscordClient discordClient, ILogger<DiscordGateway> logger)
     {
@@ -32,7 +37,7 @@ public sealed class DiscordGateway
 
     private Task OnReadyAsync(DiscordClient sender, ReadyEventArgs e)
     {
-        IsReady = true;
+        _isReady = true;
         _logger.LogInformation("Connected to Discord Gateway. Bot is ready.");
         return Task.CompletedTask;
     }
@@ -51,7 +56,7 @@ public sealed class DiscordGateway
 
     public async Task StopAsync()
     {
-        IsReady = false;
+        _isReady = false;
         _logger.LogInformation("Disconnecting from Discord Gateway...");
         await _discordClient.DisconnectAsync();
     }

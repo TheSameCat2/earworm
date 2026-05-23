@@ -224,7 +224,18 @@ public class PlayerEngine : IDisposable
                     lock (_stateLock) { _ttsCompletion = tcs = new TaskCompletionSource(); }
                     await _transitions.PrepareForPrerollAsync(player);
                     await player.PlayAsync(ttsTrack);
-                    await tcs.Task;
+                    // Cap the wait: if Lavalink misses the TrackEnded event for
+                    // the TTS clip (reconnect, dropped event), the player would
+                    // otherwise hang the queue indefinitely.
+                    var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+                    if (completed != tcs.Task)
+                    {
+                        _logger.LogWarning("TTS preroll did not complete within 30s; clearing state and continuing.");
+                        lock (_stateLock)
+                        {
+                            if (_ttsCompletion == tcs) _ttsCompletion = null;
+                        }
+                    }
                 }
                 else
                 {

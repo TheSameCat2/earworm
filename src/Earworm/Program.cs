@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -73,7 +74,10 @@ public static class Program
         var services = new ServiceCollection();
         ConfigureServices(services, earwormConfig, botToken);
 
-        var serviceProvider = services.BuildServiceProvider();
+        // await using ensures all IDisposable / IAsyncDisposable singletons are
+        // torn down on Main exit — most importantly StateStore, which drains
+        // the SQLite write channel and checkpoints WAL on Dispose.
+        await using var serviceProvider = services.BuildServiceProvider();
         var logger = serviceProvider.GetRequiredService<ILogger<object>>();
         var client = serviceProvider.GetRequiredService<DiscordClient>();
 
@@ -165,9 +169,19 @@ public static class Program
         Console.CancelKeyPress += (sender, e) =>
         {
             e.Cancel = true;
-            logger.LogInformation("Shutdown requested...");
-            tcs.SetResult();
+            logger.LogInformation("Shutdown requested (SIGINT).");
+            tcs.TrySetResult();
         };
+        // Docker `stop` sends SIGTERM, not SIGINT. Without this handler the
+        // runtime exits immediately, skipping the shutdown block below — which
+        // leaves SQLite WAL un-checkpointed and the Discord/Lavalink sessions
+        // dangling until container kill.
+        using var sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+        {
+            ctx.Cancel = true;
+            logger.LogInformation("Shutdown requested (SIGTERM).");
+            tcs.TrySetResult();
+        });
 
         await tcs.Task;
 
@@ -238,8 +252,11 @@ public static class Program
         services.AddSingleton<AudioTransitionController>();
         services.AddSingleton<PlayerEngine>();
 
-        services.AddHttpClient<GeminiClient>();
-        services.AddHttpClient<ElevenLabsTtsProvider>();
+        // Per-call timeouts. Without these, a hung external API blocks the
+        // caller for the OS-default ~100s TCP timeout, which during DJ commentary
+        // generation freezes PlayNextAsync and stalls music playback.
+        services.AddHttpClient<GeminiClient>(c => c.Timeout = TimeSpan.FromSeconds(30));
+        services.AddHttpClient<ElevenLabsTtsProvider>(c => c.Timeout = TimeSpan.FromSeconds(60));
         services.AddSingleton<ITtsProvider>(sp => sp.GetRequiredService<ElevenLabsTtsProvider>());
         services.AddSingleton<DJEngine>();
 
