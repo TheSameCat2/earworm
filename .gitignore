@@ -19,6 +19,9 @@ conf/earworm.yaml
 .vscode/
 *.swp
 
+# Local worktrees for parallel agent work
+.worktrees/
+
 # Design docs (kept locally for reference, not published — see docs/architecture.md)
 *.docx
 
