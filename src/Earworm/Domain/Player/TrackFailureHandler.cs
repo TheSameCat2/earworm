@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using DSharpPlus;
@@ -27,30 +28,36 @@ public sealed class TrackFailureHandler : IDisposable
     private readonly DiscordClient _discord;
     private readonly ISettingsRepository _settings;
     private readonly ILogger<TrackFailureHandler> _logger;
+    private readonly ShutdownLifetime _shutdown;
 
     public TrackFailureHandler(
         PlayerEngine player,
         DiscordClient discord,
         ISettingsRepository settings,
-        ILogger<TrackFailureHandler> logger)
+        ILogger<TrackFailureHandler> logger,
+        ShutdownLifetime shutdown)
     {
         _player = player;
         _discord = discord;
         _settings = settings;
         _logger = logger;
+        _shutdown = shutdown;
 
         _player.TrackFailed += OnTrackFailed;
     }
 
     private void OnTrackFailed(QueueItem track, string failureReason)
     {
-        _ = Task.Run(() => PostFailureNoticeAsync(track, failureReason));
+        var ct = _shutdown.Token;
+        _ = Task.Run(() => PostFailureNoticeAsync(track, failureReason, ct), ct);
     }
 
-    private async Task PostFailureNoticeAsync(QueueItem track, string failureReason)
+    private async Task PostFailureNoticeAsync(QueueItem track, string failureReason, CancellationToken ct)
     {
         try
         {
+            ct.ThrowIfCancellationRequested();
+
             var channelId = await _settings.GetLoggingChannelIdAsync();
             if (!channelId.HasValue)
             {
@@ -84,6 +91,10 @@ public sealed class TrackFailureHandler : IDisposable
                 .WithAllowedMentions(Mentions.None);
 
             await channel.SendMessageAsync(builder);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown: swallow.
         }
         catch (Exception ex)
         {

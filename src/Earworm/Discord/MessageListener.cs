@@ -18,19 +18,22 @@ public sealed class MessageListener : IDisposable
     private readonly TrackQueuingService _trackQueuingService;
     private readonly ISettingsRepository _settingsRepository;
     private readonly ILogger<MessageListener> _logger;
+    private readonly ShutdownLifetime _shutdown;
 
     public MessageListener(
         DiscordClient discordClient,
         VoiceManager voiceManager,
         TrackQueuingService trackQueuingService,
         ISettingsRepository settingsRepository,
-        ILogger<MessageListener> logger)
+        ILogger<MessageListener> logger,
+        ShutdownLifetime shutdown)
     {
         _discordClient = discordClient ?? throw new ArgumentNullException(nameof(discordClient));
         _voiceManager = voiceManager ?? throw new ArgumentNullException(nameof(voiceManager));
         _trackQueuingService = trackQueuingService ?? throw new ArgumentNullException(nameof(trackQueuingService));
         _settingsRepository = settingsRepository ?? throw new ArgumentNullException(nameof(settingsRepository));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _shutdown = shutdown ?? throw new ArgumentNullException(nameof(shutdown));
 
         _discordClient.MessageCreated += OnMessageCreatedAsync;
     }
@@ -40,10 +43,12 @@ public sealed class MessageListener : IDisposable
         if (e.Author.IsBot || e.Guild == null) return Task.CompletedTask;
         if (!e.MentionedUsers.Any(u => u.Id == sender.CurrentUser.Id)) return Task.CompletedTask;
 
+        var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
                 var member = await e.Guild.GetMemberAsync(e.Author.Id);
                 if (member == null) return;
 
@@ -113,6 +118,10 @@ public sealed class MessageListener : IDisposable
                     await _voiceManager.JoinChannelAsync(voiceChannel);
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown: swallow.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error handling music request from message.");
@@ -127,7 +136,7 @@ public sealed class MessageListener : IDisposable
                     _logger.LogError(inner, "Could not send failure reaction/response.");
                 }
             }
-        });
+        }, ct);
 
         return Task.CompletedTask;
     }

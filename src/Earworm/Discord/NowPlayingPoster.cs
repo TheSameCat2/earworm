@@ -15,27 +15,32 @@ public sealed class NowPlayingPoster : IDisposable
     private readonly PlayerEngine _playerEngine;
     private readonly EarwormConfig _config;
     private readonly ILogger<NowPlayingPoster> _logger;
+    private readonly ShutdownLifetime _shutdown;
 
     public NowPlayingPoster(
         DiscordClient discordClient,
         PlayerEngine playerEngine,
         EarwormConfig config,
-        ILogger<NowPlayingPoster> logger)
+        ILogger<NowPlayingPoster> logger,
+        ShutdownLifetime shutdown)
     {
         _discordClient = discordClient ?? throw new ArgumentNullException(nameof(discordClient));
         _playerEngine = playerEngine ?? throw new ArgumentNullException(nameof(playerEngine));
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _shutdown = shutdown ?? throw new ArgumentNullException(nameof(shutdown));
 
         _playerEngine.TrackStarted += OnTrackStarted;
     }
 
     private void OnTrackStarted(QueueItem track)
     {
+        var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
                 var channelIdStr = _config.Discord.NowPlayingChannelId;
                 if (string.IsNullOrWhiteSpace(channelIdStr)) return;
                 if (!ulong.TryParse(channelIdStr, out ulong channelId))
@@ -89,11 +94,15 @@ public sealed class NowPlayingPoster : IDisposable
 
                 await channel.SendMessageAsync(msg);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown: swallow.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to post now playing embed for track: {Title}", track.Title);
             }
-        });
+        }, ct);
     }
 
     public void Dispose()
