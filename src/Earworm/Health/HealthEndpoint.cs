@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -8,6 +9,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Lavalink4NET;
 using Earworm.Config;
 using Earworm.Discord;
 
@@ -17,20 +19,22 @@ namespace Earworm.Health;
 /// In-process ASP.NET Core minimal-API host providing the ops endpoints required
 /// by PRD §11:
 ///
-///   GET /health   → 200 OK when the Discord gateway WebSocket is ready, else 503.
-///                   Wired into the Dockerfile HEALTHCHECK.
+///   GET /health   → 200 OK when the Discord gateway WebSocket AND the Lavalink
+///                   audio service are ready, else 503. Wired into the Dockerfile
+///                   HEALTHCHECK.
 ///   GET /metrics  → Prometheus exposition (currently a scaffold — returns 503 or a
 ///                   "metrics disabled" body unless EARWORM_METRICS_ENABLED=true and
 ///                   the exporter is wired up).
 ///
-/// Liveness depth is set deliberately at "gateway connected": shallower checks
-/// (process alive) miss zombie states; deeper (voice pipeline functional) flap
-/// during normal voice reconnects.
+/// Liveness depth is set deliberately at "gateway connected AND lavalink ready":
+/// shallower checks (process alive) miss zombie states; deeper (voice pipeline
+/// functional) flap during normal voice reconnects.
 /// </summary>
-public sealed class HealthEndpoint : IAsyncDisposable
+public sealed partial class HealthEndpoint : IAsyncDisposable
 {
     private readonly EarwormConfig _config;
     private readonly DiscordGateway _gateway;
+    private readonly IAudioService _audioService;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<HealthEndpoint> _logger;
     private WebApplication? _app;
@@ -38,14 +42,19 @@ public sealed class HealthEndpoint : IAsyncDisposable
     public HealthEndpoint(
         EarwormConfig config,
         DiscordGateway gateway,
+        IAudioService audioService,
         ILoggerFactory loggerFactory,
         ILogger<HealthEndpoint> logger)
     {
         _config = config;
         _gateway = gateway;
+        _audioService = audioService;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
+
+    [GeneratedRegex(@"^[a-f0-9]{32}\.mp3$")]
+    private static partial Regex TtsFilenamePattern();
 
     public async Task StartAsync()
     {
@@ -57,14 +66,32 @@ public sealed class HealthEndpoint : IAsyncDisposable
         // Reuse the existing logger factory so health-host logs land in the same JSON stream as the bot.
         builder.Services.AddSingleton(_loggerFactory);
         builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+        // Bound the host-internal shutdown wait so a slow in-flight /tts stream
+        // can't push past Docker's 10s SIGTERM grace and trigger SIGKILL mid-shutdown.
+        builder.WebHost.UseShutdownTimeout(TimeSpan.FromSeconds(5));
 
         var app = builder.Build();
 
         app.MapGet("/health", () =>
         {
-            return _gateway.IsReady
-                ? Results.Ok(new { status = "ok" })
-                : Results.Json(new { status = "starting" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+            bool discordReady = _gateway.IsReady;
+            // IAudioService exposes only WaitForReadyAsync; the underlying TCS
+            // completes synchronously when ready, so IsCompletedSuccessfully on
+            // the returned ValueTask is a non-blocking readiness probe.
+            bool lavalinkReady = _audioService.WaitForReadyAsync(CancellationToken.None).IsCompletedSuccessfully;
+
+            string discordStatus = discordReady ? "ok" : "starting";
+            string lavalinkStatus = lavalinkReady ? "ok" : "down";
+
+            if (discordReady && lavalinkReady)
+            {
+                return Results.Ok(new { status = "ok", discord = discordStatus, lavalink = lavalinkStatus });
+            }
+
+            string overall = discordReady ? "degraded" : "starting";
+            return Results.Json(
+                new { status = overall, discord = discordStatus, lavalink = lavalinkStatus },
+                statusCode: StatusCodes.Status503ServiceUnavailable);
         });
 
         // PRD §12 (Lavalink-edition): Lavalink fetches staged TTS audio from
@@ -74,7 +101,7 @@ public sealed class HealthEndpoint : IAsyncDisposable
         {
             // Allowlist filename: 32-hex (Guid "N") + .mp3 — exactly what
             // DJEngine writes. Anything else is a probe; 404 silently.
-            if (!Regex.IsMatch(file, @"^[a-f0-9]{32}\.mp3$"))
+            if (!TtsFilenamePattern().IsMatch(file))
             {
                 return Results.NotFound();
             }
