@@ -30,6 +30,7 @@ public class PlayerEngine : IDisposable
     private readonly IQueueRepository _queueRepository;
     private readonly IHistoryRepository _historyRepository;
     private readonly IMetricsRepository _metricsRepository;
+    private readonly AudioTransitionController _transitions;
     private readonly EarwormConfig _config;
     private readonly ILogger<PlayerEngine> _logger;
 
@@ -73,6 +74,7 @@ public class PlayerEngine : IDisposable
         IQueueRepository queueRepository,
         IHistoryRepository historyRepository,
         IMetricsRepository metricsRepository,
+        AudioTransitionController transitions,
         EarwormConfig config,
         ILogger<PlayerEngine> logger)
     {
@@ -81,6 +83,7 @@ public class PlayerEngine : IDisposable
         _queueRepository = queueRepository;
         _historyRepository = historyRepository;
         _metricsRepository = metricsRepository;
+        _transitions = transitions;
         _config = config;
         _logger = logger;
 
@@ -219,6 +222,7 @@ public class PlayerEngine : IDisposable
                 {
                     TaskCompletionSource tcs;
                     lock (_stateLock) { _ttsCompletion = tcs = new TaskCompletionSource(); }
+                    await _transitions.PrepareForPrerollAsync(player);
                     await player.PlayAsync(ttsTrack);
                     await tcs.Task;
                 }
@@ -270,7 +274,10 @@ public class PlayerEngine : IDisposable
             _isPaused = false;
         }
 
-        await player.PlayAsync(musicTrack);
+        var duration = next.DurationSeconds.HasValue
+            ? TimeSpan.FromSeconds(next.DurationSeconds.Value)
+            : (TimeSpan?)null;
+        await _transitions.PlayMusicAsync(player, duration, () => player.PlayAsync(musicTrack));
         TrackStarted?.Invoke(next);
 
         await _queueRepository.UpdatePlaybackStateAsync(State);
@@ -486,5 +493,6 @@ public class PlayerEngine : IDisposable
     {
         _queueManager.TrackQueued -= OnTrackQueued;
         _audioService.TrackEnded -= OnLavalinkTrackEndedAsync;
+        _transitions.Cancel();
     }
 }

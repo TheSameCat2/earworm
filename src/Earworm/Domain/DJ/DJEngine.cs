@@ -22,8 +22,10 @@ namespace Earworm.Domain.DJ;
 ///   7. After playback, PlayerEngine invokes <c>OnConsumedAsync</c> which
 ///      deletes the staged file.
 ///
-/// The "ducked TTS over music" mix from the in-process design is gone in this
-/// pivot — Lavalink only plays one track at a time per voice connection.
+/// True ducking (TTS mixed over continuing music) isn't possible with a
+/// single LavalinkPlayer per voice connection. The "ducking" feel is faked
+/// by <see cref="Player.AudioTransitionController"/> ramping the music
+/// volume down before the preroll and the next track's volume up after.
 /// </summary>
 public sealed class DJEngine : IDisposable
 {

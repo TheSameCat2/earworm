@@ -63,8 +63,6 @@ In Docker Compose, `Host` and `Password` are overridden via `EARWORM_Lavalink__H
 
 ### `Audio`
 
-Legacy keys retained from the pre-Lavalink era. Currently unused — audio quality is fully governed by Lavalink's `application.yml`. Kept for forward compatibility if we ever push these settings through to Lavalink filters.
-
 ```yaml
 Audio:
   BitrateKbps: 128
@@ -72,6 +70,12 @@ Audio:
   CrossfadeSeconds: 5
   CrossfadeMinTrackSeconds: 15
 ```
+
+`BitrateKbps` and `LoudnessLufs` are legacy from the pre-Lavalink era — currently unused, governed by Lavalink's `application.yml` if you care.
+
+`CrossfadeSeconds` is the length of the volume ramp applied at music-track boundaries: the last N seconds of each track fade out and the first N of the next fade in. The same machinery brackets DJ TTS prerolls (music fades out → DJ speaks at full → next music fades in), which gives the "ducking" feel without true mixing. Lavalink only plays one stream per voice connection, so there is always a small (~100-500 ms) silent gap at the swap while it loads the next track — this isn't true overlap. Set to `0` to disable both fades.
+
+`CrossfadeMinTrackSeconds` is a safety floor: tracks shorter than this skip the ramp entirely so a 5s fade doesn't dominate an 8s clip. No effect when `CrossfadeSeconds: 0`.
 
 ### `Queue`
 

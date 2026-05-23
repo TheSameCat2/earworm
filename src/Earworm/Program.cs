@@ -235,6 +235,7 @@ public static class Program
 
         services.AddSingleton<QueueManager>();
         services.AddSingleton<TrackQueuingService>();
+        services.AddSingleton<AudioTransitionController>();
         services.AddSingleton<PlayerEngine>();
 
         services.AddHttpClient<GeminiClient>();

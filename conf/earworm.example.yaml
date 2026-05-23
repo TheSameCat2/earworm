@@ -21,10 +21,22 @@ Discord:
 Audio:
   # Legacy keys from the pre-Lavalink era. Currently unused —
   # audio quality is governed by Lavalink's application.yml.
-  # Kept here for forward compatibility.
   BitrateKbps: 128
   LoudnessLufs: -14.0
+
+  # Length of the volume ramp at music-track boundaries. The
+  # last N seconds of each track fade out and the first N of
+  # the next fade in. Also smooths the bookends around DJ TTS
+  # prerolls (music fades out → DJ speaks at full → next music
+  # fades in). Set to 0 to disable both fades.
+  #
+  # NB: Lavalink only plays one stream per voice connection, so
+  # there is always a small (~100-500ms) silent gap at the swap
+  # while it loads the next track. This isn't true overlap.
   CrossfadeSeconds: 5
+
+  # Safety floor: tracks shorter than this skip the ramp entirely
+  # so a 5s fade doesn't dominate an 8s clip.
   CrossfadeMinTrackSeconds: 15
 
 Queue:

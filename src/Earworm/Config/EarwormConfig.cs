@@ -28,9 +28,17 @@ public sealed record DiscordConfig
 
 public sealed record AudioConfig
 {
+    // Legacy keys from the pre-Lavalink era. Currently unused — audio quality
+    // is governed by Lavalink's application.yml.
     public int BitrateKbps { get; init; } = 128;
     public double LoudnessLufs { get; init; } = -14.0;
+
+    // Volume-ramp length applied at music-track boundaries (fade-in at start,
+    // fade-out at end) and around DJ TTS prerolls. 0 disables both.
     public int CrossfadeSeconds { get; init; } = 5;
+
+    // Tracks shorter than this skip the ramp so a 5s fade doesn't dominate an
+    // 8s clip. No effect when CrossfadeSeconds is 0.
     public int CrossfadeMinTrackSeconds { get; init; } = 15;
 }
 

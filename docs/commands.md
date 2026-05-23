@@ -202,7 +202,6 @@ Display the current settings — DJ enabled state, configured DJ role, configure
 
 Some features described in the original spec aren't currently implemented:
 
-- **Crossfade** between tracks — Lavalink supports filter-based crossfade but it's not wired in yet. Tracks cut hard.
 - **Volume control** — Lavalink supports per-player volume but earworm doesn't expose a `/volume` command.
 - **`/queue` track position** — shows `0:00 / 3:45` always; reading the live position from Lavalink's player needs an async path the current UI doesn't have.
 - **Search picker** — text searches always queue the first YouTube result; no "pick from 5 results" UI.

@@ -55,6 +55,7 @@ Domain/
     PlayerEngine.cs        # the Lavalink-backed playback engine (thin)
     PlaybackState.cs       # snapshot record returned by PlayerEngine.State
     PlayHistoryEntry.cs    # historical track record
+    AudioTransitionController.cs  # volume ramps for crossfade + DJ ducking
     TrackFailureHandler.cs # posts failure messages to the logging channel
   Queue/
     QueueManager.cs        # in-memory queue + SQLite persistence + events
@@ -94,6 +95,27 @@ Health/
 - `QueueManager` doesn't know `PlayerEngine` exists. Adding a second listener (e.g., a third-party plugin) is a one-line subscription.
 - Tests can substitute a mock `IQueueRepository` and exercise `PlayerEngine` without ever spinning up Lavalink.
 - The DJ TTS pre-roll vs music track distinction in the `TrackEnded` handler uses a small piece of mutable state (`_ttsCompletion`) rather than a custom Lavalink player subclass. Less moving parts.
+
+### Crossfade and DJ ducking (audio transitions)
+
+`AudioTransitionController` is a small position-polling state machine that
+ramps the player's volume up at the start of every music track and back
+down in its last `Audio.CrossfadeSeconds` seconds. The same machinery
+brackets DJ TTS prerolls: music fades out → DJ speaks at full → next music
+fades in. This gives the "ducking" feel without true mixing.
+
+Constraint: a single `LavalinkPlayer` per guild plays one stream at a
+time, so the swap between tracks always has a small (~100-500 ms) silent
+gap while Lavalink loads the next URL. The fade hides the abrupt cut but
+isn't a true crossfade overlap.
+
+Disable by setting `Audio.CrossfadeSeconds: 0`. Tracks shorter than
+`Audio.CrossfadeMinTrackSeconds` skip the ramp.
+
+The controller drives volume by polling `player.Position` every 200 ms
+rather than scheduling a `Task.Delay(duration - fade)` timer. The polling
+form handles pause / resume / seek for free — paused means position
+doesn't advance, so the fade math stays put without explicit handlers.
 
 ### Why we don't use `QueuedLavalinkPlayer`
 
