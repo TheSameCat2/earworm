@@ -40,6 +40,9 @@ public class PlayerEngine : IDisposable
     private QueueItem? _currentTrack;
     private DateTimeOffset _trackStartedAt;
     private bool _isPaused;
+    private PlaybackState _cachedState;
+
+    private const int MaxConsecutiveLoadFailures = 10;
 
     // When we're playing a TTS commentary track ahead of music, this TCS is
     // non-null and gets signalled by the global TrackEnded handler so the
@@ -91,6 +94,8 @@ public class PlayerEngine : IDisposable
         {
             throw new InvalidOperationException("PlayerEngine requires a valid discord.guild_id (ulong) in config.");
         }
+
+        _cachedState = BuildIdleState();
 
         _queueManager.TrackQueued += OnTrackQueued;
         _audioService.TrackEnded += OnLavalinkTrackEndedAsync;
@@ -153,6 +158,8 @@ public class PlayerEngine : IDisposable
                     ended = _currentTrack;
                     startedAt = _trackStartedAt;
                     _currentTrack = null;
+                    _isPaused = false;
+                    RebuildStateLocked();
                 }
 
                 if (ended != null)
@@ -189,127 +196,166 @@ public class PlayerEngine : IDisposable
 
     private async Task PlayNextAsync(LavalinkPlayer player)
     {
-        var next = await _queueManager.DequeueAsync();
-        if (next == null)
-        {
-            _logger.LogInformation("Queue is empty; player idle.");
-            await _queueRepository.UpdatePlaybackStateAsync(BuildIdleState());
-            return;
-        }
+        int consecutiveFailures = 0;
 
-        // Pre-track hook: DJ commentary preroll or null.
-        TtsPreroll? preroll = null;
-        if (_preTrackHook != null)
+        while (true)
         {
-            try
+            var next = await _queueManager.DequeueAsync();
+            if (next == null)
             {
-                preroll = await _preTrackHook(next, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Pre-track hook (DJ commentary) failed; continuing to music.");
-            }
-        }
-
-        // Play TTS pre-roll first if commentary was generated, then run its
-        // cleanup callback so DJEngine can remove the staged .mp3.
-        if (preroll != null)
-        {
-            try
-            {
-                var ttsTrack = await _audioService.Tracks.LoadTrackAsync(preroll.Url, TrackSearchMode.None);
-                if (ttsTrack != null)
+                _logger.LogInformation("Queue is empty; player idle.");
+                lock (_stateLock)
                 {
-                    TaskCompletionSource tcs;
-                    lock (_stateLock) { _ttsCompletion = tcs = new TaskCompletionSource(); }
-                    await _transitions.PrepareForPrerollAsync(player);
-                    await player.PlayAsync(ttsTrack);
-                    // Cap the wait: if Lavalink misses the TrackEnded event for
-                    // the TTS clip (reconnect, dropped event), the player would
-                    // otherwise hang the queue indefinitely.
-                    var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(30)));
-                    if (completed != tcs.Task)
+                    _currentTrack = null;
+                    _isPaused = false;
+                    RebuildStateLocked();
+                }
+                await _queueRepository.UpdatePlaybackStateAsync(State);
+                return;
+            }
+
+            // Pre-track hook: DJ commentary preroll or null.
+            TtsPreroll? preroll = null;
+            if (_preTrackHook != null)
+            {
+                try
+                {
+                    preroll = await _preTrackHook(next, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Pre-track hook (DJ commentary) failed; continuing to music.");
+                }
+            }
+
+            // Play TTS pre-roll first if commentary was generated, then run its
+            // cleanup callback so DJEngine can remove the staged .mp3.
+            if (preroll != null)
+            {
+                try
+                {
+                    var ttsTrack = await _audioService.Tracks.LoadTrackAsync(preroll.Url, TrackSearchMode.None);
+                    if (ttsTrack != null)
                     {
-                        _logger.LogWarning("TTS preroll did not complete within 30s; clearing state and continuing.");
-                        lock (_stateLock)
+                        TaskCompletionSource tcs;
+                        lock (_stateLock) { _ttsCompletion = tcs = new TaskCompletionSource(); }
+                        await _transitions.PrepareForPrerollAsync(player);
+                        await player.PlayAsync(ttsTrack);
+                        // Cap the wait: if Lavalink misses the TrackEnded event for
+                        // the TTS clip (reconnect, dropped event), the player would
+                        // otherwise hang the queue indefinitely.
+                        var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+                        if (completed != tcs.Task)
                         {
-                            if (_ttsCompletion == tcs) _ttsCompletion = null;
+                            _logger.LogWarning("TTS preroll did not complete within 30s; clearing state and continuing.");
+                            lock (_stateLock)
+                            {
+                                if (_ttsCompletion == tcs) _ttsCompletion = null;
+                            }
                         }
                     }
+                    else
+                    {
+                        _logger.LogWarning("Lavalink could not load TTS URL: {Url}", preroll.Url);
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    _logger.LogWarning("Lavalink could not load TTS URL: {Url}", preroll.Url);
+                    _logger.LogWarning(ex, "Failed to play TTS pre-roll; continuing to music.");
+                    lock (_stateLock) { _ttsCompletion = null; }
                 }
+                finally
+                {
+                    try { await preroll.OnConsumedAsync(); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "TTS cleanup callback threw."); }
+                }
+            }
+
+            // Now play the actual music track.
+            var query = BuildTrackQuery(next);
+            LavalinkTrack? musicTrack;
+            try
+            {
+                musicTrack = await _audioService.Tracks.LoadTrackAsync(query, TrackSearchMode.None);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to play TTS pre-roll; continuing to music.");
-                lock (_stateLock) { _ttsCompletion = null; }
+                _logger.LogError(ex, "Lavalink threw while loading track: {Title}", next.Title);
+                TrackFailed?.Invoke(next, $"Load error: {ex.Message}");
+                consecutiveFailures++;
+                if (consecutiveFailures >= MaxConsecutiveLoadFailures)
+                {
+                    _logger.LogCritical("Hit {Cap} consecutive Lavalink load failures; halting playback and going idle.", MaxConsecutiveLoadFailures);
+                    lock (_stateLock)
+                    {
+                        _currentTrack = null;
+                        _isPaused = false;
+                        RebuildStateLocked();
+                    }
+                    await _queueRepository.UpdatePlaybackStateAsync(State);
+                    return;
+                }
+                continue;
             }
-            finally
+
+            if (musicTrack == null)
             {
-                try { await preroll.OnConsumedAsync(); }
-                catch (Exception ex) { _logger.LogWarning(ex, "TTS cleanup callback threw."); }
+                _logger.LogWarning("Lavalink returned no result for query: {Query}", query);
+                TrackFailed?.Invoke(next, "Track not found via Lavalink.");
+                consecutiveFailures++;
+                if (consecutiveFailures >= MaxConsecutiveLoadFailures)
+                {
+                    _logger.LogCritical("Hit {Cap} consecutive Lavalink load failures; halting playback and going idle.", MaxConsecutiveLoadFailures);
+                    lock (_stateLock)
+                    {
+                        _currentTrack = null;
+                        _isPaused = false;
+                        RebuildStateLocked();
+                    }
+                    await _queueRepository.UpdatePlaybackStateAsync(State);
+                    return;
+                }
+                continue;
             }
-        }
 
-        // Now play the actual music track.
-        var query = BuildTrackQuery(next);
-        LavalinkTrack? musicTrack;
-        try
-        {
-            musicTrack = await _audioService.Tracks.LoadTrackAsync(query, TrackSearchMode.None);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Lavalink threw while loading track: {Title}", next.Title);
-            TrackFailed?.Invoke(next, $"Load error: {ex.Message}");
-            // Try the next item rather than spinning forever on a bad URL.
-            await PlayNextAsync(player);
-            return;
-        }
+            consecutiveFailures = 0;
 
-        if (musicTrack == null)
-        {
-            _logger.LogWarning("Lavalink returned no result for query: {Query}", query);
-            TrackFailed?.Invoke(next, "Track not found via Lavalink.");
-            await PlayNextAsync(player);
-            return;
-        }
-
-        lock (_stateLock)
-        {
-            _currentTrack = next;
-            _trackStartedAt = DateTimeOffset.UtcNow;
-            _isPaused = false;
-        }
-
-        var duration = next.DurationSeconds.HasValue
-            ? TimeSpan.FromSeconds(next.DurationSeconds.Value)
-            : (TimeSpan?)null;
-        await _transitions.PlayMusicAsync(player, duration, () => player.PlayAsync(musicTrack));
-        TrackStarted?.Invoke(next);
-
-        await _queueRepository.UpdatePlaybackStateAsync(State);
-
-        // Metrics: tracks_completed gets incremented on TrackEnded (Finished),
-        // not here. Here we just record a per-user "request played" beat by
-        // bumping the source-type counter when we actually start it.
-        try
-        {
-            string sourceMetric = next.SourceType switch
+            lock (_stateLock)
             {
-                "youtube" => "requests_youtube",
-                "soundcloud" => "requests_soundcloud",
-                "mp3_upload" => "requests_mp3_upload",
-                _ => "requests_search"
-            };
-            await _metricsRepository.IncrementGlobalMetricAsync(sourceMetric, 1);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to increment source-type metric.");
+                _currentTrack = next;
+                _trackStartedAt = DateTimeOffset.UtcNow;
+                _isPaused = false;
+                RebuildStateLocked();
+            }
+
+            var duration = next.DurationSeconds.HasValue
+                ? TimeSpan.FromSeconds(next.DurationSeconds.Value)
+                : (TimeSpan?)null;
+            await _transitions.PlayMusicAsync(player, duration, () => player.PlayAsync(musicTrack));
+            TrackStarted?.Invoke(next);
+
+            await _queueRepository.UpdatePlaybackStateAsync(State);
+
+            // Metrics: tracks_completed gets incremented on TrackEnded (Finished),
+            // not here. Here we just record a per-user "request played" beat by
+            // bumping the source-type counter when we actually start it.
+            try
+            {
+                string sourceMetric = next.SourceType switch
+                {
+                    "youtube" => "requests_youtube",
+                    "soundcloud" => "requests_soundcloud",
+                    "mp3_upload" => "requests_mp3_upload",
+                    _ => "requests_search"
+                };
+                await _metricsRepository.IncrementGlobalMetricAsync(sourceMetric, 1);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to increment source-type metric.");
+            }
+
+            return;
         }
     }
 
@@ -334,34 +380,37 @@ public class PlayerEngine : IDisposable
     {
         get
         {
-            QueueItem? track;
-            bool paused;
             lock (_stateLock)
             {
-                track = _currentTrack;
-                paused = _isPaused;
+                return _cachedState;
             }
-
-            // Position requires a sync player handle which we don't safely have.
-            // Leave as 0 for v1; the /queue display shows "0:00 / 3:45" which
-            // is acceptable while we ship.
-            return new PlaybackState
-            {
-                IsPlaying = track != null && !paused,
-                IsPaused = paused,
-                CurrentSourceType = track?.SourceType,
-                CurrentSourceId = track?.SourceId,
-                CurrentTitle = track?.Title,
-                CurrentArtist = track?.Artist,
-                CurrentDurationSeconds = track?.DurationSeconds,
-                CurrentRequestedByUserId = track?.RequestedByUserId,
-                CurrentRequestedByDisplayName = track?.RequestedByDisplayName,
-                CurrentPositionMs = 0,
-                VoiceChannelId = null,
-                VoiceGuildId = _guildId.ToString(),
-                UpdatedAt = DateTimeOffset.UtcNow
-            };
         }
+    }
+
+    private void RebuildStateLocked()
+    {
+        var track = _currentTrack;
+        var paused = _isPaused;
+
+        // Position requires a sync player handle which we don't safely have.
+        // Leave as 0 for v1; the /queue display shows "0:00 / 3:45" which
+        // is acceptable while we ship.
+        _cachedState = new PlaybackState
+        {
+            IsPlaying = track != null && !paused,
+            IsPaused = paused,
+            CurrentSourceType = track?.SourceType,
+            CurrentSourceId = track?.SourceId,
+            CurrentTitle = track?.Title,
+            CurrentArtist = track?.Artist,
+            CurrentDurationSeconds = track?.DurationSeconds,
+            CurrentRequestedByUserId = track?.RequestedByUserId,
+            CurrentRequestedByDisplayName = track?.RequestedByDisplayName,
+            CurrentPositionMs = 0,
+            VoiceChannelId = null,
+            VoiceGuildId = _guildId.ToString(),
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
     }
 
     private PlaybackState BuildIdleState() => new()
@@ -378,7 +427,7 @@ public class PlayerEngine : IDisposable
         var player = await TryGetPlayerAsync();
         if (player == null) return;
         await player.PauseAsync();
-        lock (_stateLock) { _isPaused = true; }
+        lock (_stateLock) { _isPaused = true; RebuildStateLocked(); }
         PlaybackPaused?.Invoke();
     }
 
@@ -387,7 +436,7 @@ public class PlayerEngine : IDisposable
         var player = await TryGetPlayerAsync();
         if (player == null) return;
         await player.ResumeAsync();
-        lock (_stateLock) { _isPaused = false; }
+        lock (_stateLock) { _isPaused = false; RebuildStateLocked(); }
         PlaybackResumed?.Invoke();
     }
 
@@ -439,7 +488,7 @@ public class PlayerEngine : IDisposable
         {
             await player.StopAsync();
         }
-        lock (_stateLock) { _currentTrack = null; _isPaused = false; }
+        lock (_stateLock) { _currentTrack = null; _isPaused = false; RebuildStateLocked(); }
     }
 
     /// <summary>
