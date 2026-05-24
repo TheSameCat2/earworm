@@ -94,6 +94,14 @@ Dj:
   #     "http://earworm:8080" (the bot's service name).
   TtsServeBaseUrl: "http://host.docker.internal:8080"
 
+  # Maximum age (minutes) for files in TtsScratchDirectory before the
+  # periodic retention sweep deletes them. Default: 60.
+  TtsScratchMaxAgeMinutes: 60
+
+  # Maximum number of .mp3 files allowed in TtsScratchDirectory at once.
+  # If exceeded, the oldest excess files are removed. Default: 100.
+  TtsScratchMaxFiles: 100
+
 Cache:
   # Legacy from the pre-Lavalink era. Lavalink handles its own
   # caching internally. Kept so EarwormConfig binding doesn't break.

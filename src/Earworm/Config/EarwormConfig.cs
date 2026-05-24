@@ -75,6 +75,19 @@ public sealed record DjConfig
     /// Empty string disables DJ commentary entirely.
     /// </summary>
     public string TtsServeBaseUrl { get; init; } = "http://host.docker.internal:8080";
+
+    /// <summary>
+    /// Maximum age (in minutes) for files in <see cref="TtsScratchDirectory"/> before
+    /// the periodic retention sweep deletes them. Default 60 minutes.
+    /// </summary>
+    public int TtsScratchMaxAgeMinutes { get; init; } = 60;
+
+    /// <summary>
+    /// Maximum number of files allowed in <see cref="TtsScratchDirectory"/> at any
+    /// one time. If the count exceeds this, the oldest excess files are deleted.
+    /// Default 100.
+    /// </summary>
+    public int TtsScratchMaxFiles { get; init; } = 100;
 }
 
 public sealed record TtsConfig
