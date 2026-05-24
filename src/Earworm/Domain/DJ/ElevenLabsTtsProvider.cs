@@ -13,25 +13,26 @@ namespace Earworm.Domain.DJ;
 
 public sealed class ElevenLabsTtsProvider : ITtsProvider
 {
-    private readonly HttpClient _httpClient;
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly EarwormConfig _config;
     private readonly ILogger<ElevenLabsTtsProvider> _logger;
+    private readonly string _apiKey;
 
-    public ElevenLabsTtsProvider(HttpClient httpClient, EarwormConfig config, ILogger<ElevenLabsTtsProvider> logger)
+    public ElevenLabsTtsProvider(IHttpClientFactory httpClientFactory, EarwormConfig config, ILogger<ElevenLabsTtsProvider> logger)
     {
-        _httpClient = httpClient;
+        _httpClientFactory = httpClientFactory;
         _config = config;
         _logger = logger;
+
+        string apiKey = Environment.GetEnvironmentVariable("EARWORM_ELEVENLABS_API_KEY") ?? string.Empty;
+        if (string.IsNullOrEmpty(apiKey))
+            throw new InvalidOperationException("ElevenLabs API key is missing. Set the EARWORM_ELEVENLABS_API_KEY environment variable.");
+        _apiKey = apiKey;
     }
 
     public async Task<Stream> RenderTtsAsync(string text, CancellationToken cancellationToken)
     {
-        string apiKey = Environment.GetEnvironmentVariable("EARWORM_ELEVENLABS_API_KEY") ?? string.Empty;
-        if (string.IsNullOrEmpty(apiKey))
-        {
-            _logger.LogError("EARWORM_ELEVENLABS_API_KEY environment variable is not set.");
-            throw new InvalidOperationException("ElevenLabs API key is missing. Set the EARWORM_ELEVENLABS_API_KEY environment variable.");
-        }
+        using var _httpClient = _httpClientFactory.CreateClient(nameof(ElevenLabsTtsProvider));
 
         string voiceId = _config.Dj.Tts.VoiceId;
         if (string.IsNullOrEmpty(voiceId))
@@ -56,7 +57,7 @@ public sealed class ElevenLabsTtsProvider : ITtsProvider
 
         string json = JsonSerializer.Serialize(requestBody);
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-        request.Headers.Add("xi-api-key", apiKey);
+        request.Headers.Add("xi-api-key", _apiKey);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("audio/mpeg"));
         request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
