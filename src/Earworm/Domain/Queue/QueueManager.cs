@@ -82,8 +82,10 @@ public class QueueManager
 
     /// <summary>
     /// Adds a track to the queue, checking all configured constraints.
+    /// Returns the finalized <see cref="QueueItem"/> as it was added to the in-memory queue
+    /// (including the database-assigned <see cref="QueueItem.QueueItemId"/> and <see cref="QueueItem.Position"/>).
     /// </summary>
-    public async Task AddTrackAsync(
+    public async Task<QueueItem> AddTrackAsync(
         string sourceType,
         string sourceId,
         string title,
@@ -199,11 +201,12 @@ public class QueueManager
             {
                 _logger.LogWarning(ex, "Failed to clean up orphaned queue row {Id} after in-memory removal.", newId);
             }
-            return;
+            return itemForEvent;
         }
 
         _logger.LogInformation("Queued track: {Title} by {Artist} at position {Pos}", title, artist, pos);
         handler?.Invoke(itemForEvent);
+        return itemForEvent;
     }
 
     /// <summary>

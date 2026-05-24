@@ -49,21 +49,27 @@ public sealed class HistoryRepository : IHistoryRepository
                     await insCmd.ExecuteNonQueryAsync();
                 }
 
-                // 2. Prune excess entries
-                using (var pruneCmd = connection.CreateCommand())
+                // 2. Prune excess entries — only pay the delete cost when we are actually over the cap.
+                using (var countCmd = connection.CreateCommand())
                 {
-                    pruneCmd.Transaction = transaction;
-                    pruneCmd.CommandText = @"
-                        DELETE FROM history 
-                        WHERE history_id NOT IN (
-                            SELECT history_id 
-                            FROM history 
-                            ORDER BY played_at DESC 
-                            LIMIT $retentionCount
-                        );
-                    ";
-                    pruneCmd.Parameters.AddWithValue("$retentionCount", retentionCount);
-                    await pruneCmd.ExecuteNonQueryAsync();
+                    countCmd.Transaction = transaction;
+                    countCmd.CommandText = "SELECT COUNT(*) FROM history;";
+                    var countObj = await countCmd.ExecuteScalarAsync();
+                    long rowCount = countObj == null || countObj == DBNull.Value ? 0 : Convert.ToInt64(countObj);
+
+                    if (rowCount > retentionCount)
+                    {
+                        using var pruneCmd = connection.CreateCommand();
+                        pruneCmd.Transaction = transaction;
+                        pruneCmd.CommandText = @"
+                            DELETE FROM history
+                            WHERE history_id NOT IN (
+                                SELECT history_id FROM history ORDER BY played_at DESC LIMIT $retentionCount
+                            );
+                        ";
+                        pruneCmd.Parameters.AddWithValue("$retentionCount", retentionCount);
+                        await pruneCmd.ExecuteNonQueryAsync();
+                    }
                 }
 
                 transaction.Commit();

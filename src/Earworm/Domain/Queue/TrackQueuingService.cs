@@ -90,7 +90,7 @@ public sealed class TrackQueuingService
         var author = string.IsNullOrWhiteSpace(track.Author) ? "Unknown Artist" : track.Author!;
         int? durationSec = track.Duration.TotalSeconds > 0 ? (int)track.Duration.TotalSeconds : null;
 
-        await _queueManager.AddTrackAsync(
+        var queued = await _queueManager.AddTrackAsync(
             sourceType: sourceType,
             sourceId: sourceId,
             title: title,
@@ -125,16 +125,6 @@ public sealed class TrackQueuingService
             _logger.LogWarning(ex, "Failed to increment queue metrics for user {UserId}.", userId);
         }
 
-        return new QueueItem
-        {
-            SourceType = sourceType,
-            SourceId = sourceId,
-            Title = title,
-            Artist = author,
-            DurationSeconds = durationSec,
-            RequestedByUserId = userId,
-            RequestedByDisplayName = displayName,
-            GuildId = guildId
-        };
+        return queued;
     }
 }
