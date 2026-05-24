@@ -542,20 +542,27 @@ public class PlayerEngine : IDisposable
 
             await _historyRepository.AddHistoryEntryAsync(entry, _config.Persistence.HistoryRetentionCount);
 
+            var metricsBatch = new List<MetricIncrement>();
+
             if (failed)
             {
-                await _metricsRepository.IncrementGlobalMetricAsync("tracks_failed", 1);
+                metricsBatch.Add(new MetricIncrement("tracks_failed", 1));
             }
             else if (!skipped)
             {
-                await _metricsRepository.IncrementUserMetricAsync(track.RequestedByUserId, track.RequestedByDisplayName, "tracks_completed", 1);
-                await _metricsRepository.IncrementGlobalMetricAsync("tracks_completed", 1);
+                metricsBatch.Add(new MetricIncrement("tracks_completed", 1, track.RequestedByUserId, track.RequestedByDisplayName));
+                metricsBatch.Add(new MetricIncrement("tracks_completed", 1));
             }
 
             if (playedSeconds > 0)
             {
-                await _metricsRepository.IncrementUserMetricAsync(track.RequestedByUserId, track.RequestedByDisplayName, "listening_seconds", playedSeconds);
-                await _metricsRepository.IncrementGlobalMetricAsync("listening_seconds", playedSeconds);
+                metricsBatch.Add(new MetricIncrement("listening_seconds", playedSeconds, track.RequestedByUserId, track.RequestedByDisplayName));
+                metricsBatch.Add(new MetricIncrement("listening_seconds", playedSeconds));
+            }
+
+            if (metricsBatch.Count > 0)
+            {
+                await _metricsRepository.IncrementBatchAsync(metricsBatch);
             }
         }
         catch (Exception ex)

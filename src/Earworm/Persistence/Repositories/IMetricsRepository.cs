@@ -4,6 +4,17 @@ using Earworm.Domain.Telemetry;
 
 namespace Earworm.Persistence.Repositories;
 
+/// <summary>
+/// Describes a single metric counter increment for use with <see cref="IMetricsRepository.IncrementBatchAsync"/>.
+/// When <see cref="UserId"/> is null the increment is applied to the global metrics table;
+/// otherwise it is applied to the per-user table for the given user.
+/// </summary>
+public record MetricIncrement(
+    string Column,
+    long Amount,
+    string? UserId = null,
+    string? DisplayName = null);
+
 public interface IMetricsRepository
 {
     /// <summary>
@@ -26,6 +37,13 @@ public interface IMetricsRepository
     /// Valid whitelisted columns: tracks_queued, tracks_completed, listening_seconds, requests_youtube, requests_soundcloud, requests_mp3_upload, requests_search
     /// </summary>
     Task IncrementUserMetricAsync(string userId, string displayName, string column, long amount = 1);
+
+    /// <summary>
+    /// Atomically increments all supplied metric counters inside a single write-channel round-trip and a single SQLite transaction.
+    /// Increments with a null <see cref="MetricIncrement.UserId"/> are applied to the global table;
+    /// those with a non-null UserId are applied to the per-user table.
+    /// </summary>
+    Task IncrementBatchAsync(IReadOnlyCollection<MetricIncrement> increments);
 
     /// <summary>
     /// Retrieves a user's metric counters, or null if not found.
