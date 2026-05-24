@@ -169,6 +169,12 @@ public static class Program
             Environment.Exit(1);
         }
 
+        // TTS scratch directory: sweep orphans from any previous crash, then
+        // start the periodic retention loop.
+        var janitor = serviceProvider.GetRequiredService<TtsScratchJanitor>();
+        janitor.SweepOnStartup();
+        janitor.StartPeriodicSweep();
+
         // Eagerly resolve event-handler singletons so their ctor-time gateway
         // event subscriptions are wired before SessionCreated fires.
         _ = serviceProvider.GetRequiredService<MessageListener>();
@@ -303,6 +309,7 @@ public static class Program
         services.AddSingleton<ElevenLabsTtsProvider>();
         services.AddSingleton<ITtsProvider>(sp => sp.GetRequiredService<ElevenLabsTtsProvider>());
         services.AddSingleton<DJEngine>();
+        services.AddSingleton<TtsScratchJanitor>();
 
         services.AddSingleton<VoiceManager>();
         services.AddSingleton<DiscordGateway>();
