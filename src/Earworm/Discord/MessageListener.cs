@@ -13,12 +13,17 @@ namespace Earworm.Discord;
 
 public sealed class MessageListener : IDisposable
 {
+    private static readonly DiscordEmoji EmojiX = DiscordEmoji.FromUnicode("❌");
+    private static readonly DiscordEmoji EmojiHourglass = DiscordEmoji.FromUnicode("⏳");
+    private static readonly DiscordEmoji EmojiCheck = DiscordEmoji.FromUnicode("✅");
+
     private readonly DiscordClient _discordClient;
     private readonly VoiceManager _voiceManager;
     private readonly TrackQueuingService _trackQueuingService;
     private readonly ISettingsRepository _settingsRepository;
     private readonly ILogger<MessageListener> _logger;
     private readonly ShutdownLifetime _shutdown;
+    private Regex? _mentionRegex;
 
     public MessageListener(
         DiscordClient discordClient,
@@ -55,15 +60,15 @@ public sealed class MessageListener : IDisposable
                 var voiceChannel = member.VoiceState?.Channel;
                 if (voiceChannel == null)
                 {
-                    await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":x:"));
+                    await e.Message.CreateReactionAsync(EmojiX);
                     await e.Message.RespondAsync("⚠️ You must be in a voice channel to queue music.");
                     return;
                 }
 
                 // Extract query (strip bot mention).
                 var content = e.Message.Content;
-                var mentionPattern = $"<@!?{sender.CurrentUser.Id}>";
-                var query = Regex.Replace(content, mentionPattern, "").Trim();
+                _mentionRegex ??= new Regex($"<@!?{sender.CurrentUser.Id}>", RegexOptions.Compiled);
+                var query = _mentionRegex.Replace(content, "").Trim();
 
                 // Prefer attachment URL if any audio file is attached. Lavalink can
                 // load Discord attachment URLs directly via the HTTP source.
@@ -92,13 +97,13 @@ public sealed class MessageListener : IDisposable
                         || (djRoleId.HasValue && member.Roles.Any(r => r.Id == djRoleId.Value));
                     if (!isDj)
                     {
-                        await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":x:"));
+                        await e.Message.CreateReactionAsync(EmojiX);
                         await e.Message.RespondAsync("⚠️ Playlist queuing is restricted to DJs or Administrators.");
                         return;
                     }
                 }
 
-                await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":hourglass:"));
+                await e.Message.CreateReactionAsync(EmojiHourglass);
 
                 _logger.LogInformation("Resolving query/URL '{Query}' from user {User}", query, e.Author.Username);
                 await _trackQueuingService.ResolveAndQueueAsync(
@@ -107,8 +112,8 @@ public sealed class MessageListener : IDisposable
                     member.DisplayName,
                     e.Guild.Id.ToString());
 
-                await e.Message.DeleteOwnReactionAsync(DiscordEmoji.FromName(sender, ":hourglass:"));
-                await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":white_check_mark:"));
+                await e.Message.DeleteOwnReactionAsync(EmojiHourglass);
+                await e.Message.CreateReactionAsync(EmojiCheck);
 
                 // Auto-join voice if not connected.
                 var botChannelId = e.Guild.CurrentMember?.VoiceState?.Channel?.Id;
@@ -127,8 +132,8 @@ public sealed class MessageListener : IDisposable
                 _logger.LogError(ex, "Error handling music request from message.");
                 try
                 {
-                    await e.Message.DeleteOwnReactionAsync(DiscordEmoji.FromName(sender, ":hourglass:"));
-                    await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":x:"));
+                    await e.Message.DeleteOwnReactionAsync(EmojiHourglass);
+                    await e.Message.CreateReactionAsync(EmojiX);
                     await e.Message.RespondAsync($"⚠️ Failed to queue song: {ex.Message}");
                 }
                 catch (Exception inner)
