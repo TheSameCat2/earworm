@@ -51,10 +51,16 @@ public sealed class AudioTransitionController
 
     public void Cancel()
     {
+        CancellationTokenSource? toDispose;
         lock (_lock)
         {
-            _currentLoopCts?.Cancel();
+            toDispose = _currentLoopCts;
             _currentLoopCts = null;
+        }
+        if (toDispose != null)
+        {
+            try { toDispose.Cancel(); } catch (ObjectDisposedException) { }
+            toDispose.Dispose();
         }
     }
 
