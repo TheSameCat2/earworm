@@ -129,8 +129,8 @@ public sealed class PersistenceTests
             };
 
             // Act: Add Tracks
-            long id1 = await repo.AddTrackAsync(item1);
-            long id2 = await repo.AddTrackAsync(item2);
+            long id1 = await repo.AddTrackAsync(item1, 0);
+            long id2 = await repo.AddTrackAsync(item2, 1);
 
             // Assert Get Queue
             var queue = await repo.GetQueueAsync();
@@ -157,7 +157,8 @@ public sealed class PersistenceTests
             var queueAfterRemove = await repo.GetQueueAsync();
             queueAfterRemove.Should().HaveCount(1);
             queueAfterRemove[0].SourceId.Should().Be("t1");
-            queueAfterRemove[0].Position.Should().Be(0); // Should shift position down to 0
+            // Position gaps are intentional: the DB skips renumbering on delete.
+            // QueueManager maintains dense in-memory positions for display.
 
             // Playback State singleton tests
             var defaultState = await repo.GetPlaybackStateAsync();
@@ -221,7 +222,7 @@ public sealed class PersistenceTests
                 QueuedAt = DateTimeOffset.UtcNow,
                 GuildId = "guild123"
             };
-            await queueRepo.AddTrackAsync(item);
+            await queueRepo.AddTrackAsync(item, 0);
 
             var activeState = new PlaybackState
             {
@@ -441,6 +442,112 @@ public sealed class PersistenceTests
             // Invalid column validation
             Func<Task> act = async () => await repo.IncrementUserMetricAsync("user1", "Alice", "invalid_col_name", 1);
             await act.Should().ThrowAsync<ArgumentException>();
+        });
+    }
+
+    [Fact]
+    public async Task QueueRepository_MoveTrack_AcrossLargeQueue_ProducesCorrectOrder()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            const int N = 50;
+            var repo = new QueueRepository(stateStore);
+
+            // Insert N tracks with sequential positions
+            var ids = new long[N];
+            for (int i = 0; i < N; i++)
+            {
+                ids[i] = await repo.AddTrackAsync(new QueueItem
+                {
+                    SourceType = "youtube",
+                    SourceId = $"track_{i}",
+                    Title = $"Track {i}",
+                    Artist = "Artist",
+                    RequestedByUserId = "u1",
+                    RequestedByDisplayName = "User",
+                    QueuedAt = DateTimeOffset.UtcNow,
+                    GuildId = "g1"
+                }, i);
+            }
+
+            // Move the last item (index 49) to the front (position 0)
+            await repo.MoveTrackAsync(ids[N - 1], 0);
+
+            var queue = await repo.GetQueueAsync();
+            queue.Should().HaveCount(N);
+            queue[0].SourceId.Should().Be($"track_{N - 1}", "last track moved to front");
+            for (int i = 1; i < N; i++)
+            {
+                queue[i].SourceId.Should().Be($"track_{i - 1}", $"original track {i - 1} should now be at index {i}");
+            }
+
+            // Move item from index 0 (track_49) to the middle (position 25)
+            await repo.MoveTrackAsync(ids[N - 1], 25);
+
+            var queue2 = await repo.GetQueueAsync();
+            queue2.Should().HaveCount(N);
+            queue2[25].SourceId.Should().Be($"track_{N - 1}", "moved item should be at index 25");
+            // Items before the moved item: track_0..track_24
+            for (int i = 0; i < 25; i++)
+            {
+                queue2[i].SourceId.Should().Be($"track_{i}");
+            }
+            // Items after the moved item: track_25..track_48
+            for (int i = 26; i < N; i++)
+            {
+                queue2[i].SourceId.Should().Be($"track_{i - 1}");
+            }
+        });
+    }
+
+    [Fact]
+    public async Task QueueRepository_RemoveTrack_LeavesGapsAndOrderIsPreservedByPosition()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            const int N = 20;
+            var repo = new QueueRepository(stateStore);
+
+            var ids = new long[N];
+            for (int i = 0; i < N; i++)
+            {
+                ids[i] = await repo.AddTrackAsync(new QueueItem
+                {
+                    SourceType = "youtube",
+                    SourceId = $"track_{i}",
+                    Title = $"Track {i}",
+                    Artist = "Artist",
+                    RequestedByUserId = "u1",
+                    RequestedByDisplayName = "User",
+                    QueuedAt = DateTimeOffset.UtcNow,
+                    GuildId = "g1"
+                }, i);
+            }
+
+            // Dequeue first 5 items (simulating front-of-queue pops)
+            for (int i = 0; i < 5; i++)
+            {
+                await repo.RemoveTrackAsync(ids[i]);
+            }
+
+            // Remaining items must be in correct relative order by position column,
+            // even though positions are no longer dense (gaps exist).
+            var remaining = await repo.GetQueueAsync();
+            remaining.Should().HaveCount(N - 5);
+            for (int i = 0; i < remaining.Count; i++)
+            {
+                remaining[i].SourceId.Should().Be($"track_{i + 5}", $"item at index {i} should be track_{i + 5}");
+            }
+
+            // Compact positions and verify dense 0-based assignment
+            await repo.CompactPositionsAsync();
+            var compacted = await repo.GetQueueAsync();
+            compacted.Should().HaveCount(N - 5);
+            for (int i = 0; i < compacted.Count; i++)
+            {
+                compacted[i].Position.Should().Be(i, $"after compact, position at index {i} must equal {i}");
+                compacted[i].SourceId.Should().Be($"track_{i + 5}");
+            }
         });
     }
 

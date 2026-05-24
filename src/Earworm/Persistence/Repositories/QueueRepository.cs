@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 using Earworm.Domain.Queue;
@@ -23,7 +24,7 @@ public sealed class QueueRepository : IQueueRepository
 
         using var cmd = connection.CreateCommand();
         cmd.CommandText = @"
-            SELECT queue_item_id, position, source_type, source_id, title, artist, duration_seconds, 
+            SELECT queue_item_id, position, source_type, source_id, title, artist, duration_seconds,
                    requested_by_user_id, requested_by_display_name, queued_at, guild_id
             FROM queue
             ORDER BY position ASC;
@@ -51,64 +52,35 @@ public sealed class QueueRepository : IQueueRepository
         return list;
     }
 
-    public async Task<long> AddTrackAsync(QueueItem item)
+    public async Task<long> AddTrackAsync(QueueItem item, int position)
     {
         return await _stateStore.SubmitWriteAsync(async connection =>
         {
-            using var transaction = connection.BeginTransaction();
-            try
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"
+                INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
+                                   requested_by_user_id, requested_by_display_name, queued_at, guild_id)
+                VALUES ($position, $sourceType, $sourceId, $title, $artist, $duration,
+                        $userId, $displayName, $queuedAt, $guildId)
+                RETURNING queue_item_id;
+            ";
+            cmd.Parameters.AddWithValue("$position", position);
+            cmd.Parameters.AddWithValue("$sourceType", item.SourceType);
+            cmd.Parameters.AddWithValue("$sourceId", item.SourceId);
+            cmd.Parameters.AddWithValue("$title", (object?)item.Title ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$artist", (object?)item.Artist ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$duration", (object?)item.DurationSeconds ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$userId", item.RequestedByUserId);
+            cmd.Parameters.AddWithValue("$displayName", item.RequestedByDisplayName);
+            cmd.Parameters.AddWithValue("$queuedAt", item.QueuedAt.ToUnixTimeMilliseconds());
+            cmd.Parameters.AddWithValue("$guildId", item.GuildId);
+
+            var idObj = await cmd.ExecuteScalarAsync();
+            if (idObj == null || idObj == DBNull.Value)
             {
-                // Find current max position
-                int nextPosition = 0;
-                using (var maxCmd = connection.CreateCommand())
-                {
-                    maxCmd.Transaction = transaction;
-                    maxCmd.CommandText = "SELECT MAX(position) FROM queue;";
-                    var val = await maxCmd.ExecuteScalarAsync();
-                    if (val != null && val != DBNull.Value)
-                    {
-                        nextPosition = Convert.ToInt32(val) + 1;
-                    }
-                }
-
-                long newId;
-                using (var insCmd = connection.CreateCommand())
-                {
-                    insCmd.Transaction = transaction;
-                    insCmd.CommandText = @"
-                        INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
-                                           requested_by_user_id, requested_by_display_name, queued_at, guild_id)
-                        VALUES ($position, $sourceType, $sourceId, $title, $artist, $duration,
-                                $userId, $displayName, $queuedAt, $guildId)
-                        RETURNING queue_item_id;
-                    ";
-                    insCmd.Parameters.AddWithValue("$position", nextPosition);
-                    insCmd.Parameters.AddWithValue("$sourceType", item.SourceType);
-                    insCmd.Parameters.AddWithValue("$sourceId", item.SourceId);
-                    insCmd.Parameters.AddWithValue("$title", (object?)item.Title ?? DBNull.Value);
-                    insCmd.Parameters.AddWithValue("$artist", (object?)item.Artist ?? DBNull.Value);
-                    insCmd.Parameters.AddWithValue("$duration", (object?)item.DurationSeconds ?? DBNull.Value);
-                    insCmd.Parameters.AddWithValue("$userId", item.RequestedByUserId);
-                    insCmd.Parameters.AddWithValue("$displayName", item.RequestedByDisplayName);
-                    insCmd.Parameters.AddWithValue("$queuedAt", item.QueuedAt.ToUnixTimeMilliseconds());
-                    insCmd.Parameters.AddWithValue("$guildId", item.GuildId);
-
-                    var idObj = await insCmd.ExecuteScalarAsync();
-                    if (idObj == null || idObj == DBNull.Value)
-                    {
-                        throw new InvalidOperationException("INSERT ... RETURNING queue_item_id returned no rows.");
-                    }
-                    newId = Convert.ToInt64(idObj);
-                }
-
-                transaction.Commit();
-                return newId;
+                throw new InvalidOperationException("INSERT ... RETURNING queue_item_id returned no rows.");
             }
-            catch
-            {
-                transaction.Rollback();
-                throw;
-            }
+            return Convert.ToInt64(idObj);
         });
     }
 
@@ -116,42 +88,60 @@ public sealed class QueueRepository : IQueueRepository
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "DELETE FROM queue WHERE queue_item_id = $id;";
+            cmd.Parameters.AddWithValue("$id", queueItemId);
+            await cmd.ExecuteNonQueryAsync();
+        });
+    }
+
+    public async Task CompactPositionsAsync()
+    {
+        await _stateStore.SubmitWriteAsync(async connection =>
+        {
             using var transaction = connection.BeginTransaction();
             try
             {
-                int? targetPosition = null;
-                using (var posCmd = connection.CreateCommand())
+                var items = new List<long>();
+                using (var selectCmd = connection.CreateCommand())
                 {
-                    posCmd.Transaction = transaction;
-                    posCmd.CommandText = "SELECT position FROM queue WHERE queue_item_id = $id;";
-                    posCmd.Parameters.AddWithValue("$id", queueItemId);
-                    var val = await posCmd.ExecuteScalarAsync();
-                    if (val != null && val != DBNull.Value)
+                    selectCmd.Transaction = transaction;
+                    selectCmd.CommandText = "SELECT queue_item_id FROM queue ORDER BY position ASC;";
+                    using var reader = await selectCmd.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
                     {
-                        targetPosition = Convert.ToInt32(val);
+                        items.Add(reader.GetInt64(0));
                     }
                 }
 
-                if (targetPosition == null)
+                if (items.Count == 0)
                 {
                     transaction.Commit();
                     return;
                 }
 
-                using (var delCmd = connection.CreateCommand())
+                // Phase 1: move all rows to large negative sentinels to vacate position slots
+                using (var stageCmd = connection.CreateCommand())
                 {
-                    delCmd.Transaction = transaction;
-                    delCmd.CommandText = "DELETE FROM queue WHERE queue_item_id = $id;";
-                    delCmd.Parameters.AddWithValue("$id", queueItemId);
-                    await delCmd.ExecuteNonQueryAsync();
+                    stageCmd.Transaction = transaction;
+                    stageCmd.CommandText = "UPDATE queue SET position = -(position + 1000000);";
+                    await stageCmd.ExecuteNonQueryAsync();
                 }
 
-                using (var shiftCmd = connection.CreateCommand())
+                // Phase 2: assign dense 0-based positions via a single CASE statement
+                var sb = new StringBuilder();
+                sb.Append("UPDATE queue SET position = CASE queue_item_id");
+                for (int i = 0; i < items.Count; i++)
                 {
-                    shiftCmd.Transaction = transaction;
-                    shiftCmd.CommandText = "UPDATE queue SET position = position - 1 WHERE position > $position;";
-                    shiftCmd.Parameters.AddWithValue("$position", targetPosition.Value);
-                    await shiftCmd.ExecuteNonQueryAsync();
+                    sb.Append($" WHEN {items[i]} THEN {i}");
+                }
+                sb.Append(" END;");
+
+                using (var updCmd = connection.CreateCommand())
+                {
+                    updCmd.Transaction = transaction;
+                    updCmd.CommandText = sb.ToString();
+                    await updCmd.ExecuteNonQueryAsync();
                 }
 
                 transaction.Commit();
@@ -171,7 +161,7 @@ public sealed class QueueRepository : IQueueRepository
             using var transaction = connection.BeginTransaction();
             try
             {
-                // Get all current queue items ordered by position
+                // Load all items ordered by position
                 var items = new List<(long Id, int Pos)>();
                 using (var getCmd = connection.CreateCommand())
                 {
@@ -194,7 +184,6 @@ public sealed class QueueRepository : IQueueRepository
                 var targetItem = items[targetItemIndex];
                 items.RemoveAt(targetItemIndex);
 
-                // Safe bounds clamping
                 int clampedTo = Math.Max(0, Math.Min(toPosition, items.Count));
                 items.Insert(clampedTo, targetItem);
 
@@ -204,27 +193,44 @@ public sealed class QueueRepository : IQueueRepository
                     return;
                 }
 
-                // Two-phase position rewrite to avoid UNIQUE(position) collisions:
-                // phase 1 stages negative positions, phase 2 sets the final ones.
-                for (int i = 0; i < items.Count; i++)
+                // Only rows in the affected range need position updates
+                int lo = Math.Min(targetItemIndex, clampedTo);
+                int hi = Math.Max(targetItemIndex, clampedTo);
+
+                // Build a two-statement batched update covering only the affected range.
+                // Phase 1: move all affected rows to large negative sentinel positions to
+                //          clear the UNIQUE(position) slots (SQLite checks per-row).
+                // Phase 2: set the final positions via a single CASE statement.
+                // Together this is O(1) round-trips regardless of queue size.
+                var idList = new StringBuilder();
+                for (int i = lo; i <= hi; i++)
                 {
-                    using var updCmd = connection.CreateCommand();
-                    updCmd.Transaction = transaction;
-                    updCmd.CommandText = "UPDATE queue SET position = $pos WHERE queue_item_id = $id;";
-                    updCmd.Parameters.AddWithValue("$pos", -(i + 1));
-                    updCmd.Parameters.AddWithValue("$id", items[i].Id);
-                    await updCmd.ExecuteNonQueryAsync();
+                    if (i > lo) idList.Append(',');
+                    idList.Append(items[i].Id);
+                }
+                string inClause = idList.ToString();
+
+                // Phase 1: stage negatives
+                using (var stageCmd = connection.CreateCommand())
+                {
+                    stageCmd.Transaction = transaction;
+                    stageCmd.CommandText = $"UPDATE queue SET position = -(position + 1000000) WHERE queue_item_id IN ({inClause});";
+                    await stageCmd.ExecuteNonQueryAsync();
                 }
 
-                for (int i = 0; i < items.Count; i++)
+                // Phase 2: set final positions
+                var sb = new StringBuilder();
+                sb.Append("UPDATE queue SET position = CASE queue_item_id");
+                for (int i = lo; i <= hi; i++)
                 {
-                    using var updCmd = connection.CreateCommand();
-                    updCmd.Transaction = transaction;
-                    updCmd.CommandText = "UPDATE queue SET position = $pos WHERE queue_item_id = $id;";
-                    updCmd.Parameters.AddWithValue("$pos", i);
-                    updCmd.Parameters.AddWithValue("$id", items[i].Id);
-                    await updCmd.ExecuteNonQueryAsync();
+                    sb.Append($" WHEN {items[i].Id} THEN {i}");
                 }
+                sb.Append($" END WHERE queue_item_id IN ({inClause});");
+
+                using var updCmd = connection.CreateCommand();
+                updCmd.Transaction = transaction;
+                updCmd.CommandText = sb.ToString();
+                await updCmd.ExecuteNonQueryAsync();
 
                 transaction.Commit();
             }

@@ -118,7 +118,7 @@ public class QueueManager
             pos = _queue.Count;
             // SubmitWriteAsync only enqueues to an unbounded channel (no I/O),
             // so we can safely call it under the lock and capture the Task.
-            writeTask = _queueRepository.AddTrackAsync(item);
+            writeTask = _queueRepository.AddTrackAsync(item, pos);
 
             finalItem = item with { Position = pos };
             _queue.Add(finalItem);
@@ -408,7 +408,7 @@ public class QueueManager
         lock (_lock)
         {
             lastPos = _queue.Count;
-            addTask = _queueRepository.AddTrackAsync(fresh);
+            addTask = _queueRepository.AddTrackAsync(fresh, lastPos);
             _queue.Add(fresh with { Position = lastPos });
         }
 

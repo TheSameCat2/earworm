@@ -119,6 +119,22 @@ public static class Program
             var stateStore = serviceProvider.GetRequiredService<StateStore>();
             var migrationLogger = serviceProvider.GetRequiredService<ILogger<SchemaMigrator>>();
             new SchemaMigrator(stateStore.ConnectionString, migrationLogger).Migrate();
+
+            // Ensure singleton rows exist for databases created before the seed
+            // statements were added to the migration, or restored from a backup
+            // that is missing them.
+            using var seedConn = new Microsoft.Data.Sqlite.SqliteConnection(stateStore.ConnectionString);
+            await seedConn.OpenAsync();
+            using (var seedCmd = seedConn.CreateCommand())
+            {
+                seedCmd.CommandText = @"
+                    INSERT OR IGNORE INTO playback_state (id, is_playing, is_paused, current_position_ms, updated_at)
+                        VALUES (1, 0, 0, 0, $now);
+                    INSERT OR IGNORE INTO snapshot (id) VALUES (1);
+                ";
+                seedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                await seedCmd.ExecuteNonQueryAsync();
+            }
         }
         catch (Exception ex)
         {

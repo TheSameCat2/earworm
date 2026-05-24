@@ -8,7 +8,8 @@ namespace Earworm.Persistence.Repositories;
 public interface IQueueRepository
 {
     Task<List<QueueItem>> GetQueueAsync();
-    Task<long> AddTrackAsync(QueueItem item);
+    Task<long> AddTrackAsync(QueueItem item, int position);
+    Task CompactPositionsAsync();
     Task RemoveTrackAsync(long queueItemId);
     Task MoveTrackAsync(long queueItemId, int toPosition);
     Task ClearQueueAsync();
