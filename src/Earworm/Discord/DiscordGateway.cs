@@ -51,7 +51,14 @@ public sealed class DiscordGateway
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         _logger.LogInformation("Connecting to Discord Gateway...");
-        await _discordClient.ConnectAsync();
+        var connectTask = _discordClient.ConnectAsync();
+        var cancelTask = Task.Delay(Timeout.Infinite, cancellationToken);
+        var winner = await Task.WhenAny(connectTask, cancelTask);
+        if (winner == cancelTask)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        await connectTask;
     }
 
     public async Task StopAsync()
