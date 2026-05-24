@@ -115,7 +115,7 @@ public sealed class DJEngine : IDisposable
             const int hardCharCap = 320;
             if (text.Length > hardCharCap)
             {
-                text = text.Substring(0, hardCharCap).TrimEnd() + "...";
+                text = text[..hardCharCap].TrimEnd() + "...";
             }
 
             // Render to MP3 and stage on disk.
@@ -142,15 +142,11 @@ public sealed class DJEngine : IDisposable
             string pathForCleanup = scratchPath;
             Func<Task> cleanup = () =>
             {
-                try
+                _ = Task.Run(() =>
                 {
-                    if (File.Exists(pathForCleanup)) File.Delete(pathForCleanup);
-                    _logger.LogDebug("Cleaned up staged TTS file {Path}.", pathForCleanup);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to delete staged TTS file {Path}.", pathForCleanup);
-                }
+                    try { if (File.Exists(pathForCleanup)) File.Delete(pathForCleanup); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete staged TTS file {Path}.", pathForCleanup); }
+                });
                 return Task.CompletedTask;
             };
 
