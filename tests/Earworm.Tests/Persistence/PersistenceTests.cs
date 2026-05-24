@@ -761,6 +761,24 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task SchemaMigrator_CacheIndexTable_ShouldNotExistAfterMigrations()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            // The 002_drop_cache_index migration must have removed cache_index.
+            // Query sqlite_master directly to verify the table is gone.
+            using var connection = new Microsoft.Data.Sqlite.SqliteConnection(stateStore.ConnectionString);
+            await connection.OpenAsync();
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name='cache_index';";
+            var result = await cmd.ExecuteScalarAsync();
+
+            result.Should().BeNull("cache_index table must not exist after migrations run");
+        });
+    }
+
+    [Fact]
     public async Task StateStore_ConcurrentWrites_ShouldExecuteSequentiallyWithoutLockingExceptions()
     {
         await RunTestWithDbAsync(async stateStore =>
