@@ -13,9 +13,9 @@ public sealed class NowPlayingPoster : IDisposable
 {
     private readonly DiscordClient _discordClient;
     private readonly PlayerEngine _playerEngine;
-    private readonly EarwormConfig _config;
     private readonly ILogger<NowPlayingPoster> _logger;
     private readonly ShutdownLifetime _shutdown;
+    private readonly ulong? _nowPlayingChannelId;
 
     public NowPlayingPoster(
         DiscordClient discordClient,
@@ -26,28 +26,38 @@ public sealed class NowPlayingPoster : IDisposable
     {
         _discordClient = discordClient ?? throw new ArgumentNullException(nameof(discordClient));
         _playerEngine = playerEngine ?? throw new ArgumentNullException(nameof(playerEngine));
-        _config = config ?? throw new ArgumentNullException(nameof(config));
+        _ = config ?? throw new ArgumentNullException(nameof(config));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _shutdown = shutdown ?? throw new ArgumentNullException(nameof(shutdown));
+
+        var raw = config.Discord.NowPlayingChannelId;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            _nowPlayingChannelId = null;
+        }
+        else if (ulong.TryParse(raw, out var parsedId))
+        {
+            _nowPlayingChannelId = parsedId;
+        }
+        else
+        {
+            _logger.LogWarning("Invalid NowPlayingChannelId: {ChannelId}", raw);
+            _nowPlayingChannelId = null;
+        }
 
         _playerEngine.TrackStarted += OnTrackStarted;
     }
 
     private void OnTrackStarted(QueueItem track)
     {
+        if (_nowPlayingChannelId is not ulong channelId) return;
+
         var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
             try
             {
                 ct.ThrowIfCancellationRequested();
-                var channelIdStr = _config.Discord.NowPlayingChannelId;
-                if (string.IsNullOrWhiteSpace(channelIdStr)) return;
-                if (!ulong.TryParse(channelIdStr, out ulong channelId))
-                {
-                    _logger.LogWarning("Invalid NowPlayingChannelId: {ChannelId}", channelIdStr);
-                    return;
-                }
 
                 var channel = await _discordClient.GetChannelAsync(channelId);
                 if (channel == null)

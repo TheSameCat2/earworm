@@ -511,6 +511,39 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task HistoryRepository_Prune_KeepsExactlyRetentionCountAfterBulkInsert()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var repo = new HistoryRepository(stateStore);
+            const int total = 200;
+            const int retention = 100;
+
+            for (int i = 0; i < total; i++)
+            {
+                await repo.AddHistoryEntryAsync(new PlayHistoryEntry
+                {
+                    PlayedAt = DateTimeOffset.UtcNow.AddSeconds(i),
+                    SourceType = "youtube",
+                    SourceId = $"bulk_{i}",
+                    Title = $"Bulk Track {i}",
+                    RequestedByUserId = "u1",
+                    RequestedByDisplayName = "Bulk User",
+                    GuildId = "guild_bulk"
+                }, retention);
+            }
+
+            var history = await repo.GetRecentHistoryAsync(total + 1);
+            history.Should().HaveCount(retention, "prune must keep exactly {0} entries after {1} inserts", retention, total);
+
+            // Newest entry should be the last inserted
+            history[0].SourceId.Should().Be($"bulk_{total - 1}");
+            // Oldest retained entry is bulk_100 (the 101st, 0-indexed)
+            history[retention - 1].SourceId.Should().Be($"bulk_{total - retention}");
+        });
+    }
+
+    [Fact]
     public async Task MetricsRepository_ShouldLogGlobalAndUserMetricsCorrectly()
     {
         await RunTestWithDbAsync(async stateStore =>
