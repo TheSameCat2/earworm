@@ -288,6 +288,132 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task SnapshotRepository_RestoreIsFieldIdenticalToSavedState()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var queueRepo = new QueueRepository(stateStore);
+            var snapshotRepo = new SnapshotRepository(stateStore);
+
+            var item1 = new QueueItem
+            {
+                SourceType = "youtube",
+                SourceId = "snap_track_1",
+                Title = "Snapshot Track One",
+                Artist = "Snap Artist A",
+                DurationSeconds = 240,
+                RequestedByUserId = "u10",
+                RequestedByDisplayName = "SnapUser10",
+                QueuedAt = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_000),
+                GuildId = "guild_snap"
+            };
+            var item2 = new QueueItem
+            {
+                SourceType = "soundcloud",
+                SourceId = "snap_track_2",
+                Title = null,
+                Artist = null,
+                DurationSeconds = null,
+                RequestedByUserId = "u11",
+                RequestedByDisplayName = "SnapUser11",
+                QueuedAt = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_001_000),
+                GuildId = "guild_snap"
+            };
+            await queueRepo.AddTrackAsync(item1);
+            await queueRepo.AddTrackAsync(item2);
+
+            var originalState = new PlaybackState
+            {
+                IsPlaying = true,
+                IsPaused = false,
+                CurrentSourceType = "youtube",
+                CurrentSourceId = "snap_playing",
+                CurrentTitle = "Snap Playing Title",
+                CurrentArtist = "Snap Playing Artist",
+                CurrentDurationSeconds = 333,
+                CurrentRequestedByUserId = "u12",
+                CurrentRequestedByDisplayName = "SnapUser12",
+                CurrentPositionMs = 77777,
+                VoiceChannelId = "vc_snap",
+                VoiceGuildId = "guild_snap",
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+            await queueRepo.UpdatePlaybackStateAsync(originalState);
+
+            await snapshotRepo.SaveSnapshotAsync("snap_admin");
+
+            // Mutate active state to something completely different
+            await queueRepo.ClearQueueAsync();
+            await queueRepo.UpdatePlaybackStateAsync(new PlaybackState
+            {
+                IsPlaying = false,
+                IsPaused = false,
+                CurrentSourceType = null,
+                CurrentSourceId = null,
+                CurrentTitle = null,
+                CurrentArtist = null,
+                CurrentDurationSeconds = null,
+                CurrentRequestedByUserId = null,
+                CurrentRequestedByDisplayName = null,
+                CurrentPositionMs = 0,
+                VoiceChannelId = null,
+                VoiceGuildId = null,
+                UpdatedAt = DateTimeOffset.UtcNow
+            });
+
+            (await queueRepo.GetQueueAsync()).Should().BeEmpty();
+            (await queueRepo.GetPlaybackStateAsync()).CurrentSourceId.Should().BeNull();
+
+            // Restore and assert byte-identical field values
+            var restored = await snapshotRepo.RestoreSnapshotAsync();
+            restored.Should().NotBeNull();
+
+            var ps = restored!.Value.PlaybackState;
+            ps.IsPlaying.Should().Be(originalState.IsPlaying);
+            ps.IsPaused.Should().Be(originalState.IsPaused);
+            ps.CurrentSourceType.Should().Be(originalState.CurrentSourceType);
+            ps.CurrentSourceId.Should().Be(originalState.CurrentSourceId);
+            ps.CurrentTitle.Should().Be(originalState.CurrentTitle);
+            ps.CurrentArtist.Should().Be(originalState.CurrentArtist);
+            ps.CurrentDurationSeconds.Should().Be(originalState.CurrentDurationSeconds);
+            ps.CurrentRequestedByUserId.Should().Be(originalState.CurrentRequestedByUserId);
+            ps.CurrentRequestedByDisplayName.Should().Be(originalState.CurrentRequestedByDisplayName);
+            ps.CurrentPositionMs.Should().Be(originalState.CurrentPositionMs);
+            ps.VoiceChannelId.Should().Be(originalState.VoiceChannelId);
+            ps.VoiceGuildId.Should().Be(originalState.VoiceGuildId);
+
+            var qi = restored.Value.QueueItems;
+            qi.Should().HaveCount(2);
+            qi[0].SourceType.Should().Be(item1.SourceType);
+            qi[0].SourceId.Should().Be(item1.SourceId);
+            qi[0].Title.Should().Be(item1.Title);
+            qi[0].Artist.Should().Be(item1.Artist);
+            qi[0].DurationSeconds.Should().Be(item1.DurationSeconds);
+            qi[0].RequestedByUserId.Should().Be(item1.RequestedByUserId);
+            qi[0].RequestedByDisplayName.Should().Be(item1.RequestedByDisplayName);
+            qi[0].QueuedAt.ToUnixTimeMilliseconds().Should().Be(item1.QueuedAt.ToUnixTimeMilliseconds());
+            qi[0].GuildId.Should().Be(item1.GuildId);
+            qi[0].Position.Should().Be(0);
+
+            qi[1].SourceType.Should().Be(item2.SourceType);
+            qi[1].SourceId.Should().Be(item2.SourceId);
+            qi[1].Title.Should().BeNull();
+            qi[1].Artist.Should().BeNull();
+            qi[1].DurationSeconds.Should().BeNull();
+            qi[1].RequestedByUserId.Should().Be(item2.RequestedByUserId);
+            qi[1].RequestedByDisplayName.Should().Be(item2.RequestedByDisplayName);
+            qi[1].QueuedAt.ToUnixTimeMilliseconds().Should().Be(item2.QueuedAt.ToUnixTimeMilliseconds());
+            qi[1].GuildId.Should().Be(item2.GuildId);
+            qi[1].Position.Should().Be(1);
+
+            // Also verify no-snapshot case returns null without side effects
+            await snapshotRepo.ClearSnapshotAsync();
+            var noRestore = await snapshotRepo.RestoreSnapshotAsync();
+            noRestore.Should().BeNull();
+        });
+    }
+
+    [Fact]
     public async Task HistoryRepository_ShouldLogAndPruneHistoryCorrectly()
     {
         await RunTestWithDbAsync(async stateStore =>
