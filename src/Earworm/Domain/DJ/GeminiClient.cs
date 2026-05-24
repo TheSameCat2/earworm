@@ -11,28 +11,29 @@ namespace Earworm.Domain.DJ;
 
 public class GeminiClient
 {
-    private readonly HttpClient _httpClient;
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly EarwormConfig _config;
     private readonly ILogger<GeminiClient> _logger;
+    private readonly string _apiKey;
 
-    public GeminiClient(HttpClient httpClient, EarwormConfig config, ILogger<GeminiClient> _logger)
+    public GeminiClient(IHttpClientFactory httpClientFactory, EarwormConfig config, ILogger<GeminiClient> logger)
     {
-        _httpClient = httpClient;
+        _httpClientFactory = httpClientFactory;
         _config = config;
-        this._logger = _logger;
+        _logger = logger;
+
+        string apiKey = Environment.GetEnvironmentVariable("EARWORM_GEMINI_API_KEY") ?? string.Empty;
+        if (string.IsNullOrEmpty(apiKey))
+            throw new InvalidOperationException("Gemini API key is missing. Set the EARWORM_GEMINI_API_KEY environment variable.");
+        _apiKey = apiKey;
     }
 
     public virtual async Task<string> GenerateCommentaryAsync(string trackTitle, string trackArtist, CancellationToken cancellationToken)
     {
-        string apiKey = Environment.GetEnvironmentVariable("EARWORM_GEMINI_API_KEY") ?? string.Empty;
-        if (string.IsNullOrEmpty(apiKey))
-        {
-            _logger.LogError("EARWORM_GEMINI_API_KEY environment variable is not set.");
-            throw new InvalidOperationException("Gemini API key is missing. Set the EARWORM_GEMINI_API_KEY environment variable.");
-        }
+        using var _httpClient = _httpClientFactory.CreateClient(nameof(GeminiClient));
 
         string model = _config.Dj.GeminiModel;
-        string endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={apiKey}";
+        string endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={_apiKey}";
 
         // Format prompt using the configured persona
         string trackMetadata = $"'{trackTitle}' by '{trackArtist}'";

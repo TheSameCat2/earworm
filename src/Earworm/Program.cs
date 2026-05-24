@@ -297,8 +297,10 @@ public static class Program
         // Per-call timeouts. Without these, a hung external API blocks the
         // caller for the OS-default ~100s TCP timeout, which during DJ commentary
         // generation freezes PlayNextAsync and stalls music playback.
-        services.AddHttpClient<GeminiClient>(c => c.Timeout = TimeSpan.FromSeconds(30));
-        services.AddHttpClient<ElevenLabsTtsProvider>(c => c.Timeout = TimeSpan.FromSeconds(60));
+        services.AddHttpClient(nameof(GeminiClient), c => c.Timeout = TimeSpan.FromSeconds(30));
+        services.AddHttpClient(nameof(ElevenLabsTtsProvider), c => c.Timeout = TimeSpan.FromSeconds(60));
+        services.AddSingleton<GeminiClient>();
+        services.AddSingleton<ElevenLabsTtsProvider>();
         services.AddSingleton<ITtsProvider>(sp => sp.GetRequiredService<ElevenLabsTtsProvider>());
         services.AddSingleton<DJEngine>();
 
