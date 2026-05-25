@@ -2,6 +2,7 @@ namespace Earworm.Config;
 
 public sealed record EarwormConfig
 {
+    public BotConfig Bot { get; init; } = new();
     public DiscordConfig Discord { get; init; } = new();
     public AudioConfig Audio { get; init; } = new();
     public QueueConfig Queue { get; init; } = new();
@@ -11,6 +12,15 @@ public sealed record EarwormConfig
     public AutoBehaviorConfig AutoBehavior { get; init; } = new();
     public OpsConfig Ops { get; init; } = new();
     public LavalinkConfig Lavalink { get; init; } = new();
+}
+
+public sealed record BotConfig
+{
+    /// <summary>
+    /// Discord user IDs (as strings) that are allowed to execute /admin commands.
+    /// Configure via YAML key <c>Bot.OwnerUserIds</c> (PascalCase — binder does not transform).
+    /// </summary>
+    public List<string> OwnerUserIds { get; init; } = new();
 }
 
 public sealed record LavalinkConfig
