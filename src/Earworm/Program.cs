@@ -139,15 +139,22 @@ public static class Program
             }
 
             // Seed initial tenant row from config (one-time; idempotent)
-            using (var tenantSeedCmd = seedConn.CreateCommand())
+            if (ulong.TryParse(earwormConfig.Discord.GuildId, out _))
             {
-                tenantSeedCmd.CommandText = @"
-                    INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
-                    VALUES ($guild_id, 'free', 'active', $now);
-                ";
-                tenantSeedCmd.Parameters.AddWithValue("$guild_id", earwormConfig.Discord.GuildId);
-                tenantSeedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                await tenantSeedCmd.ExecuteNonQueryAsync();
+                using (var tenantSeedCmd = seedConn.CreateCommand())
+                {
+                    tenantSeedCmd.CommandText = @"
+                        INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
+                        VALUES ($guild_id, 'free', 'active', $now);
+                    ";
+                    tenantSeedCmd.Parameters.AddWithValue("$guild_id", earwormConfig.Discord.GuildId);
+                    tenantSeedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    await tenantSeedCmd.ExecuteNonQueryAsync();
+                }
+            }
+            else
+            {
+                logger.LogWarning("Skipped tenant seed: Discord.GuildId '{GuildId}' is not a valid numeric snowflake.", earwormConfig.Discord.GuildId);
             }
         }
         catch (Exception ex)

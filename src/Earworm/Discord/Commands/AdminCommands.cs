@@ -29,6 +29,12 @@ public sealed class AdminCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(
             InteractionResponseType.DeferredChannelMessageWithSource,
             new DiscordInteractionResponseBuilder { IsEphemeral = true });
+        if (!ulong.TryParse(guildId, out _))
+        {
+            await ctx.EditResponseAsync(Text($"Invalid guild ID `{guildId}` — must be a numeric Discord snowflake."));
+            return;
+        }
+
         try
         {
             await _tenantService.AddTenantAsync(guildId, ctx.User.Id.ToString());
@@ -84,6 +90,12 @@ public sealed class AdminCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(
             InteractionResponseType.DeferredChannelMessageWithSource,
             new DiscordInteractionResponseBuilder { IsEphemeral = true });
+        if (!ulong.TryParse(guildId, out _))
+        {
+            await ctx.EditResponseAsync(Text($"Invalid guild ID `{guildId}` — must be a numeric Discord snowflake."));
+            return;
+        }
+
         try
         {
             await _tenantService.RemoveTenantAsync(guildId);
