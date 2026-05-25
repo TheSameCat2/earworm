@@ -35,8 +35,9 @@ public sealed class TenantRepository : ITenantRepository
         {
             using var cmd = connection.CreateCommand();
             cmd.CommandText = @"
-                INSERT OR IGNORE INTO tenants (guild_id, owner_user_id, plan, status, created_at)
-                VALUES ($guild_id, $owner_user_id, 'free', 'active', $created_at);
+                INSERT INTO tenants (guild_id, owner_user_id, plan, status, created_at)
+                VALUES ($guild_id, $owner_user_id, 'free', 'active', $created_at)
+                ON CONFLICT(guild_id) DO UPDATE SET status = 'active', owner_user_id = excluded.owner_user_id;
             ";
             cmd.Parameters.AddWithValue("$guild_id", guildId);
             cmd.Parameters.AddWithValue("$owner_user_id", ownerUserId as object ?? DBNull.Value);
@@ -50,7 +51,7 @@ public sealed class TenantRepository : ITenantRepository
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
-            cmd.CommandText = "DELETE FROM tenants WHERE guild_id = $guild_id;";
+            cmd.CommandText = "UPDATE tenants SET status = 'suspended' WHERE guild_id = $guild_id;";
             cmd.Parameters.AddWithValue("$guild_id", guildId);
             await cmd.ExecuteNonQueryAsync();
         });
