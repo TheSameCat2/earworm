@@ -98,22 +98,10 @@ public static class Program
         var client = serviceProvider.GetRequiredService<DiscordClient>();
 
         // Slash commands. UseSlashCommands accepts a ServiceProvider; command
-        // classes are resolved from it per-invocation.
-        var slash = client.UseSlashCommands(new SlashCommandsConfiguration { Services = serviceProvider });
-
-        ulong commandGuildId = 0;
-        ulong.TryParse(earwormConfig.Discord.GuildId, out commandGuildId);
-        if (commandGuildId == 0)
-        {
-            logger.LogWarning("No guild_id configured — slash commands will register globally (can take up to 1 hour to propagate).");
-        }
-
-        slash.RegisterCommands<PlaybackCommands>(commandGuildId);
-        slash.RegisterCommands<QueueCommands>(commandGuildId);
-        slash.RegisterCommands<InfoCommands>(commandGuildId);
-        slash.RegisterCommands<DJCommands>(commandGuildId);
-        slash.RegisterCommands<ConfigCommands>(commandGuildId);
-        slash.RegisterCommands<AdminCommands>(commandGuildId);
+        // classes are resolved from it per-invocation. Per-guild registration is
+        // handled by TenantLifecycleListener.RegisterStartupCommandsAsync() below,
+        // which queries active tenants and registers commands for each guild.
+        client.UseSlashCommands(new SlashCommandsConfiguration { Services = serviceProvider });
 
         // Migrations.
         try
@@ -202,6 +190,19 @@ public static class Program
         _ = serviceProvider.GetRequiredService<NowPlayingPoster>();
         _ = serviceProvider.GetRequiredService<VoiceManager>();
         _ = serviceProvider.GetRequiredService<TrackFailureHandler>();
+
+        // Register slash commands per active tenant before connecting so DSharpPlus
+        // pushes all registrations when the Ready event fires.
+        var tenantLifecycleListener = serviceProvider.GetRequiredService<TenantLifecycleListener>();
+        try
+        {
+            await tenantLifecycleListener.RegisterStartupCommandsAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(ex, "Failed to register startup slash commands. Shutting down.");
+            Environment.Exit(1);
+        }
 
         // Discord gateway connect.
         var gateway = serviceProvider.GetRequiredService<DiscordGateway>();
@@ -339,6 +340,7 @@ public static class Program
         services.AddSingleton<MessageListener>();
         services.AddSingleton<NowPlayingPoster>();
         services.AddSingleton<TrackFailureHandler>();
+        services.AddSingleton<TenantLifecycleListener>();
 
         services.AddSingleton<PlaybackCommands>();
         services.AddSingleton<QueueCommands>();
