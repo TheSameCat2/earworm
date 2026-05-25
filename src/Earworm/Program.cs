@@ -18,6 +18,7 @@ using Earworm.Persistence.Repositories;
 using Earworm.Domain.Queue;
 using Earworm.Domain.Player;
 using Earworm.Domain.DJ;
+using Earworm.Domain.Tenants;
 using Earworm.Discord;
 using Earworm.Discord.Commands;
 using Earworm.Health;
@@ -112,6 +113,7 @@ public static class Program
         slash.RegisterCommands<InfoCommands>(commandGuildId);
         slash.RegisterCommands<DJCommands>(commandGuildId);
         slash.RegisterCommands<ConfigCommands>(commandGuildId);
+        slash.RegisterCommands<AdminCommands>(commandGuildId);
 
         // Migrations.
         try
@@ -134,6 +136,18 @@ public static class Program
                 ";
                 seedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 await seedCmd.ExecuteNonQueryAsync();
+            }
+
+            // Seed initial tenant row from config (one-time; idempotent)
+            using (var tenantSeedCmd = seedConn.CreateCommand())
+            {
+                tenantSeedCmd.CommandText = @"
+                    INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
+                    VALUES ($guild_id, 'free', 'active', $now);
+                ";
+                tenantSeedCmd.Parameters.AddWithValue("$guild_id", earwormConfig.Discord.GuildId);
+                tenantSeedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                await tenantSeedCmd.ExecuteNonQueryAsync();
             }
         }
         catch (Exception ex)
@@ -294,6 +308,8 @@ public static class Program
         services.AddSingleton<ISnapshotRepository, SnapshotRepository>();
         services.AddSingleton<IHistoryRepository, HistoryRepository>();
         services.AddSingleton<IMetricsRepository, MetricsRepository>();
+        services.AddSingleton<ITenantRepository, TenantRepository>();
+        services.AddSingleton<ITenantService, TenantService>();
 
         services.AddSingleton<QueueManager>();
         services.AddSingleton<TrackQueuingService>();
@@ -322,6 +338,7 @@ public static class Program
         services.AddSingleton<InfoCommands>();
         services.AddSingleton<DJCommands>();
         services.AddSingleton<ConfigCommands>();
+        services.AddSingleton<AdminCommands>();
 
         services.AddSingleton<HealthEndpoint>();
     }
