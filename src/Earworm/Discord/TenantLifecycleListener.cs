@@ -25,6 +25,7 @@ public sealed class TenantLifecycleListener : IDisposable
     private readonly EarwormConfig _config;
     private readonly ILogger<TenantLifecycleListener> _logger;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private readonly HashSet<ulong> _registeredGuilds = new();
 
     public TenantLifecycleListener(
         DiscordClient discordClient,
@@ -49,14 +50,17 @@ public sealed class TenantLifecycleListener : IDisposable
     /// </summary>
     public async Task RegisterStartupCommandsAsync()
     {
-        var slash = _discordClient.GetExtension<SlashCommandsExtension>();
+        var slash = _discordClient.GetExtension<SlashCommandsExtension>()
+            ?? throw new InvalidOperationException("SlashCommandsExtension is not registered on the DiscordClient.");
+
         var tenants = await _tenantService.GetAllTenantsAsync();
         var active = tenants.Where(t => t.Status == "active").ToList();
 
         foreach (var tenant in active)
         {
             if (!ulong.TryParse(tenant.GuildId, out var guildId)) continue;
-            RegisterPerGuildCommands(slash, guildId);
+            if (_registeredGuilds.Add(guildId))
+                RegisterPerGuildCommands(slash, guildId);
         }
 
         if (ulong.TryParse(_config.Discord.GuildId, out var controlGuildId))
@@ -82,7 +86,20 @@ public sealed class TenantLifecycleListener : IDisposable
         await _refreshLock.WaitAsync();
         try
         {
+            if (!_registeredGuilds.Add(id))
+            {
+                _logger.LogInformation("Slash commands already registered for tenant {GuildId}; skipping.", guildId);
+                return;
+            }
+
             var slash = _discordClient.GetExtension<SlashCommandsExtension>();
+            if (slash == null)
+            {
+                _logger.LogError("SlashCommandsExtension not found on DiscordClient; cannot register commands for tenant {GuildId}.", guildId);
+                _registeredGuilds.Remove(id);
+                return;
+            }
+
             RegisterPerGuildCommands(slash, id);
             await slash.RefreshCommands();
             _logger.LogInformation("Slash commands registered and pushed for new tenant {GuildId}.", guildId);
@@ -99,6 +116,9 @@ public sealed class TenantLifecycleListener : IDisposable
     /// </summary>
     public Task OnTenantRemovedAsync(string guildId)
     {
+        if (ulong.TryParse(guildId, out var id))
+            _registeredGuilds.Remove(id);
+
         _logger.LogInformation(
             "Tenant {GuildId} suspended. Commands remain registered on Discord; WhitelistedGuild guard will block access after PR-3.",
             guildId);

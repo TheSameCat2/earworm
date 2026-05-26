@@ -43,12 +43,21 @@ public sealed class AdminCommands : ApplicationCommandModule
         try
         {
             await _tenantService.AddTenantAsync(guildId, ctx.User.Id.ToString());
+        }
+        catch (Exception ex)
+        {
+            await ctx.EditResponseAsync(Text($"Failed to add server: {ex.Message}"));
+            return;
+        }
+
+        try
+        {
             await _lifecycleListener.OnTenantAddedAsync(guildId);
             await ctx.EditResponseAsync(Text($"Server `{guildId}` has been added as a tenant."));
         }
         catch (Exception ex)
         {
-            await ctx.EditResponseAsync(Text($"Failed to add server: {ex.Message}"));
+            await ctx.EditResponseAsync(Text($"Server `{guildId}` was added, but slash command registration failed: {ex.Message}. Commands will be available after the next restart."));
         }
     }
 
