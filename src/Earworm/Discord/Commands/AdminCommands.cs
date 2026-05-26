@@ -15,8 +15,13 @@ namespace Earworm.Discord.Commands;
 public sealed class AdminCommands : ApplicationCommandModule
 {
     private readonly ITenantService _tenantService;
+    private readonly TenantLifecycleListener _lifecycleListener;
 
-    public AdminCommands(ITenantService tenantService) => _tenantService = tenantService;
+    public AdminCommands(ITenantService tenantService, TenantLifecycleListener lifecycleListener)
+    {
+        _tenantService = tenantService;
+        _lifecycleListener = lifecycleListener;
+    }
 
     private static DiscordWebhookBuilder Text(string s) =>
         new DiscordWebhookBuilder().WithContent(s);
@@ -38,11 +43,21 @@ public sealed class AdminCommands : ApplicationCommandModule
         try
         {
             await _tenantService.AddTenantAsync(guildId, ctx.User.Id.ToString());
-            await ctx.EditResponseAsync(Text($"Server `{guildId}` has been added as a tenant."));
         }
         catch (Exception ex)
         {
             await ctx.EditResponseAsync(Text($"Failed to add server: {ex.Message}"));
+            return;
+        }
+
+        try
+        {
+            await _lifecycleListener.OnTenantAddedAsync(guildId);
+            await ctx.EditResponseAsync(Text($"Server `{guildId}` has been added as a tenant."));
+        }
+        catch (Exception ex)
+        {
+            await ctx.EditResponseAsync(Text($"Server `{guildId}` was added, but slash command registration failed: {ex.Message}. Commands will be available after the next restart."));
         }
     }
 
@@ -99,6 +114,7 @@ public sealed class AdminCommands : ApplicationCommandModule
         try
         {
             await _tenantService.RemoveTenantAsync(guildId);
+            await _lifecycleListener.OnTenantRemovedAsync(guildId);
             await ctx.EditResponseAsync(Text($"Server `{guildId}` has been suspended and will no longer have access to bot commands."));
         }
         catch (Exception ex)
