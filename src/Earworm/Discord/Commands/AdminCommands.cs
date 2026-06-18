@@ -106,6 +106,7 @@ public sealed class AdminCommands : ApplicationCommandModule
         try
         {
             await _tenantService.RemoveTenantAsync(guildId);
+            await _lifecycle.DeregisterGuildAsync(guildId);
             await ctx.EditResponseAsync(Text($"Server `{guildId}` has been suspended and will no longer have access to bot commands."));
         }
         catch (Exception ex)

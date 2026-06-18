@@ -106,7 +106,12 @@ public sealed class VoiceManager : IDisposable
         CancelEmptyChannelTimer(guildId);
         CancelIdleTimer(guildId);
 
-        await _playerEngines.GetOrCreate(guildId.ToString()).StopAsync();
+        // Only stop an engine that actually exists — don't construct one just to
+        // leave a channel.
+        if (_playerEngines.TryGet(guildId.ToString(), out var engine))
+        {
+            await engine.StopAsync();
+        }
 
         var player = await _audioService.Players.GetPlayerAsync<LavalinkPlayer>(guildId);
         if (player != null)
@@ -134,16 +139,23 @@ public sealed class VoiceManager : IDisposable
                     bool wasMuted = e.Before?.IsServerMuted ?? false;
                     bool isMuted = e.After?.IsServerMuted ?? false;
 
-                    var engine = _playerEngines.GetOrCreate(guild.Id.ToString());
-                    if (isMuted && !wasMuted)
+                    // Only act if this guild already has a live engine. Don't
+                    // construct one (possibly for a non-tenant guild the bot
+                    // happens to sit in) just because the bot's mute flag flipped —
+                    // a constructed engine subscribes to the shared audio service
+                    // and would never be reclaimed.
+                    if (_playerEngines.TryGet(guild.Id.ToString(), out var engine))
                     {
-                        _logger.LogInformation("Bot server-muted; pausing.");
-                        await engine.PauseAsync();
-                    }
-                    else if (!isMuted && wasMuted)
-                    {
-                        _logger.LogInformation("Bot server-unmuted; resuming.");
-                        await engine.ResumeAsync();
+                        if (isMuted && !wasMuted)
+                        {
+                            _logger.LogInformation("Bot server-muted; pausing.");
+                            await engine.PauseAsync();
+                        }
+                        else if (!isMuted && wasMuted)
+                        {
+                            _logger.LogInformation("Bot server-unmuted; resuming.");
+                            await engine.ResumeAsync();
+                        }
                     }
                     return;
                 }

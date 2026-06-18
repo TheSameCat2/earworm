@@ -10,7 +10,7 @@ using Earworm.Domain.Player;
 
 namespace Earworm.Domain.Queue;
 
-public class QueueManager
+public class QueueManager : IDisposable
 {
     private readonly IQueueRepository _queueRepository;
     private readonly ISnapshotRepository _snapshotRepository;
@@ -550,5 +550,11 @@ public class QueueManager
         handler?.Invoke();
 
         return restored.Value.PlaybackState;
+    }
+
+    /// <summary>Disposes the hydration gate. Called when the guild is evicted.</summary>
+    public void Dispose()
+    {
+        _initGate.Dispose();
     }
 }

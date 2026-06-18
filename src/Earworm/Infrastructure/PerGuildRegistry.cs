@@ -95,6 +95,34 @@ public sealed class PerGuildRegistry<T> where T : class
         }
     }
 
+    /// <summary>
+    /// Removes a guild's instance and disposes it if it is <see cref="IDisposable"/>.
+    /// Called when a tenant is removed so per-guild engines — and their
+    /// subscriptions to shared singletons like the audio service — don't linger
+    /// for the process lifetime. Returns true if a constructed instance was
+    /// dropped (and disposed).
+    /// </summary>
+    public bool Evict(string guildId)
+    {
+        if (!_instances.TryRemove(guildId, out var lazy)) return false;
+
+        // An un-evaluated Lazy never constructed an instance: nothing in _created,
+        // nothing to dispose.
+        if (!lazy.IsValueCreated) return false;
+
+        var instance = lazy.Value;
+        lock (_initLock)
+        {
+            _created.Remove(instance);
+        }
+
+        if (instance is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+        return true;
+    }
+
     private T Create(string guildId)
     {
         var instance = _factory(guildId);
