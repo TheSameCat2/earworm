@@ -100,11 +100,15 @@ DROP TABLE snapshot;
 ALTER TABLE snapshot_new RENAME TO snapshot;
 
 -- ------------------------------------------------------------
--- snapshot_queue: drop-recreate so the FK retargets snapshot(guild_id).
--- The old snapshot_queue.guild_id (already present) becomes the
--- snapshot key after the sentinel backfill below.
+-- snapshot_queue: rebuild so the FK retargets snapshot(guild_id), PRESERVING
+-- existing rows. The old snapshot_queue.guild_id (NOT NULL since 001) becomes
+-- the new snapshot_guild_id; it already holds the real guild id, which matches
+-- snapshot(guild_id) once the sentinel backfill below rewrites '' -> guild id.
+-- (FK enforcement is off during migrations, so the transient '' mismatch on the
+-- snapshot side before backfill is fine.) snapshot_queue_item_id is allowed to
+-- re-autoincrement — nothing references it; row order is carried by position.
 -- ------------------------------------------------------------
-DROP TABLE snapshot_queue;
+ALTER TABLE snapshot_queue RENAME TO snapshot_queue_old;
 CREATE TABLE snapshot_queue (
     snapshot_queue_item_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_guild_id          TEXT NOT NULL REFERENCES snapshot(guild_id) ON DELETE CASCADE,
@@ -119,6 +123,12 @@ CREATE TABLE snapshot_queue (
     queued_at                  INTEGER NOT NULL,
     UNIQUE(snapshot_guild_id, position)
 );
+INSERT INTO snapshot_queue (snapshot_guild_id, position, source_type, source_id, title, artist,
+                            duration_seconds, requested_by_user_id, requested_by_display_name, queued_at)
+    SELECT guild_id, position, source_type, source_id, title, artist,
+           duration_seconds, requested_by_user_id, requested_by_display_name, queued_at
+    FROM snapshot_queue_old;
+DROP TABLE snapshot_queue_old;
 CREATE INDEX idx_snapshot_queue ON snapshot_queue(snapshot_guild_id, position);
 
 -- ------------------------------------------------------------
