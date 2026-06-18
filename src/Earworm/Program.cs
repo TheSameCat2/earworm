@@ -153,7 +153,37 @@ public static class Program
                 }
                 return;
             }
+
+            // Any other failure — including an exception THROWN by a check (e.g. a
+            // transient SQLite error in IsAdmittedAsync / GetDjRoleIdAsync) rather
+            // than the check returning false — would otherwise leave the user
+            // staring at "the application did not respond". Log it and best-effort
+            // surface a generic error.
             logger.LogError(e.Exception, "Slash command '{Name}' errored.", e.Context?.CommandName);
+            try
+            {
+                await e.Context.CreateResponseAsync(
+                    InteractionResponseType.ChannelMessageWithSource,
+                    new DiscordInteractionResponseBuilder
+                    {
+                        IsEphemeral = true,
+                        Content = "⚠️ Something went wrong running that command. Please try again."
+                    });
+            }
+            catch
+            {
+                // Already acknowledged/deferred (command body failed after
+                // responding) — fall back to editing the deferred response.
+                try
+                {
+                    await e.Context.EditResponseAsync(
+                        new DiscordWebhookBuilder().WithContent("⚠️ Something went wrong running that command. Please try again."));
+                }
+                catch
+                {
+                    // Interaction expired or already finalized; nothing more to do.
+                }
+            }
         };
 
         // HTTP host (PRD §11 — /health, /metrics, /tts/{id}).
