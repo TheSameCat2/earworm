@@ -15,9 +15,8 @@ using DSharpPlus;
 using Lavalink4NET;
 using Earworm.Config;
 using Earworm.Discord;
-using Earworm.Domain.Player;
+using Earworm.Domain.Tenants;
 using Earworm.Health;
-using Earworm.Infrastructure;
 
 namespace Earworm.Tests;
 
@@ -101,7 +100,7 @@ public sealed class HealthEndpointTests
             BuildConfig(port),
             BuildGateway(ready: true),
             BuildAudioService(ready: true),
-            new PerGuildRegistry<PlayerEngine>(_ => null!),
+            Substitute.For<ITenantService>(),
             NullLoggerFactory.Instance,
             NullLogger<HealthEndpoint>.Instance);
 
@@ -128,7 +127,7 @@ public sealed class HealthEndpointTests
             BuildConfig(port),
             BuildGateway(ready: true),
             BuildAudioService(ready: false),
-            new PerGuildRegistry<PlayerEngine>(_ => null!),
+            Substitute.For<ITenantService>(),
             NullLoggerFactory.Instance,
             NullLogger<HealthEndpoint>.Instance);
 
@@ -155,7 +154,7 @@ public sealed class HealthEndpointTests
             BuildConfig(port),
             BuildGateway(ready: false),
             BuildAudioService(ready: true),
-            new PerGuildRegistry<PlayerEngine>(_ => null!),
+            Substitute.For<ITenantService>(),
             NullLoggerFactory.Instance,
             NullLogger<HealthEndpoint>.Instance);
 
