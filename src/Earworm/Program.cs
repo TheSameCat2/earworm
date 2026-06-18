@@ -481,6 +481,12 @@ public static class Program
 
         if (string.IsNullOrWhiteSpace(config.Discord.GuildId) || config.Discord.GuildId.Contains("REQUIRED"))
             throw new InvalidOperationException("discord.guild_id is required in conf/earworm.yaml.");
+        // Must be a real snowflake: a non-numeric value passes the check above but
+        // then fails ulong.TryParse downstream, which silently skips the tenant
+        // backfill AND registers commands for zero guilds — the bot comes up but
+        // admits and serves nobody. Fail fast instead.
+        if (!ulong.TryParse(config.Discord.GuildId, out _))
+            throw new InvalidOperationException($"discord.guild_id must be a numeric Discord snowflake; got '{config.Discord.GuildId}'.");
 
         if (string.IsNullOrWhiteSpace(config.Dj.Tts.VoiceId) || config.Dj.Tts.VoiceId.Contains("REQUIRED"))
             throw new InvalidOperationException("dj.tts.voice_id is required in conf/earworm.yaml.");
