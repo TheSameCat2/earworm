@@ -106,10 +106,13 @@ public sealed class PerGuildRegistry<T> where T : class
     {
         if (!_instances.TryRemove(guildId, out var lazy)) return false;
 
-        // An un-evaluated Lazy never constructed an instance: nothing in _created,
-        // nothing to dispose.
-        if (!lazy.IsValueCreated) return false;
-
+        // Force resolution rather than checking IsValueCreated. If another thread
+        // is mid-construction inside GetOrCreate, IsValueCreated is still false but
+        // the factory is about to publish the instance into _created — skipping it
+        // here would orphan that instance (left in _created, subscribed to the
+        // shared audio service, never disposed). Lazy is ExecutionAndPublication,
+        // so .Value blocks until the in-flight construction completes and returns
+        // the one instance every caller sees.
         var instance = lazy.Value;
         lock (_initLock)
         {
