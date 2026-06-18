@@ -411,41 +411,58 @@ public static class Program
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection(connectionString);
         await conn.OpenAsync();
 
-        using (var cmd = conn.CreateCommand())
+        // All three steps run as one atomic unit. Each is individually idempotent
+        // (so a re-run after a crash still converges), but the transaction means no
+        // other connection ever observes a half-applied backfill.
+        using var transaction = conn.BeginTransaction();
+        try
         {
-            cmd.CommandText = @"
-                UPDATE playback_state   SET guild_id = $g WHERE guild_id = '';
-                UPDATE snapshot         SET guild_id = $g WHERE guild_id = '';
-                UPDATE settings         SET guild_id = $g WHERE guild_id = '';
-                UPDATE metrics_global   SET guild_id = $g WHERE guild_id = '';
-                UPDATE metrics_per_user SET guild_id = $g WHERE guild_id = '';
-            ";
-            cmd.Parameters.AddWithValue("$g", guildId);
-            await cmd.ExecuteNonQueryAsync();
-        }
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    UPDATE playback_state   SET guild_id = $g WHERE guild_id = '';
+                    UPDATE snapshot         SET guild_id = $g WHERE guild_id = '';
+                    UPDATE settings         SET guild_id = $g WHERE guild_id = '';
+                    UPDATE metrics_global   SET guild_id = $g WHERE guild_id = '';
+                    UPDATE metrics_per_user SET guild_id = $g WHERE guild_id = '';
+                ";
+                cmd.Parameters.AddWithValue("$g", guildId);
+                await cmd.ExecuteNonQueryAsync();
+            }
 
-        using (var cmd = conn.CreateCommand())
-        {
-            cmd.CommandText = @"
-                INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
-                VALUES ($g, 'free', 'active', $now);
-            ";
-            cmd.Parameters.AddWithValue("$g", guildId);
-            cmd.Parameters.AddWithValue("$now", now);
-            await cmd.ExecuteNonQueryAsync();
-        }
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
+                    VALUES ($g, 'free', 'active', $now);
+                ";
+                cmd.Parameters.AddWithValue("$g", guildId);
+                cmd.Parameters.AddWithValue("$now", now);
+                await cmd.ExecuteNonQueryAsync();
+            }
 
-        if (!string.IsNullOrWhiteSpace(config.Discord.NowPlayingChannelId))
+            if (!string.IsNullOrWhiteSpace(config.Discord.NowPlayingChannelId))
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = @"
+                    INSERT OR IGNORE INTO settings (guild_id, key, value, updated_at)
+                    VALUES ($g, 'now_playing_channel_id', $value, $now);
+                ";
+                cmd.Parameters.AddWithValue("$g", guildId);
+                cmd.Parameters.AddWithValue("$value", config.Discord.NowPlayingChannelId);
+                cmd.Parameters.AddWithValue("$now", now);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            transaction.Commit();
+        }
+        catch
         {
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"
-                INSERT OR IGNORE INTO settings (guild_id, key, value, updated_at)
-                VALUES ($g, 'now_playing_channel_id', $value, $now);
-            ";
-            cmd.Parameters.AddWithValue("$g", guildId);
-            cmd.Parameters.AddWithValue("$value", config.Discord.NowPlayingChannelId);
-            cmd.Parameters.AddWithValue("$now", now);
-            await cmd.ExecuteNonQueryAsync();
+            transaction.Rollback();
+            throw;
         }
     }
 
