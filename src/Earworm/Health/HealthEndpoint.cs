@@ -12,6 +12,8 @@ using Microsoft.Extensions.Logging;
 using Lavalink4NET;
 using Earworm.Config;
 using Earworm.Discord;
+using Earworm.Domain.Player;
+using Earworm.Infrastructure;
 
 namespace Earworm.Health;
 
@@ -35,6 +37,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
     private readonly EarwormConfig _config;
     private readonly DiscordGateway _gateway;
     private readonly IAudioService _audioService;
+    private readonly PerGuildRegistry<PlayerEngine> _playerEngines;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<HealthEndpoint> _logger;
     private WebApplication? _app;
@@ -43,12 +46,14 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
         EarwormConfig config,
         DiscordGateway gateway,
         IAudioService audioService,
+        PerGuildRegistry<PlayerEngine> playerEngines,
         ILoggerFactory loggerFactory,
         ILogger<HealthEndpoint> logger)
     {
         _config = config;
         _gateway = gateway;
         _audioService = audioService;
+        _playerEngines = playerEngines;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -82,15 +87,17 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
 
             string discordStatus = discordReady ? "ok" : "starting";
             string lavalinkStatus = lavalinkReady ? "ok" : "down";
+            // Number of guilds with a live (constructed) per-guild engine.
+            int activeTenants = _playerEngines.CreatedInstances().Count;
 
             if (discordReady && lavalinkReady)
             {
-                return Results.Ok(new { status = "ok", discord = discordStatus, lavalink = lavalinkStatus });
+                return Results.Ok(new { status = "ok", discord = discordStatus, lavalink = lavalinkStatus, tenants = activeTenants });
             }
 
             string overall = discordReady ? "degraded" : "starting";
             return Results.Json(
-                new { status = overall, discord = discordStatus, lavalink = lavalinkStatus },
+                new { status = overall, discord = discordStatus, lavalink = lavalinkStatus, tenants = activeTenants },
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         });
 

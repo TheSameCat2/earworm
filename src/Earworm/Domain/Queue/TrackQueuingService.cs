@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Lavalink4NET;
 using Lavalink4NET.Rest.Entities.Tracks;
+using Earworm.Infrastructure;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Domain.Queue;
@@ -17,18 +18,18 @@ namespace Earworm.Domain.Queue;
 public sealed class TrackQueuingService
 {
     private readonly IAudioService _audioService;
-    private readonly QueueManager _queueManager;
+    private readonly PerGuildRegistry<QueueManager> _queueManagers;
     private readonly IMetricsRepository _metrics;
     private readonly ILogger<TrackQueuingService> _logger;
 
     public TrackQueuingService(
         IAudioService audioService,
-        QueueManager queueManager,
+        PerGuildRegistry<QueueManager> queueManagers,
         IMetricsRepository metrics,
         ILogger<TrackQueuingService> logger)
     {
         _audioService = audioService;
-        _queueManager = queueManager;
+        _queueManagers = queueManagers;
         _metrics = metrics;
         _logger = logger;
     }
@@ -90,7 +91,7 @@ public sealed class TrackQueuingService
         var author = string.IsNullOrWhiteSpace(track.Author) ? "Unknown Artist" : track.Author!;
         int? durationSec = track.Duration.TotalSeconds > 0 ? (int)track.Duration.TotalSeconds : null;
 
-        var queued = await _queueManager.AddTrackAsync(
+        var queued = await _queueManagers.GetOrCreate(guildId).AddTrackAsync(
             sourceType: sourceType,
             sourceId: sourceId,
             title: title,
@@ -113,7 +114,7 @@ public sealed class TrackQueuingService
 
         try
         {
-            await _metrics.IncrementBatchAsync(new[]
+            await _metrics.IncrementBatchAsync(guildId, new[]
             {
                 new MetricIncrement(bucket, 1, userId, displayName),
                 new MetricIncrement("tracks_queued", 1, userId, displayName),

@@ -7,28 +7,30 @@ using DSharpPlus.SlashCommands;
 using Earworm.Discord.Attributes;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Discord.Commands;
 
+[WhitelistedGuild]
 public sealed class PlaybackCommands : ApplicationCommandModule
 {
     private readonly VoiceManager _voice;
-    private readonly PlayerEngine _player;
-    private readonly QueueManager _queue;
+    private readonly PerGuildRegistry<PlayerEngine> _players;
+    private readonly PerGuildRegistry<QueueManager> _queues;
     private readonly TrackQueuingService _queuing;
     private readonly ISettingsRepository _settings;
 
     public PlaybackCommands(
         VoiceManager voice,
-        PlayerEngine player,
-        QueueManager queue,
+        PerGuildRegistry<PlayerEngine> players,
+        PerGuildRegistry<QueueManager> queues,
         TrackQueuingService queuing,
         ISettingsRepository settings)
     {
         _voice = voice;
-        _player = player;
-        _queue = queue;
+        _players = players;
+        _queues = queues;
         _queuing = queuing;
         _settings = settings;
     }
@@ -51,7 +53,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
 
         if (_queuing.IsPlaylistUrl(query))
         {
-            var djRoleId = await _settings.GetDjRoleIdAsync();
+            var djRoleId = await _settings.GetDjRoleIdAsync(ctx.Guild!.Id.ToString());
             bool isDj = ctx.Member!.Permissions.HasPermission(Permissions.Administrator)
                 || (djRoleId.HasValue && ctx.Member.Roles.Any(r => r.Id == djRoleId.Value));
             if (!isDj)
@@ -133,7 +135,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
     public async Task PauseAsync(InteractionContext ctx)
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
-        try { await _player.PauseAsync(); await ctx.EditResponseAsync(Text("⏸️ Playback paused.")); }
+        try { await _players.GetOrCreate(ctx.Guild!.Id.ToString()).PauseAsync(); await ctx.EditResponseAsync(Text("⏸️ Playback paused.")); }
         catch (Exception ex) { await ctx.EditResponseAsync(Text($"⚠️ Failed to pause: {ex.Message}")); }
     }
 
@@ -141,7 +143,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
     public async Task ResumeAsync(InteractionContext ctx)
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
-        try { await _player.ResumeAsync(); await ctx.EditResponseAsync(Text("▶️ Playback resumed.")); }
+        try { await _players.GetOrCreate(ctx.Guild!.Id.ToString()).ResumeAsync(); await ctx.EditResponseAsync(Text("▶️ Playback resumed.")); }
         catch (Exception ex) { await ctx.EditResponseAsync(Text($"⚠️ Failed to resume: {ex.Message}")); }
     }
 
@@ -149,7 +151,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
     public async Task SkipAsync(InteractionContext ctx)
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
-        try { await _player.SkipAsync(); await ctx.EditResponseAsync(Text("⏭️ Track skipped.")); }
+        try { await _players.GetOrCreate(ctx.Guild!.Id.ToString()).SkipAsync(); await ctx.EditResponseAsync(Text("⏭️ Track skipped.")); }
         catch (Exception ex) { await ctx.EditResponseAsync(Text($"⚠️ Failed to skip: {ex.Message}")); }
     }
 
@@ -157,7 +159,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
     public async Task PreviousAsync(InteractionContext ctx)
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
-        try { await _player.PreviousAsync(); await ctx.EditResponseAsync(Text("⏮️ Playing previous track.")); }
+        try { await _players.GetOrCreate(ctx.Guild!.Id.ToString()).PreviousAsync(); await ctx.EditResponseAsync(Text("⏮️ Playing previous track.")); }
         catch (Exception ex) { await ctx.EditResponseAsync(Text($"⚠️ Failed to go to previous track: {ex.Message}")); }
     }
 
@@ -196,7 +198,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
                 return;
             }
 
-            await _player.SeekAsync(seekTime);
+            await _players.GetOrCreate(ctx.Guild!.Id.ToString()).SeekAsync(seekTime);
             await ctx.EditResponseAsync(Text($"⏩ Seeked to **{positionStr}**."));
         }
         catch (Exception ex)
@@ -209,7 +211,7 @@ public sealed class PlaybackCommands : ApplicationCommandModule
     public async Task ClearQueueAsync(InteractionContext ctx)
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
-        try { await _queue.ClearQueueAsync(); await ctx.EditResponseAsync(Text("🧹 The music queue has been cleared.")); }
+        try { await _queues.GetOrCreate(ctx.Guild!.Id.ToString()).ClearQueueAsync(); await ctx.EditResponseAsync(Text("🧹 The music queue has been cleared.")); }
         catch (Exception ex) { await ctx.EditResponseAsync(Text($"⚠️ Failed to clear queue: {ex.Message}")); }
     }
 }

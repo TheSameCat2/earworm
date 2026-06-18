@@ -18,45 +18,46 @@ public record MetricIncrement(
 public interface IMetricsRepository
 {
     /// <summary>
-    /// Increments a global metric counter by the given amount (default 1).
+    /// Increments a global metric counter for the guild by the given amount (default 1).
     /// </summary>
-    Task IncrementGlobalMetricAsync(string key, long amount = 1);
+    Task IncrementGlobalMetricAsync(string guildId, string key, long amount = 1);
 
     /// <summary>
-    /// Retrieves a single global metric value, returning 0 if it doesn't exist.
+    /// Retrieves a single global metric value for the guild, returning 0 if it doesn't exist.
     /// </summary>
-    Task<long> GetGlobalMetricAsync(string key);
+    Task<long> GetGlobalMetricAsync(string guildId, string key);
 
     /// <summary>
-    /// Retrieves all global metrics as a key-value dictionary.
+    /// Retrieves all of the guild's global metrics as a key-value dictionary.
     /// </summary>
-    Task<Dictionary<string, long>> GetGlobalMetricsAsync();
+    Task<Dictionary<string, long>> GetGlobalMetricsAsync(string guildId);
 
     /// <summary>
-    /// Increments a specific column counter for a user.
+    /// Increments a specific column counter for a user within the guild.
     /// Valid whitelisted columns: tracks_queued, tracks_completed, listening_seconds, requests_youtube, requests_soundcloud, requests_mp3_upload, requests_search
     /// </summary>
-    Task IncrementUserMetricAsync(string userId, string displayName, string column, long amount = 1);
+    Task IncrementUserMetricAsync(string guildId, string userId, string displayName, string column, long amount = 1);
 
     /// <summary>
-    /// Atomically increments all supplied metric counters inside a single write-channel round-trip and a single SQLite transaction.
+    /// Atomically increments all supplied metric counters for the guild inside a single
+    /// write-channel round-trip and a single SQLite transaction.
     /// Increments with a null <see cref="MetricIncrement.UserId"/> are applied to the global table;
     /// those with a non-null UserId are applied to the per-user table.
     /// </summary>
-    Task IncrementBatchAsync(IReadOnlyCollection<MetricIncrement> increments);
+    Task IncrementBatchAsync(string guildId, IReadOnlyCollection<MetricIncrement> increments);
 
     /// <summary>
-    /// Retrieves a user's metric counters, or null if not found.
+    /// Retrieves a user's metric counters within the guild, or null if not found.
     /// </summary>
-    Task<UserMetrics?> GetUserMetricsAsync(string userId);
+    Task<UserMetrics?> GetUserMetricsAsync(string guildId, string userId);
 
     /// <summary>
-    /// Retrieves the top users by total listening seconds.
+    /// Retrieves the guild's top users by total listening seconds.
     /// </summary>
-    Task<List<UserMetrics>> GetTopUsersByListeningTimeAsync(int limit);
+    Task<List<UserMetrics>> GetTopUsersByListeningTimeAsync(string guildId, int limit);
 
     /// <summary>
-    /// Retrieves the top users by total tracks queued.
+    /// Retrieves the guild's top users by total tracks queued.
     /// </summary>
-    Task<List<UserMetrics>> GetTopUsersByTracksQueuedAsync(int limit);
+    Task<List<UserMetrics>> GetTopUsersByTracksQueuedAsync(string guildId, int limit);
 }

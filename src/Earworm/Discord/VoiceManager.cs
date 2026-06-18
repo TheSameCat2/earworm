@@ -14,6 +14,7 @@ using Lavalink4NET.Players;
 using Earworm.Config;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
 
 namespace Earworm.Discord;
 
@@ -21,8 +22,8 @@ public sealed class VoiceManager : IDisposable
 {
     private readonly DiscordClient _discordClient;
     private readonly IAudioService _audioService;
-    private readonly PlayerEngine _playerEngine;
-    private readonly QueueManager _queueManager;
+    private readonly PerGuildRegistry<PlayerEngine> _playerEngines;
+    private readonly PerGuildRegistry<QueueManager> _queueManagers;
     private readonly EarwormConfig _config;
     private readonly ILogger<VoiceManager> _logger;
 
@@ -32,20 +33,25 @@ public sealed class VoiceManager : IDisposable
     public VoiceManager(
         DiscordClient discordClient,
         IAudioService audioService,
-        PlayerEngine playerEngine,
-        QueueManager queueManager,
+        PerGuildRegistry<PlayerEngine> playerEngines,
+        PerGuildRegistry<QueueManager> queueManagers,
         EarwormConfig config,
         ILogger<VoiceManager> logger)
     {
         _discordClient = discordClient;
         _audioService = audioService;
-        _playerEngine = playerEngine;
-        _queueManager = queueManager;
+        _playerEngines = playerEngines;
+        _queueManagers = queueManagers;
         _config = config;
         _logger = logger;
 
-        _playerEngine.TrackStarted += OnTrackStarted;
-        _playerEngine.TrackEnded += OnTrackEnded;
+        // Attach idle/empty-channel bookkeeping to every per-guild engine —
+        // those already created and any created later.
+        _playerEngines.AddInitializer(engine =>
+        {
+            engine.TrackStarted += OnTrackStarted;
+            engine.TrackEnded += OnTrackEnded;
+        });
         _discordClient.VoiceStateUpdated += OnVoiceStateUpdatedAsync;
     }
 
@@ -90,7 +96,7 @@ public sealed class VoiceManager : IDisposable
         CancelIdleTimer(channel.Guild.Id);
         CheckChannelEmptyState(channel);
 
-        await _playerEngine.MaybeStartAsync();
+        await _playerEngines.GetOrCreate(channel.Guild.Id.ToString()).MaybeStartAsync();
     }
 
     public async Task LeaveChannelAsync(ulong guildId)
@@ -100,7 +106,7 @@ public sealed class VoiceManager : IDisposable
         CancelEmptyChannelTimer(guildId);
         CancelIdleTimer(guildId);
 
-        await _playerEngine.StopAsync();
+        await _playerEngines.GetOrCreate(guildId.ToString()).StopAsync();
 
         var player = await _audioService.Players.GetPlayerAsync<LavalinkPlayer>(guildId);
         if (player != null)
@@ -128,15 +134,16 @@ public sealed class VoiceManager : IDisposable
                     bool wasMuted = e.Before?.IsServerMuted ?? false;
                     bool isMuted = e.After?.IsServerMuted ?? false;
 
+                    var engine = _playerEngines.GetOrCreate(guild.Id.ToString());
                     if (isMuted && !wasMuted)
                     {
                         _logger.LogInformation("Bot server-muted; pausing.");
-                        await _playerEngine.PauseAsync();
+                        await engine.PauseAsync();
                     }
                     else if (!isMuted && wasMuted)
                     {
                         _logger.LogInformation("Bot server-unmuted; resuming.");
-                        await _playerEngine.ResumeAsync();
+                        await engine.ResumeAsync();
                     }
                     return;
                 }
@@ -213,7 +220,7 @@ public sealed class VoiceManager : IDisposable
             {
                 if (ulong.TryParse(track.GuildId, out ulong guildId))
                 {
-                    if (_queueManager.Count == 0) StartIdleTimer(guildId);
+                    if (_queueManagers.GetOrCreate(track.GuildId).Count == 0) StartIdleTimer(guildId);
                 }
             }
             catch (Exception ex)
@@ -277,8 +284,11 @@ public sealed class VoiceManager : IDisposable
 
     public void Dispose()
     {
-        _playerEngine.TrackStarted -= OnTrackStarted;
-        _playerEngine.TrackEnded -= OnTrackEnded;
+        foreach (var engine in _playerEngines.CreatedInstances())
+        {
+            engine.TrackStarted -= OnTrackStarted;
+            engine.TrackEnded -= OnTrackEnded;
+        }
         _discordClient.VoiceStateUpdated -= OnVoiceStateUpdatedAsync;
 
         foreach (var t in _emptyChannelTimers.Values) { t.Cancel(); t.Dispose(); }

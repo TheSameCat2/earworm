@@ -8,21 +8,27 @@ using DSharpPlus.SlashCommands;
 using Earworm.Discord.Attributes;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Discord.Commands;
 
+[WhitelistedGuild]
 public sealed class QueueCommands : ApplicationCommandModule
 {
-    private readonly QueueManager _queue;
-    private readonly PlayerEngine _player;
+    private readonly PerGuildRegistry<QueueManager> _queues;
+    private readonly PerGuildRegistry<PlayerEngine> _players;
     private readonly VoiceManager _voice;
     private readonly ISettingsRepository _settings;
 
-    public QueueCommands(QueueManager queue, PlayerEngine player, VoiceManager voice, ISettingsRepository settings)
+    public QueueCommands(
+        PerGuildRegistry<QueueManager> queues,
+        PerGuildRegistry<PlayerEngine> players,
+        VoiceManager voice,
+        ISettingsRepository settings)
     {
-        _queue = queue;
-        _player = player;
+        _queues = queues;
+        _players = players;
         _voice = voice;
         _settings = settings;
     }
@@ -35,8 +41,9 @@ public sealed class QueueCommands : ApplicationCommandModule
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
-        var queue = _queue.GetQueue();
-        var state = _player.State;
+        var gid = ctx.Guild!.Id.ToString();
+        var queue = _queues.GetOrCreate(gid).GetQueue();
+        var state = _players.GetOrCreate(gid).State;
 
         var embed = new DiscordEmbedBuilder()
             .WithTitle("Music Queue 🎶")
@@ -116,8 +123,10 @@ public sealed class QueueCommands : ApplicationCommandModule
             return;
         }
 
+        var gid = ctx.Guild!.Id.ToString();
+        var queueManager = _queues.GetOrCreate(gid);
         int index = (int)position - 1;
-        int queueCount = _queue.Count;
+        int queueCount = queueManager.Count;
         if (index >= queueCount)
         {
             await ctx.EditResponseAsync(Text($"⚠️ Invalid position. The queue currently only has {queueCount} tracks."));
@@ -126,11 +135,11 @@ public sealed class QueueCommands : ApplicationCommandModule
 
         try
         {
-            var djRoleId = await _settings.GetDjRoleIdAsync();
+            var djRoleId = await _settings.GetDjRoleIdAsync(gid);
             bool isDj = ctx.Member!.Permissions.HasPermission(Permissions.Administrator)
                 || (djRoleId.HasValue && ctx.Member.Roles.Any(r => r.Id == djRoleId.Value));
 
-            var removedTrack = await _queue.RemoveTrackAsync(index, ctx.User.Id.ToString(), isDj);
+            var removedTrack = await queueManager.RemoveTrackAsync(index, ctx.User.Id.ToString(), isDj);
             await ctx.EditResponseAsync(Text($"❌ Removed track **{removedTrack.Title}** from position `{position}` in the queue."));
         }
         catch (Exception ex)
@@ -146,7 +155,8 @@ public sealed class QueueCommands : ApplicationCommandModule
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
-        var queue = _queue.GetQueue();
+        var queueManager = _queues.GetOrCreate(ctx.Guild!.Id.ToString());
+        var queue = queueManager.GetQueue();
         if (from <= 0 || from > queue.Count || to <= 0 || to > queue.Count)
         {
             await ctx.EditResponseAsync(Text($"⚠️ Positions must be between 1 and {queue.Count}."));
@@ -159,7 +169,7 @@ public sealed class QueueCommands : ApplicationCommandModule
         try
         {
             var track = queue[fromIndex];
-            await _queue.MoveTrackAsync(fromIndex, toIndex);
+            await queueManager.MoveTrackAsync(fromIndex, toIndex);
             await ctx.EditResponseAsync(Text($"🔄 Moved track **{track.Title}** from position `{from}` to `{to}`."));
         }
         catch (Exception ex)
@@ -174,7 +184,7 @@ public sealed class QueueCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            await _queue.SaveSnapshotAsync(ctx.User.Id.ToString());
+            await _queues.GetOrCreate(ctx.Guild!.Id.ToString()).SaveSnapshotAsync(ctx.User.Id.ToString());
             await ctx.EditResponseAsync(Text("💾 Saved a snapshot of the current queue. Use `/restore` to reload it at any time!"));
         }
         catch (Exception ex)
@@ -189,7 +199,7 @@ public sealed class QueueCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            var restoredState = await _queue.RestoreSnapshotAsync();
+            var restoredState = await _queues.GetOrCreate(ctx.Guild!.Id.ToString()).RestoreSnapshotAsync();
             if (restoredState == null)
             {
                 await ctx.EditResponseAsync(Text("📂 No saved snapshot to restore."));

@@ -16,21 +16,49 @@ public sealed class SnapshotRepository : ISnapshotRepository
         _stateStore = stateStore;
     }
 
-    public async Task SaveSnapshotAsync(string savedByUserId)
+    public async Task SaveSnapshotAsync(string guildId, string savedByUserId)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var transaction = connection.BeginTransaction();
             try
             {
+                // 1. Upsert the snapshot row, stamping saved_at/saved_by and
+                //    resetting the current_* fields (filled from playback_state below).
+                using (var rowCmd = connection.CreateCommand())
+                {
+                    rowCmd.Transaction = transaction;
+                    rowCmd.CommandText = @"
+                        INSERT INTO snapshot (guild_id, saved_at, saved_by_user_id)
+                        VALUES ($guildId, $savedAt, $userId)
+                        ON CONFLICT(guild_id) DO UPDATE SET
+                            saved_at = excluded.saved_at,
+                            saved_by_user_id = excluded.saved_by_user_id,
+                            current_source_type = NULL,
+                            current_source_id = NULL,
+                            current_title = NULL,
+                            current_artist = NULL,
+                            current_duration_seconds = NULL,
+                            current_requested_by_user_id = NULL,
+                            current_requested_by_display_name = NULL,
+                            current_position_ms = NULL,
+                            voice_channel_id = NULL,
+                            voice_guild_id = NULL;
+                    ";
+                    rowCmd.Parameters.AddWithValue("$guildId", guildId);
+                    rowCmd.Parameters.AddWithValue("$savedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    rowCmd.Parameters.AddWithValue("$userId", savedByUserId);
+                    await rowCmd.ExecuteNonQueryAsync();
+                }
+
+                // 2. Copy the guild's current playback state into the snapshot row
+                //    (no-op if the guild has never played anything).
                 using (var copyPlayCmd = connection.CreateCommand())
                 {
                     copyPlayCmd.Transaction = transaction;
                     copyPlayCmd.CommandText = @"
                         UPDATE snapshot
-                        SET saved_at = $savedAt,
-                            saved_by_user_id = $userId,
-                            current_source_type = ps.current_source_type,
+                        SET current_source_type = ps.current_source_type,
                             current_source_id = ps.current_source_id,
                             current_title = ps.current_title,
                             current_artist = ps.current_artist,
@@ -40,18 +68,19 @@ public sealed class SnapshotRepository : ISnapshotRepository
                             current_position_ms = ps.current_position_ms,
                             voice_channel_id = ps.voice_channel_id,
                             voice_guild_id = ps.voice_guild_id
-                        FROM (SELECT * FROM playback_state WHERE id = 1) ps
-                        WHERE snapshot.id = 1;
+                        FROM (SELECT * FROM playback_state WHERE guild_id = $guildId) ps
+                        WHERE snapshot.guild_id = $guildId;
                     ";
-                    copyPlayCmd.Parameters.AddWithValue("$savedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                    copyPlayCmd.Parameters.AddWithValue("$userId", savedByUserId);
+                    copyPlayCmd.Parameters.AddWithValue("$guildId", guildId);
                     await copyPlayCmd.ExecuteNonQueryAsync();
                 }
 
+                // 3. Replace the snapshot queue from the guild's live queue.
                 using (var clearQueueCmd = connection.CreateCommand())
                 {
                     clearQueueCmd.Transaction = transaction;
-                    clearQueueCmd.CommandText = "DELETE FROM snapshot_queue WHERE snapshot_id = 1;";
+                    clearQueueCmd.CommandText = "DELETE FROM snapshot_queue WHERE snapshot_guild_id = $guildId;";
+                    clearQueueCmd.Parameters.AddWithValue("$guildId", guildId);
                     await clearQueueCmd.ExecuteNonQueryAsync();
                 }
 
@@ -59,12 +88,14 @@ public sealed class SnapshotRepository : ISnapshotRepository
                 {
                     copyQueueCmd.Transaction = transaction;
                     copyQueueCmd.CommandText = @"
-                        INSERT INTO snapshot_queue (snapshot_id, position, source_type, source_id, title, artist,
-                                                   duration_seconds, requested_by_user_id, requested_by_display_name, queued_at, guild_id)
-                        SELECT 1, position, source_type, source_id, title, artist,
-                               duration_seconds, requested_by_user_id, requested_by_display_name, queued_at, guild_id
-                        FROM queue;
+                        INSERT INTO snapshot_queue (snapshot_guild_id, position, source_type, source_id, title, artist,
+                                                   duration_seconds, requested_by_user_id, requested_by_display_name, queued_at)
+                        SELECT $guildId, position, source_type, source_id, title, artist,
+                               duration_seconds, requested_by_user_id, requested_by_display_name, queued_at
+                        FROM queue
+                        WHERE guild_id = $guildId;
                     ";
+                    copyQueueCmd.Parameters.AddWithValue("$guildId", guildId);
                     await copyQueueCmd.ExecuteNonQueryAsync();
                 }
 
@@ -78,25 +109,27 @@ public sealed class SnapshotRepository : ISnapshotRepository
         });
     }
 
-    public async Task<bool> HasSnapshotAsync()
+    public async Task<bool> HasSnapshotAsync(string guildId)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT saved_at FROM snapshot WHERE id = 1;";
+        cmd.CommandText = "SELECT saved_at FROM snapshot WHERE guild_id = $guildId;";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
         var result = await cmd.ExecuteScalarAsync();
         return result != null && result != DBNull.Value;
     }
 
-    public async Task<(PlaybackState PlaybackState, List<QueueItem> QueueItems)?> RestoreSnapshotAsync()
+    public async Task<(PlaybackState PlaybackState, List<QueueItem> QueueItems)?> RestoreSnapshotAsync(string guildId)
     {
         (PlaybackState, List<QueueItem>)? result = null;
 
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var checkCmd = connection.CreateCommand();
-            checkCmd.CommandText = "SELECT saved_at FROM snapshot WHERE id = 1;";
+            checkCmd.CommandText = "SELECT saved_at FROM snapshot WHERE guild_id = $guildId;";
+            checkCmd.Parameters.AddWithValue("$guildId", guildId);
             var hasSnapshot = (await checkCmd.ExecuteScalarAsync()) is not null and not DBNull;
             if (!hasSnapshot) return;
 
@@ -106,7 +139,8 @@ public sealed class SnapshotRepository : ISnapshotRepository
                 using (var clearQueueCmd = connection.CreateCommand())
                 {
                     clearQueueCmd.Transaction = transaction;
-                    clearQueueCmd.CommandText = "DELETE FROM queue;";
+                    clearQueueCmd.CommandText = "DELETE FROM queue WHERE guild_id = $guildId;";
+                    clearQueueCmd.Parameters.AddWithValue("$guildId", guildId);
                     await clearQueueCmd.ExecuteNonQueryAsync();
                 }
 
@@ -117,11 +151,22 @@ public sealed class SnapshotRepository : ISnapshotRepository
                         INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
                                            requested_by_user_id, requested_by_display_name, queued_at, guild_id)
                         SELECT position, source_type, source_id, title, artist, duration_seconds,
-                               requested_by_user_id, requested_by_display_name, queued_at, guild_id
+                               requested_by_user_id, requested_by_display_name, queued_at, $guildId
                         FROM snapshot_queue
-                        WHERE snapshot_id = 1;
+                        WHERE snapshot_guild_id = $guildId;
                     ";
+                    copyQueueCmd.Parameters.AddWithValue("$guildId", guildId);
                     await copyQueueCmd.ExecuteNonQueryAsync();
+                }
+
+                // Ensure a playback_state row exists for the guild, then copy from the snapshot.
+                using (var ensureCmd = connection.CreateCommand())
+                {
+                    ensureCmd.Transaction = transaction;
+                    ensureCmd.CommandText = "INSERT OR IGNORE INTO playback_state (guild_id, updated_at) VALUES ($guildId, $updatedAt);";
+                    ensureCmd.Parameters.AddWithValue("$guildId", guildId);
+                    ensureCmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    await ensureCmd.ExecuteNonQueryAsync();
                 }
 
                 using (var copyPlayCmd = connection.CreateCommand())
@@ -142,9 +187,10 @@ public sealed class SnapshotRepository : ISnapshotRepository
                             voice_channel_id = sn.voice_channel_id,
                             voice_guild_id = sn.voice_guild_id,
                             updated_at = $updatedAt
-                        FROM (SELECT * FROM snapshot WHERE id = 1) sn
-                        WHERE playback_state.id = 1;
+                        FROM (SELECT * FROM snapshot WHERE guild_id = $guildId) sn
+                        WHERE playback_state.guild_id = $guildId;
                     ";
+                    copyPlayCmd.Parameters.AddWithValue("$guildId", guildId);
                     copyPlayCmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                     await copyPlayCmd.ExecuteNonQueryAsync();
                 }
@@ -165,8 +211,9 @@ public sealed class SnapshotRepository : ISnapshotRepository
                            current_duration_seconds, current_requested_by_user_id, current_requested_by_display_name,
                            current_position_ms, voice_channel_id, voice_guild_id, updated_at
                     FROM playback_state
-                    WHERE id = 1;
+                    WHERE guild_id = $guildId;
                 ";
+                playCmd.Parameters.AddWithValue("$guildId", guildId);
 
                 using var reader = await playCmd.ExecuteReaderAsync();
                 if (await reader.ReadAsync())
@@ -190,7 +237,7 @@ public sealed class SnapshotRepository : ISnapshotRepository
                 }
                 else
                 {
-                    throw new InvalidOperationException("Playback state singleton row is missing after restore.");
+                    throw new InvalidOperationException("Playback state row is missing after restore.");
                 }
             }
 
@@ -201,8 +248,10 @@ public sealed class SnapshotRepository : ISnapshotRepository
                     SELECT queue_item_id, position, source_type, source_id, title, artist, duration_seconds,
                            requested_by_user_id, requested_by_display_name, queued_at, guild_id
                     FROM queue
+                    WHERE guild_id = $guildId
                     ORDER BY position ASC;
                 ";
+                queueCmd.Parameters.AddWithValue("$guildId", guildId);
 
                 using var reader = await queueCmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
@@ -230,7 +279,7 @@ public sealed class SnapshotRepository : ISnapshotRepository
         return result;
     }
 
-    public async Task ClearSnapshotAsync()
+    public async Task ClearSnapshotAsync(string guildId)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
@@ -254,15 +303,17 @@ public sealed class SnapshotRepository : ISnapshotRepository
                             current_position_ms = NULL,
                             voice_channel_id = NULL,
                             voice_guild_id = NULL
-                        WHERE id = 1;
+                        WHERE guild_id = $guildId;
                     ";
+                    clearPlayCmd.Parameters.AddWithValue("$guildId", guildId);
                     await clearPlayCmd.ExecuteNonQueryAsync();
                 }
 
                 using (var clearQueueCmd = connection.CreateCommand())
                 {
                     clearQueueCmd.Transaction = transaction;
-                    clearQueueCmd.CommandText = "DELETE FROM snapshot_queue WHERE snapshot_id = 1;";
+                    clearQueueCmd.CommandText = "DELETE FROM snapshot_queue WHERE snapshot_guild_id = $guildId;";
+                    clearQueueCmd.Parameters.AddWithValue("$guildId", guildId);
                     await clearQueueCmd.ExecuteNonQueryAsync();
                 }
 

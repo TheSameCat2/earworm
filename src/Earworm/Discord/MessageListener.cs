@@ -7,6 +7,7 @@ using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
 using Earworm.Domain.Queue;
+using Earworm.Domain.Tenants;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Discord;
@@ -21,6 +22,7 @@ public sealed class MessageListener : IDisposable
     private readonly VoiceManager _voiceManager;
     private readonly TrackQueuingService _trackQueuingService;
     private readonly ISettingsRepository _settingsRepository;
+    private readonly ITenantService _tenantService;
     private readonly ILogger<MessageListener> _logger;
     private readonly ShutdownLifetime _shutdown;
     private Regex? _mentionRegex;
@@ -30,6 +32,7 @@ public sealed class MessageListener : IDisposable
         VoiceManager voiceManager,
         TrackQueuingService trackQueuingService,
         ISettingsRepository settingsRepository,
+        ITenantService tenantService,
         ILogger<MessageListener> logger,
         ShutdownLifetime shutdown)
     {
@@ -37,6 +40,7 @@ public sealed class MessageListener : IDisposable
         _voiceManager = voiceManager ?? throw new ArgumentNullException(nameof(voiceManager));
         _trackQueuingService = trackQueuingService ?? throw new ArgumentNullException(nameof(trackQueuingService));
         _settingsRepository = settingsRepository ?? throw new ArgumentNullException(nameof(settingsRepository));
+        _tenantService = tenantService ?? throw new ArgumentNullException(nameof(tenantService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _shutdown = shutdown ?? throw new ArgumentNullException(nameof(shutdown));
 
@@ -54,6 +58,15 @@ public sealed class MessageListener : IDisposable
             try
             {
                 ct.ThrowIfCancellationRequested();
+
+                // Tenant gate: only serve @mentions in whitelisted guilds. Stay
+                // silent in non-admitted servers rather than spamming a refusal.
+                if (!await _tenantService.IsAdmittedAsync(e.Guild.Id.ToString()))
+                {
+                    _logger.LogInformation("Ignoring mention in non-admitted guild {GuildId}.", e.Guild.Id);
+                    return;
+                }
+
                 var member = await e.Guild.GetMemberAsync(e.Author.Id);
                 if (member == null) return;
 
@@ -92,7 +105,7 @@ public sealed class MessageListener : IDisposable
                 // Playlist gating (DJ only).
                 if (_trackQueuingService.IsPlaylistUrl(query))
                 {
-                    var djRoleId = await _settingsRepository.GetDjRoleIdAsync();
+                    var djRoleId = await _settingsRepository.GetDjRoleIdAsync(e.Guild.Id.ToString());
                     bool isDj = member.Permissions.HasPermission(Permissions.Administrator)
                         || (djRoleId.HasValue && member.Roles.Any(r => r.Id == djRoleId.Value));
                     if (!isDj)

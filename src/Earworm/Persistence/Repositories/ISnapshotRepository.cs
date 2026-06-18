@@ -8,23 +8,23 @@ namespace Earworm.Persistence.Repositories;
 public interface ISnapshotRepository
 {
     /// <summary>
-    /// Saves the current playback state and live queue as a snapshot.
+    /// Saves the guild's current playback state and live queue as its snapshot.
     /// </summary>
-    Task SaveSnapshotAsync(string savedByUserId);
+    Task SaveSnapshotAsync(string guildId, string savedByUserId);
 
     /// <summary>
-    /// Checks if a valid snapshot exists to be restored.
+    /// Checks if a valid snapshot exists for the guild.
     /// </summary>
-    Task<bool> HasSnapshotAsync();
+    Task<bool> HasSnapshotAsync(string guildId);
 
     /// <summary>
-    /// Restores the saved snapshot back into the active queue and playback state tables.
+    /// Restores the guild's saved snapshot back into its active queue and playback state.
     /// Returns the restored state, or null if no snapshot exists.
     /// </summary>
-    Task<(PlaybackState PlaybackState, List<QueueItem> QueueItems)?> RestoreSnapshotAsync();
+    Task<(PlaybackState PlaybackState, List<QueueItem> QueueItems)?> RestoreSnapshotAsync(string guildId);
 
     /// <summary>
-    /// Clears the saved snapshot, setting saved_at to null and emptying the snapshot queue.
+    /// Clears the guild's saved snapshot, setting saved_at to null and emptying its snapshot queue.
     /// </summary>
-    Task ClearSnapshotAsync();
+    Task ClearSnapshotAsync(string guildId);
 }

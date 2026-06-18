@@ -8,7 +8,10 @@ Every way to talk to earworm: slash commands, the `@mention` shortcut, and the i
 - **🟡 In-voice** — requires the caller to be in the same voice channel as the bot (or any voice channel if the bot isn't connected).
 - **🔴 DJ** — requires the configured DJ role, or Administrator. Set the role with `/config dj-role @Role`.
 - **🔵 Requester or DJ** — original track requester gets a pass; otherwise DJ.
-- **⚙ Manage Roles or Admin** — only `/config dj-role` itself, to prevent self-promotion.
+- **⚙ Manage Roles or Admin** — `/config dj-role` and the channel settings, to prevent self-promotion.
+- **👑 Bot owner** — `/admin …`, restricted to the user IDs in `Bot.OwnerUserIds`.
+
+All non-admin commands additionally require the guild to be a whitelisted tenant (see [Admin](#admin-bot-owners)). In a non-whitelisted guild they reply with an ephemeral "not available here."
 
 ---
 
@@ -192,9 +195,35 @@ Set a text channel where the bot posts failure notices (e.g., "Couldn't play X �
 /config logging-channel channel: #bot-ops
 ```
 
+### `/config now-playing-channel <channel>`  ⚙
+
+Set the text channel where "Now Playing" embeds are posted when a track starts. Each guild configures its own. Without this set, no Now Playing embeds are posted.
+
+```
+/config now-playing-channel channel: #now-playing
+```
+
 ### `/config show`  🟢
 
-Display the current settings — DJ enabled state, configured DJ role, configured logging channel.
+Display the current settings — DJ enabled state, configured DJ role, configured logging channel, configured now-playing channel.
+
+---
+
+## Admin (bot owners)
+
+These commands manage the multi-tenant whitelist and are restricted to the bot owners listed in `Bot.OwnerUserIds`. earworm only serves guilds that have been admitted as tenants; all the commands above are gated on the calling guild being whitelisted.
+
+### `/admin add-server <guild-id>`  👑
+
+Whitelist a Discord guild as a tenant. Slash commands are registered to that guild immediately (instant propagation).
+
+### `/admin list-servers`  👑
+
+List every tenant guild with its plan and status.
+
+### `/admin remove-server <guild-id>`  👑
+
+Suspend a tenant (soft delete — status becomes `suspended`). Commands stop working there; the data is retained.
 
 ---
 

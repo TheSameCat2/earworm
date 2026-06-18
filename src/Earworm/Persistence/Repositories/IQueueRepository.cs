@@ -7,14 +7,14 @@ namespace Earworm.Persistence.Repositories;
 
 public interface IQueueRepository
 {
-    Task<List<QueueItem>> GetQueueAsync();
+    Task<List<QueueItem>> GetQueueAsync(string guildId);
     Task<long> AddTrackAsync(QueueItem item, int position);
-    Task CompactPositionsAsync();
+    Task CompactPositionsAsync(string guildId);
     Task RemoveTrackAsync(long queueItemId);
-    Task MoveTrackAsync(long queueItemId, int toPosition);
-    Task ClearQueueAsync();
+    Task MoveTrackAsync(string guildId, long queueItemId, int toPosition);
+    Task ClearQueueAsync(string guildId);
 
-    Task<PlaybackState> GetPlaybackStateAsync();
-    Task UpdatePlaybackStateAsync(PlaybackState state);
-    Task UpdatePlaybackPositionAsync(int positionMs);
+    Task<PlaybackState> GetPlaybackStateAsync(string guildId);
+    Task UpdatePlaybackStateAsync(string guildId, PlaybackState state);
+    Task UpdatePlaybackPositionAsync(string guildId, int positionMs);
 }

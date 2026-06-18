@@ -8,6 +8,7 @@ using Earworm.Persistence.Repositories;
 
 namespace Earworm.Discord.Commands;
 
+[WhitelistedGuild]
 public sealed class DJCommands : ApplicationCommandModule
 {
     private readonly ISettingsRepository _settings;
@@ -23,7 +24,7 @@ public sealed class DJCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            await _settings.SetDjEnabledAsync(true);
+            await _settings.SetDjEnabledAsync(ctx.Guild!.Id.ToString(), true);
             await ctx.EditResponseAsync(Text("📻 **AI DJ commentary is now ENABLED!** The DJ will inject warm west-coast radio commentary over song transitions."));
         }
         catch (Exception ex)
@@ -38,7 +39,7 @@ public sealed class DJCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            await _settings.SetDjEnabledAsync(false);
+            await _settings.SetDjEnabledAsync(ctx.Guild!.Id.ToString(), false);
             await ctx.EditResponseAsync(Text("📻 **AI DJ commentary is now DISABLED.** Transitions will be clean without radio intros."));
         }
         catch (Exception ex)

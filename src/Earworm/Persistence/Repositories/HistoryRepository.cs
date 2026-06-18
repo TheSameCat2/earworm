@@ -49,11 +49,13 @@ public sealed class HistoryRepository : IHistoryRepository
                     await insCmd.ExecuteNonQueryAsync();
                 }
 
-                // 2. Prune excess entries — only pay the delete cost when we are actually over the cap.
+                // 2. Prune excess entries for this guild — only pay the delete cost
+                //    when this guild is actually over the cap.
                 using (var countCmd = connection.CreateCommand())
                 {
                     countCmd.Transaction = transaction;
-                    countCmd.CommandText = "SELECT COUNT(*) FROM history;";
+                    countCmd.CommandText = "SELECT COUNT(*) FROM history WHERE guild_id = $guildId;";
+                    countCmd.Parameters.AddWithValue("$guildId", entry.GuildId);
                     var countObj = await countCmd.ExecuteScalarAsync();
                     long rowCount = countObj == null || countObj == DBNull.Value ? 0 : Convert.ToInt64(countObj);
 
@@ -63,10 +65,14 @@ public sealed class HistoryRepository : IHistoryRepository
                         pruneCmd.Transaction = transaction;
                         pruneCmd.CommandText = @"
                             DELETE FROM history
-                            WHERE history_id NOT IN (
-                                SELECT history_id FROM history ORDER BY played_at DESC LIMIT $retentionCount
+                            WHERE guild_id = $guildId
+                              AND history_id NOT IN (
+                                SELECT history_id FROM history
+                                WHERE guild_id = $guildId
+                                ORDER BY played_at DESC LIMIT $retentionCount
                             );
                         ";
+                        pruneCmd.Parameters.AddWithValue("$guildId", entry.GuildId);
                         pruneCmd.Parameters.AddWithValue("$retentionCount", retentionCount);
                         await pruneCmd.ExecuteNonQueryAsync();
                     }
@@ -82,19 +88,21 @@ public sealed class HistoryRepository : IHistoryRepository
         });
     }
 
-    public async Task<List<PlayHistoryEntry>> GetRecentHistoryAsync(int limit)
+    public async Task<List<PlayHistoryEntry>> GetRecentHistoryAsync(string guildId, int limit)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 
         using var cmd = connection.CreateCommand();
         cmd.CommandText = @"
-            SELECT history_id, played_at, source_type, source_id, title, artist, duration_seconds, 
+            SELECT history_id, played_at, source_type, source_id, title, artist, duration_seconds,
                    played_seconds, requested_by_user_id, requested_by_display_name, skipped, failed, failure_reason, guild_id
             FROM history
+            WHERE guild_id = $guildId
             ORDER BY played_at DESC
             LIMIT $limit;
         ";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
         cmd.Parameters.AddWithValue("$limit", limit);
 
         var list = new List<PlayHistoryEntry>();

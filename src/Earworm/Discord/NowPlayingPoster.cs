@@ -3,55 +3,39 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using DSharpPlus;
 using DSharpPlus.Entities;
-using Earworm.Config;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
+using Earworm.Persistence.Repositories;
 
 namespace Earworm.Discord;
 
 public sealed class NowPlayingPoster : IDisposable
 {
     private readonly DiscordClient _discordClient;
-    private readonly PlayerEngine _playerEngine;
+    private readonly PerGuildRegistry<PlayerEngine> _playerEngines;
+    private readonly ISettingsRepository _settings;
     private readonly ILogger<NowPlayingPoster> _logger;
     private readonly ShutdownLifetime _shutdown;
-    private readonly ulong? _nowPlayingChannelId;
 
     public NowPlayingPoster(
         DiscordClient discordClient,
-        PlayerEngine playerEngine,
-        EarwormConfig config,
+        PerGuildRegistry<PlayerEngine> playerEngines,
+        ISettingsRepository settings,
         ILogger<NowPlayingPoster> logger,
         ShutdownLifetime shutdown)
     {
         _discordClient = discordClient ?? throw new ArgumentNullException(nameof(discordClient));
-        _playerEngine = playerEngine ?? throw new ArgumentNullException(nameof(playerEngine));
-        _ = config ?? throw new ArgumentNullException(nameof(config));
+        _playerEngines = playerEngines ?? throw new ArgumentNullException(nameof(playerEngines));
+        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _shutdown = shutdown ?? throw new ArgumentNullException(nameof(shutdown));
 
-        var raw = config.Discord.NowPlayingChannelId;
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            _nowPlayingChannelId = null;
-        }
-        else if (ulong.TryParse(raw, out var parsedId))
-        {
-            _nowPlayingChannelId = parsedId;
-        }
-        else
-        {
-            _logger.LogWarning("Invalid NowPlayingChannelId: {ChannelId}", raw);
-            _nowPlayingChannelId = null;
-        }
-
-        _playerEngine.TrackStarted += OnTrackStarted;
+        _playerEngines.AddInitializer(engine => engine.TrackStarted += OnTrackStarted);
     }
 
     private void OnTrackStarted(QueueItem track)
     {
-        if (_nowPlayingChannelId is not ulong channelId) return;
-
         var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
@@ -59,10 +43,13 @@ public sealed class NowPlayingPoster : IDisposable
             {
                 ct.ThrowIfCancellationRequested();
 
-                var channel = await _discordClient.GetChannelAsync(channelId);
+                var channelId = await _settings.GetNowPlayingChannelIdAsync(track.GuildId);
+                if (channelId is not ulong nowPlayingChannelId) return;
+
+                var channel = await _discordClient.GetChannelAsync(nowPlayingChannelId);
                 if (channel == null)
                 {
-                    _logger.LogWarning("Could not find now playing channel with ID: {ChannelId}", channelId);
+                    _logger.LogWarning("Could not find now playing channel with ID: {ChannelId}", nowPlayingChannelId);
                     return;
                 }
 
@@ -117,6 +104,9 @@ public sealed class NowPlayingPoster : IDisposable
 
     public void Dispose()
     {
-        _playerEngine.TrackStarted -= OnTrackStarted;
+        foreach (var engine in _playerEngines.CreatedInstances())
+        {
+            engine.TrackStarted -= OnTrackStarted;
+        }
     }
 }

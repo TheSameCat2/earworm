@@ -14,6 +14,7 @@ using Earworm;
 using Earworm.Discord;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Tests.Discord;
@@ -46,7 +47,8 @@ public sealed class VoiceManagerTests
             Substitute.For<IQueueRepository>(),
             Substitute.For<ISnapshotRepository>(),
             config,
-            NullLogger<QueueManager>.Instance);
+            NullLogger<QueueManager>.Instance,
+            "1");
 
     private static PlayerEngine BuildPlayerEngineSub(EarwormConfig config, QueueManager queueManager) =>
         Substitute.For<PlayerEngine>(
@@ -58,7 +60,8 @@ public sealed class VoiceManagerTests
             new AudioTransitionController(config, NullLogger<AudioTransitionController>.Instance),
             config,
             NullLogger<PlayerEngine>.Instance,
-            new ShutdownLifetime());
+            new ShutdownLifetime(),
+            "1");
 
     private static VoiceManager BuildVoiceManager(out ConcurrentDictionary<ulong, CancellationTokenSource> idleTimers)
     {
@@ -67,7 +70,9 @@ public sealed class VoiceManagerTests
         var playerEngine = BuildPlayerEngineSub(config, queueManager);
         var client = BuildPlaceholderClient();
         var audio = Substitute.For<IAudioService>();
-        var vm = new VoiceManager(client, audio, playerEngine, queueManager, config, NullLogger<VoiceManager>.Instance);
+        var playerRegistry = new PerGuildRegistry<PlayerEngine>(_ => playerEngine);
+        var queueRegistry = new PerGuildRegistry<QueueManager>(_ => queueManager);
+        var vm = new VoiceManager(client, audio, playerRegistry, queueRegistry, config, NullLogger<VoiceManager>.Instance);
 
         var field = typeof(VoiceManager).GetField("_idleTimers", BindingFlags.NonPublic | BindingFlags.Instance);
         idleTimers = (ConcurrentDictionary<ulong, CancellationTokenSource>)field!.GetValue(vm)!;

@@ -17,7 +17,7 @@ public sealed class QueueRepository : IQueueRepository
         _stateStore = stateStore;
     }
 
-    public async Task<List<QueueItem>> GetQueueAsync()
+    public async Task<List<QueueItem>> GetQueueAsync(string guildId)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
@@ -27,8 +27,10 @@ public sealed class QueueRepository : IQueueRepository
             SELECT queue_item_id, position, source_type, source_id, title, artist, duration_seconds,
                    requested_by_user_id, requested_by_display_name, queued_at, guild_id
             FROM queue
+            WHERE guild_id = $guildId
             ORDER BY position ASC;
         ";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
 
         var list = new List<QueueItem>();
         using var reader = await cmd.ExecuteReaderAsync();
@@ -95,7 +97,7 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
-    public async Task CompactPositionsAsync()
+    public async Task CompactPositionsAsync(string guildId)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
@@ -106,7 +108,8 @@ public sealed class QueueRepository : IQueueRepository
                 using (var selectCmd = connection.CreateCommand())
                 {
                     selectCmd.Transaction = transaction;
-                    selectCmd.CommandText = "SELECT queue_item_id FROM queue ORDER BY position ASC;";
+                    selectCmd.CommandText = "SELECT queue_item_id FROM queue WHERE guild_id = $guildId ORDER BY position ASC;";
+                    selectCmd.Parameters.AddWithValue("$guildId", guildId);
                     using var reader = await selectCmd.ExecuteReaderAsync();
                     while (await reader.ReadAsync())
                     {
@@ -124,7 +127,8 @@ public sealed class QueueRepository : IQueueRepository
                 using (var stageCmd = connection.CreateCommand())
                 {
                     stageCmd.Transaction = transaction;
-                    stageCmd.CommandText = "UPDATE queue SET position = -(position + 1000000);";
+                    stageCmd.CommandText = "UPDATE queue SET position = -(position + 1000000) WHERE guild_id = $guildId;";
+                    stageCmd.Parameters.AddWithValue("$guildId", guildId);
                     await stageCmd.ExecuteNonQueryAsync();
                 }
 
@@ -135,12 +139,13 @@ public sealed class QueueRepository : IQueueRepository
                 {
                     sb.Append($" WHEN {items[i]} THEN {i}");
                 }
-                sb.Append(" END;");
+                sb.Append(" END WHERE guild_id = $guildId;");
 
                 using (var updCmd = connection.CreateCommand())
                 {
                     updCmd.Transaction = transaction;
                     updCmd.CommandText = sb.ToString();
+                    updCmd.Parameters.AddWithValue("$guildId", guildId);
                     await updCmd.ExecuteNonQueryAsync();
                 }
 
@@ -154,19 +159,20 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
-    public async Task MoveTrackAsync(long queueItemId, int toPosition)
+    public async Task MoveTrackAsync(string guildId, long queueItemId, int toPosition)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var transaction = connection.BeginTransaction();
             try
             {
-                // Load all items ordered by position
+                // Load this guild's items ordered by position
                 var items = new List<(long Id, int Pos)>();
                 using (var getCmd = connection.CreateCommand())
                 {
                     getCmd.Transaction = transaction;
-                    getCmd.CommandText = "SELECT queue_item_id, position FROM queue ORDER BY position ASC;";
+                    getCmd.CommandText = "SELECT queue_item_id, position FROM queue WHERE guild_id = $guildId ORDER BY position ASC;";
+                    getCmd.Parameters.AddWithValue("$guildId", guildId);
                     using var reader = await getCmd.ExecuteReaderAsync();
                     while (await reader.ReadAsync())
                     {
@@ -199,7 +205,7 @@ public sealed class QueueRepository : IQueueRepository
 
                 // Build a two-statement batched update covering only the affected range.
                 // Phase 1: move all affected rows to large negative sentinel positions to
-                //          clear the UNIQUE(position) slots (SQLite checks per-row).
+                //          clear the UNIQUE(guild_id, position) slots (SQLite checks per-row).
                 // Phase 2: set the final positions via a single CASE statement.
                 // Together this is O(1) round-trips regardless of queue size.
                 var idList = new StringBuilder();
@@ -242,17 +248,18 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
-    public async Task ClearQueueAsync()
+    public async Task ClearQueueAsync(string guildId)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
-            cmd.CommandText = "DELETE FROM queue;";
+            cmd.CommandText = "DELETE FROM queue WHERE guild_id = $guildId;";
+            cmd.Parameters.AddWithValue("$guildId", guildId);
             await cmd.ExecuteNonQueryAsync();
         });
     }
 
-    public async Task<PlaybackState> GetPlaybackStateAsync()
+    public async Task<PlaybackState> GetPlaybackStateAsync(string guildId)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
@@ -263,8 +270,9 @@ public sealed class QueueRepository : IQueueRepository
                    current_duration_seconds, current_requested_by_user_id, current_requested_by_display_name,
                    current_position_ms, voice_channel_id, voice_guild_id, updated_at
             FROM playback_state
-            WHERE id = 1;
+            WHERE guild_id = $guildId;
         ";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
 
         using var reader = await cmd.ExecuteReaderAsync();
         if (await reader.ReadAsync())
@@ -287,31 +295,50 @@ public sealed class QueueRepository : IQueueRepository
             };
         }
 
-        throw new InvalidOperationException("Playback state singleton row (id = 1) is missing from the database.");
+        // No row yet for this guild (e.g. freshly admitted tenant that hasn't
+        // played anything). Return an idle default rather than throwing.
+        return new PlaybackState
+        {
+            IsPlaying = false,
+            IsPaused = false,
+            CurrentPositionMs = 0,
+            VoiceGuildId = guildId,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
     }
 
-    public async Task UpdatePlaybackStateAsync(PlaybackState state)
+    public async Task UpdatePlaybackStateAsync(string guildId, PlaybackState state)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
             cmd.CommandText = @"
-                UPDATE playback_state
-                SET is_playing = $isPlaying,
-                    is_paused = $isPaused,
-                    current_source_type = $sourceType,
-                    current_source_id = $sourceId,
-                    current_title = $title,
-                    current_artist = $artist,
-                    current_duration_seconds = $duration,
-                    current_requested_by_user_id = $userId,
-                    current_requested_by_display_name = $displayName,
-                    current_position_ms = $posMs,
-                    voice_channel_id = $voiceChannelId,
-                    voice_guild_id = $voiceGuildId,
-                    updated_at = $updatedAt
-                WHERE id = 1;
+                INSERT INTO playback_state
+                    (guild_id, is_playing, is_paused, current_source_type, current_source_id,
+                     current_title, current_artist, current_duration_seconds,
+                     current_requested_by_user_id, current_requested_by_display_name,
+                     current_position_ms, voice_channel_id, voice_guild_id, updated_at)
+                VALUES
+                    ($guildId, $isPlaying, $isPaused, $sourceType, $sourceId,
+                     $title, $artist, $duration,
+                     $userId, $displayName,
+                     $posMs, $voiceChannelId, $voiceGuildId, $updatedAt)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    is_playing = excluded.is_playing,
+                    is_paused = excluded.is_paused,
+                    current_source_type = excluded.current_source_type,
+                    current_source_id = excluded.current_source_id,
+                    current_title = excluded.current_title,
+                    current_artist = excluded.current_artist,
+                    current_duration_seconds = excluded.current_duration_seconds,
+                    current_requested_by_user_id = excluded.current_requested_by_user_id,
+                    current_requested_by_display_name = excluded.current_requested_by_display_name,
+                    current_position_ms = excluded.current_position_ms,
+                    voice_channel_id = excluded.voice_channel_id,
+                    voice_guild_id = excluded.voice_guild_id,
+                    updated_at = excluded.updated_at;
             ";
+            cmd.Parameters.AddWithValue("$guildId", guildId);
             cmd.Parameters.AddWithValue("$isPlaying", state.IsPlaying ? 1 : 0);
             cmd.Parameters.AddWithValue("$isPaused", state.IsPaused ? 1 : 0);
             cmd.Parameters.AddWithValue("$sourceType", (object?)state.CurrentSourceType ?? DBNull.Value);
@@ -330,7 +357,7 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
-    public async Task UpdatePlaybackPositionAsync(int positionMs)
+    public async Task UpdatePlaybackPositionAsync(string guildId, int positionMs)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
@@ -339,8 +366,9 @@ public sealed class QueueRepository : IQueueRepository
                 UPDATE playback_state
                 SET current_position_ms = $posMs,
                     updated_at = $updatedAt
-                WHERE id = 1;
+                WHERE guild_id = $guildId;
             ";
+            cmd.Parameters.AddWithValue("$guildId", guildId);
             cmd.Parameters.AddWithValue("$posMs", positionMs);
             cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 

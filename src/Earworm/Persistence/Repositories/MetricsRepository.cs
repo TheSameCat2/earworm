@@ -21,43 +21,28 @@ public sealed class MetricsRepository : IMetricsRepository
 
     // Precomputed at type-init so the SQL strings are stable identities across calls,
     // allowing Microsoft.Data.Sqlite's prepared-statement cache to reuse plans.
-    private static readonly IReadOnlyDictionary<string, string> UserUpsertSqlByColumn =
-        BuildUpsertDict(forUser: true);
+    private static readonly IReadOnlyDictionary<string, string> UserUpsertSqlByColumn = BuildUserUpsertDict();
 
-    private static readonly IReadOnlyDictionary<string, string> GlobalUpsertSqlByColumn =
-        BuildUpsertDict(forUser: false);
-
-    private static IReadOnlyDictionary<string, string> BuildUpsertDict(bool forUser)
+    private static IReadOnlyDictionary<string, string> BuildUserUpsertDict()
     {
         var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var col in new[]
+        foreach (var col in WhitelistedColumns)
         {
-            "tracks_queued", "tracks_completed", "listening_seconds",
-            "requests_youtube", "requests_soundcloud", "requests_mp3_upload", "requests_search"
-        })
-        {
-            dict[col] = forUser
-                ? $@"
-                    INSERT INTO metrics_per_user (user_id, display_name_last_seen, {col}, updated_at)
-                    VALUES ($userId, $displayName, $amount, $updatedAt)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        display_name_last_seen = excluded.display_name_last_seen,
-                        {col} = {col} + excluded.{col},
-                        updated_at = excluded.updated_at;"
-                : $@"
-                    INSERT INTO metrics_global (metric_key, metric_value, updated_at)
-                    VALUES ($key, $amount, $updatedAt)
-                    ON CONFLICT(metric_key) DO UPDATE SET
-                        metric_value = metric_value + excluded.metric_value,
-                        updated_at = excluded.updated_at;";
+            dict[col] = $@"
+                INSERT INTO metrics_per_user (guild_id, user_id, display_name_last_seen, {col}, updated_at)
+                VALUES ($guildId, $userId, $displayName, $amount, $updatedAt)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    display_name_last_seen = excluded.display_name_last_seen,
+                    {col} = {col} + excluded.{col},
+                    updated_at = excluded.updated_at;";
         }
         return dict;
     }
 
     private const string GlobalUpsertSql = @"
-        INSERT INTO metrics_global (metric_key, metric_value, updated_at)
-        VALUES ($key, $amount, $updatedAt)
-        ON CONFLICT(metric_key) DO UPDATE SET
+        INSERT INTO metrics_global (guild_id, metric_key, metric_value, updated_at)
+        VALUES ($guildId, $key, $amount, $updatedAt)
+        ON CONFLICT(guild_id, metric_key) DO UPDATE SET
             metric_value = metric_value + excluded.metric_value,
             updated_at = excluded.updated_at;";
 
@@ -68,12 +53,13 @@ public sealed class MetricsRepository : IMetricsRepository
         _stateStore = stateStore;
     }
 
-    public async Task IncrementGlobalMetricAsync(string key, long amount = 1)
+    public async Task IncrementGlobalMetricAsync(string guildId, string key, long amount = 1)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
             cmd.CommandText = GlobalUpsertSql;
+            cmd.Parameters.AddWithValue("$guildId", guildId);
             cmd.Parameters.AddWithValue("$key", key);
             cmd.Parameters.AddWithValue("$amount", amount);
             cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -82,26 +68,28 @@ public sealed class MetricsRepository : IMetricsRepository
         });
     }
 
-    public async Task<long> GetGlobalMetricAsync(string key)
+    public async Task<long> GetGlobalMetricAsync(string guildId, string key)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT metric_value FROM metrics_global WHERE metric_key = $key;";
+        cmd.CommandText = "SELECT metric_value FROM metrics_global WHERE guild_id = $guildId AND metric_key = $key;";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
         cmd.Parameters.AddWithValue("$key", key);
 
         var result = await cmd.ExecuteScalarAsync();
         return result != null && result != DBNull.Value ? Convert.ToInt64(result) : 0;
     }
 
-    public async Task<Dictionary<string, long>> GetGlobalMetricsAsync()
+    public async Task<Dictionary<string, long>> GetGlobalMetricsAsync(string guildId)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT metric_key, metric_value FROM metrics_global;";
+        cmd.CommandText = "SELECT metric_key, metric_value FROM metrics_global WHERE guild_id = $guildId;";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
 
         var dict = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         using var reader = await cmd.ExecuteReaderAsync();
@@ -112,7 +100,7 @@ public sealed class MetricsRepository : IMetricsRepository
         return dict;
     }
 
-    public async Task IncrementUserMetricAsync(string userId, string displayName, string column, long amount = 1)
+    public async Task IncrementUserMetricAsync(string guildId, string userId, string displayName, string column, long amount = 1)
     {
         if (!UserUpsertSqlByColumn.TryGetValue(column, out var sql))
         {
@@ -123,6 +111,7 @@ public sealed class MetricsRepository : IMetricsRepository
         {
             using var cmd = connection.CreateCommand();
             cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$guildId", guildId);
             cmd.Parameters.AddWithValue("$userId", userId);
             cmd.Parameters.AddWithValue("$displayName", displayName);
             cmd.Parameters.AddWithValue("$amount", amount);
@@ -132,7 +121,7 @@ public sealed class MetricsRepository : IMetricsRepository
         });
     }
 
-    public async Task IncrementBatchAsync(IReadOnlyCollection<MetricIncrement> increments)
+    public async Task IncrementBatchAsync(string guildId, IReadOnlyCollection<MetricIncrement> increments)
     {
         if (increments.Count == 0) return;
 
@@ -165,6 +154,7 @@ public sealed class MetricsRepository : IMetricsRepository
                     if (inc.UserId is null)
                     {
                         cmd.CommandText = GlobalUpsertSql;
+                        cmd.Parameters.AddWithValue("$guildId", guildId);
                         cmd.Parameters.AddWithValue("$key", inc.Column);
                         cmd.Parameters.AddWithValue("$amount", inc.Amount);
                         cmd.Parameters.AddWithValue("$updatedAt", updatedAt);
@@ -172,6 +162,7 @@ public sealed class MetricsRepository : IMetricsRepository
                     else
                     {
                         cmd.CommandText = UserUpsertSqlByColumn[inc.Column];
+                        cmd.Parameters.AddWithValue("$guildId", guildId);
                         cmd.Parameters.AddWithValue("$userId", inc.UserId);
                         cmd.Parameters.AddWithValue("$displayName", inc.DisplayName ?? string.Empty);
                         cmd.Parameters.AddWithValue("$amount", inc.Amount);
@@ -191,18 +182,19 @@ public sealed class MetricsRepository : IMetricsRepository
         });
     }
 
-    public async Task<UserMetrics?> GetUserMetricsAsync(string userId)
+    public async Task<UserMetrics?> GetUserMetricsAsync(string guildId, string userId)
     {
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 
         using var cmd = connection.CreateCommand();
         cmd.CommandText = @"
-            SELECT user_id, display_name_last_seen, tracks_queued, tracks_completed, listening_seconds, 
+            SELECT user_id, display_name_last_seen, tracks_queued, tracks_completed, listening_seconds,
                    requests_youtube, requests_soundcloud, requests_mp3_upload, requests_search, updated_at
             FROM metrics_per_user
-            WHERE user_id = $userId;
+            WHERE guild_id = $guildId AND user_id = $userId;
         ";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
         cmd.Parameters.AddWithValue("$userId", userId);
 
         using var reader = await cmd.ExecuteReaderAsync();
@@ -213,17 +205,17 @@ public sealed class MetricsRepository : IMetricsRepository
         return null;
     }
 
-    public async Task<List<UserMetrics>> GetTopUsersByListeningTimeAsync(int limit)
+    public async Task<List<UserMetrics>> GetTopUsersByListeningTimeAsync(string guildId, int limit)
     {
-        return await GetTopUsersInternalAsync("listening_seconds", limit);
+        return await GetTopUsersInternalAsync(guildId, "listening_seconds", limit);
     }
 
-    public async Task<List<UserMetrics>> GetTopUsersByTracksQueuedAsync(int limit)
+    public async Task<List<UserMetrics>> GetTopUsersByTracksQueuedAsync(string guildId, int limit)
     {
-        return await GetTopUsersInternalAsync("tracks_queued", limit);
+        return await GetTopUsersInternalAsync(guildId, "tracks_queued", limit);
     }
 
-    private async Task<List<UserMetrics>> GetTopUsersInternalAsync(string orderByColumn, int limit)
+    private async Task<List<UserMetrics>> GetTopUsersInternalAsync(string guildId, string orderByColumn, int limit)
     {
         // orderByColumn is interpolated into SQL below; whitelist defensively in
         // case a future caller passes a user-controlled string.
@@ -237,12 +229,14 @@ public sealed class MetricsRepository : IMetricsRepository
 
         using var cmd = connection.CreateCommand();
         cmd.CommandText = $@"
-            SELECT user_id, display_name_last_seen, tracks_queued, tracks_completed, listening_seconds, 
+            SELECT user_id, display_name_last_seen, tracks_queued, tracks_completed, listening_seconds,
                    requests_youtube, requests_soundcloud, requests_mp3_upload, requests_search, updated_at
             FROM metrics_per_user
+            WHERE guild_id = $guildId
             ORDER BY {orderByColumn} DESC
             LIMIT $limit;
         ";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
         cmd.Parameters.AddWithValue("$limit", limit);
 
         var list = new List<UserMetrics>();

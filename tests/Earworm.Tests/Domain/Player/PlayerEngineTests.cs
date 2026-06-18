@@ -32,7 +32,8 @@ public sealed class PlayerEngineTests
             Substitute.For<IQueueRepository>(),
             Substitute.For<ISnapshotRepository>(),
             config,
-            NullLogger<QueueManager>.Instance);
+            NullLogger<QueueManager>.Instance,
+            "1");
     }
 
     private static PlayerEngine BuildEngine(
@@ -55,7 +56,8 @@ public sealed class PlayerEngineTests
             transitions,
             config,
             NullLogger<PlayerEngine>.Instance,
-            new ShutdownLifetime());
+            new ShutdownLifetime(),
+            "1");
     }
 
     private static Task InvokePlayNextAsync(PlayerEngine engine, LavalinkPlayer? player)
@@ -117,7 +119,7 @@ public sealed class PlayerEngineTests
         engine.State.IsPlaying.Should().BeFalse();
         engine.State.IsPaused.Should().BeFalse();
         engine.State.CurrentSourceId.Should().BeNull();
-        await queueRepo.Received().UpdatePlaybackStateAsync(Arg.Is<PlaybackState>(s => !s.IsPlaying && s.CurrentSourceId == null));
+        await queueRepo.Received().UpdatePlaybackStateAsync(Arg.Any<string>(), Arg.Is<PlaybackState>(s => !s.IsPlaying && s.CurrentSourceId == null));
     }
 
     [Fact]
@@ -140,7 +142,7 @@ public sealed class PlayerEngineTests
         // Assert
         await queueManager.Received(1).DequeueAsync();
         await trackManager.DidNotReceive().LoadTrackAsync(Arg.Any<string>(), Arg.Any<TrackSearchMode>(), default, default);
-        await queueRepo.Received().UpdatePlaybackStateAsync(Arg.Is<PlaybackState>(s => !s.IsPlaying));
+        await queueRepo.Received().UpdatePlaybackStateAsync(Arg.Any<string>(), Arg.Is<PlaybackState>(s => !s.IsPlaying));
     }
 
     [Fact]

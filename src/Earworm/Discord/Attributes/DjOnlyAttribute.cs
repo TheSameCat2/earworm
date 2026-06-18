@@ -19,11 +19,11 @@ public sealed class DjOnlyAttribute : SlashCheckBaseAttribute
 {
     public override async Task<bool> ExecuteChecksAsync(InteractionContext ctx)
     {
-        if (ctx.Member == null) return false;
+        if (ctx.Member == null || ctx.Guild == null) return false;
         if (ctx.Member.Permissions.HasPermission(Permissions.Administrator)) return true;
 
         var settings = ctx.Services.GetRequiredService<ISettingsRepository>();
-        var djRoleId = await settings.GetDjRoleIdAsync();
+        var djRoleId = await settings.GetDjRoleIdAsync(ctx.Guild.Id.ToString());
         return djRoleId.HasValue && ctx.Member.Roles.Any(r => r.Id == djRoleId.Value);
     }
 }

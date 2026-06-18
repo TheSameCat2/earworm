@@ -31,6 +31,18 @@ These are **never** in `earworm.yaml`. Set them via shell, `.env`, or your secre
 
 Keys are **PascalCase** because the .NET configuration binder is case-insensitive but doesn't transform `snake_case`. Don't use snake_case — it'll silently fall back to defaults and you'll be debugging "why is my queue cap not applying" for an hour. (Ask me how I know.)
 
+### `Bot`
+
+```yaml
+Bot:
+  OwnerUserIds:
+    - "123456789012345678"
+```
+
+| Key | Required | Default | Description |
+|---|:-:|---|---|
+| `OwnerUserIds` | for multi-tenant | `[]` | Discord user IDs allowed to run `/admin …` (whitelist management). Without at least one, no one can admit new tenant guilds. |
+
 ### `Discord`
 
 ```yaml
@@ -41,8 +53,8 @@ Discord:
 
 | Key | Required | Default | Description |
 |---|:-:|---|---|
-| `GuildId` | yes | — | Discord server ID. Slash commands register per-guild; if blank, they register globally and take up to 1 hour to propagate. |
-| `NowPlayingChannelId` | no | `null` | Channel ID for the "Now Playing" embed. If unset, no embed is posted at all. |
+| `GuildId` | yes | — | **Seed only.** On first run this guild is admitted as the initial tenant and its pre-multi-tenant data is backfilled to it. After that the whitelist lives in the `tenants` table (managed via `/admin`); changing this key does not re-admit or move data. |
+| `NowPlayingChannelId` | no | `null` | **Seed only** for the `GuildId` tenant's now-playing channel. Per-guild thereafter — set it for any tenant with `/config now-playing-channel`. If unset, no embed is posted. |
 
 ### `Lavalink`
 

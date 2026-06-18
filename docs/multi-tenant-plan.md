@@ -1,6 +1,10 @@
 # Multi-tenant refactor plan
 
-Status: **planned, not yet implemented**. Designed in feature-dev session 2026-05-25.
+Status: **implemented** (2026-06-18). Original design from the feature-dev session 2026-05-25 is preserved below for context. Three deviations were made during implementation:
+
+1. **Migration renumbered to `004_multi_tenant.sql`.** PR-1 had already shipped `003_tenants.sql`, so the full-schema migration became 004 and dropped its now-redundant `CREATE TABLE tenants`.
+2. **`PlayerEngine` keeps its cross-guild `TrackEnded` filter.** The plan said to remove it ("now always matches"), but `IAudioService` is a single process-wide singleton shared by every per-guild engine — the `e.Player.GuildId != _guildId` check is the event-routing mechanism. Removing it would make every guild handle every other guild's events. `_guildId` now comes from the injected `guildId` instead of config.
+3. **`NowPlayingPoster` and `TrackFailureHandler` stay global singleton bridges** (subscribing to all engines via `PerGuildRegistry.AddInitializer`) rather than becoming per-guild instances. They already read `track.GuildId`, so per-guild settings lookups work without per-guild instances. `playback_state`/`snapshot` writes became upserts so a freshly admitted guild self-seeds its rows.
 
 ## Goal
 

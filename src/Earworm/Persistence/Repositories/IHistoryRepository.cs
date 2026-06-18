@@ -7,13 +7,14 @@ namespace Earworm.Persistence.Repositories;
 public interface IHistoryRepository
 {
     /// <summary>
-    /// Adds a play history entry and prunes excess entries exceeding retentionCount.
-    /// Insertion and pruning happen atomically inside a single transaction.
+    /// Adds a play history entry and prunes excess entries exceeding retentionCount
+    /// for the entry's guild. Insertion and pruning happen atomically inside a single
+    /// transaction.
     /// </summary>
     Task AddHistoryEntryAsync(PlayHistoryEntry entry, int retentionCount);
 
     /// <summary>
-    /// Retrieves the most recent N history entries, ordered by played_at DESC.
+    /// Retrieves the most recent N history entries for the guild, ordered by played_at DESC.
     /// </summary>
-    Task<List<PlayHistoryEntry>> GetRecentHistoryAsync(int limit);
+    Task<List<PlayHistoryEntry>> GetRecentHistoryAsync(string guildId, int limit);
 }

@@ -29,13 +29,13 @@ namespace Earworm.Domain.DJ;
 /// </summary>
 public sealed class DJEngine : IDisposable
 {
-    private readonly PlayerEngine _playerEngine;
     private readonly GeminiClient _geminiClient;
     private readonly ITtsProvider _ttsProvider;
     private readonly ISettingsRepository _settingsRepository;
     private readonly IMetricsRepository _metricsRepository;
     private readonly EarwormConfig _config;
     private readonly ILogger<DJEngine> _logger;
+    private readonly string _guildId;
 
     private readonly Random _random = new();
     private readonly object _stateLock = new();
@@ -43,21 +43,21 @@ public sealed class DJEngine : IDisposable
     private int _targetGap;
 
     public DJEngine(
-        PlayerEngine playerEngine,
         GeminiClient geminiClient,
         ITtsProvider ttsProvider,
         ISettingsRepository settingsRepository,
         IMetricsRepository metricsRepository,
         EarwormConfig config,
-        ILogger<DJEngine> logger)
+        ILogger<DJEngine> logger,
+        string guildId)
     {
-        _playerEngine = playerEngine;
         _geminiClient = geminiClient;
         _ttsProvider = ttsProvider;
         _settingsRepository = settingsRepository;
         _metricsRepository = metricsRepository;
         _config = config;
         _logger = logger;
+        _guildId = guildId;
 
         ResetTargetGap();
     }
@@ -71,7 +71,7 @@ public sealed class DJEngine : IDisposable
     public async Task<TtsPreroll?> MaybePlayCommentaryAsync(QueueItem upcomingTrack, CancellationToken cancellationToken)
     {
         bool enabled;
-        try { enabled = await _settingsRepository.IsDjEnabledAsync(); }
+        try { enabled = await _settingsRepository.IsDjEnabledAsync(_guildId); }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to read DJ-enabled setting; skipping commentary.");
@@ -131,7 +131,7 @@ public sealed class DJEngine : IDisposable
             }
 
             // PRD §11: best-effort metric increment.
-            try { await _metricsRepository.IncrementGlobalMetricAsync("dj_commentary_count", 1); }
+            try { await _metricsRepository.IncrementGlobalMetricAsync(_guildId, "dj_commentary_count", 1); }
             catch { /* best-effort */ }
 
             string baseUrl = _config.Dj.TtsServeBaseUrl.TrimEnd('/');

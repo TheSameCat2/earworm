@@ -13,54 +13,66 @@ public sealed class SettingsRepository : ISettingsRepository
         _stateStore = stateStore;
     }
 
-    public async Task<ulong?> GetDjRoleIdAsync()
+    public async Task<ulong?> GetDjRoleIdAsync(string guildId)
     {
-        var val = await GetValueAsync("dj_role_id");
+        var val = await GetValueAsync(guildId, "dj_role_id");
         return ulong.TryParse(val, out var id) ? id : null;
     }
 
-    public async Task SetDjRoleIdAsync(ulong? roleId)
+    public async Task SetDjRoleIdAsync(string guildId, ulong? roleId)
     {
-        await SetValueAsync("dj_role_id", roleId?.ToString());
+        await SetValueAsync(guildId, "dj_role_id", roleId?.ToString());
     }
 
-    public async Task<ulong?> GetLoggingChannelIdAsync()
+    public async Task<ulong?> GetLoggingChannelIdAsync(string guildId)
     {
-        var val = await GetValueAsync("logging_channel_id");
+        var val = await GetValueAsync(guildId, "logging_channel_id");
         return ulong.TryParse(val, out var id) ? id : null;
     }
 
-    public async Task SetLoggingChannelIdAsync(ulong? channelId)
+    public async Task SetLoggingChannelIdAsync(string guildId, ulong? channelId)
     {
-        await SetValueAsync("logging_channel_id", channelId?.ToString());
+        await SetValueAsync(guildId, "logging_channel_id", channelId?.ToString());
     }
 
-    public async Task<bool> IsDjEnabledAsync()
+    public async Task<bool> IsDjEnabledAsync(string guildId)
     {
-        var val = await GetValueAsync("dj_enabled");
+        var val = await GetValueAsync(guildId, "dj_enabled");
         return val == "1";
     }
 
-    public async Task SetDjEnabledAsync(bool enabled)
+    public async Task SetDjEnabledAsync(string guildId, bool enabled)
     {
-        await SetValueAsync("dj_enabled", enabled ? "1" : "0");
+        await SetValueAsync(guildId, "dj_enabled", enabled ? "1" : "0");
     }
 
-    private async Task<string?> GetValueAsync(string key)
+    public async Task<ulong?> GetNowPlayingChannelIdAsync(string guildId)
+    {
+        var val = await GetValueAsync(guildId, "now_playing_channel_id");
+        return ulong.TryParse(val, out var id) ? id : null;
+    }
+
+    public async Task SetNowPlayingChannelIdAsync(string guildId, ulong? channelId)
+    {
+        await SetValueAsync(guildId, "now_playing_channel_id", channelId?.ToString());
+    }
+
+    private async Task<string?> GetValueAsync(string guildId, string key)
     {
         // Read directly using concurrent connection
         using var connection = _stateStore.CreateConnection();
         await connection.OpenAsync();
 
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT value FROM settings WHERE key = $key;";
+        cmd.CommandText = "SELECT value FROM settings WHERE guild_id = $guildId AND key = $key;";
+        cmd.Parameters.AddWithValue("$guildId", guildId);
         cmd.Parameters.AddWithValue("$key", key);
 
         var val = await cmd.ExecuteScalarAsync();
         return val as string;
     }
 
-    private async Task SetValueAsync(string key, string? value)
+    private async Task SetValueAsync(string guildId, string key, string? value)
     {
         // Write serialized through the channel
         await _stateStore.SubmitWriteAsync(async connection =>
@@ -68,15 +80,17 @@ public sealed class SettingsRepository : ISettingsRepository
             using var cmd = connection.CreateCommand();
             if (value is null)
             {
-                cmd.CommandText = "DELETE FROM settings WHERE key = $key;";
+                cmd.CommandText = "DELETE FROM settings WHERE guild_id = $guildId AND key = $key;";
+                cmd.Parameters.AddWithValue("$guildId", guildId);
                 cmd.Parameters.AddWithValue("$key", key);
             }
             else
             {
                 cmd.CommandText = @"
-                    INSERT INTO settings (key, value, updated_at) VALUES ($key, $value, $updated_at)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+                    INSERT INTO settings (guild_id, key, value, updated_at) VALUES ($guildId, $key, $value, $updated_at)
+                    ON CONFLICT(guild_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
                 ";
+                cmd.Parameters.AddWithValue("$guildId", guildId);
                 cmd.Parameters.AddWithValue("$key", key);
                 cmd.Parameters.AddWithValue("$value", value);
                 cmd.Parameters.AddWithValue("$updated_at", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
