@@ -149,6 +149,17 @@ public class QueueManager : IDisposable
     {
         await EnsureInitializedAsync();
 
+        // The row belongs to THIS manager's guild, never the caller-supplied
+        // argument. Positions are computed against our own in-memory queue, so a
+        // mismatched guild_id would write into another tenant at a position that
+        // can collide on UNIQUE(guild_id, position). Flag a mismatch defensively.
+        if (!string.Equals(guildId, _guildId, StringComparison.Ordinal))
+        {
+            _logger.LogWarning(
+                "AddTrackAsync received guildId '{Arg}' on the QueueManager for '{Owner}'; using the owner guild.",
+                guildId, _guildId);
+        }
+
         var item = new QueueItem
         {
             SourceType = sourceType,
@@ -159,7 +170,7 @@ public class QueueManager : IDisposable
             RequestedByUserId = requestedByUserId,
             RequestedByDisplayName = requestedByDisplayName,
             QueuedAt = DateTimeOffset.UtcNow,
-            GuildId = guildId
+            GuildId = _guildId
         };
 
         Task<long> writeTask;
@@ -465,7 +476,7 @@ public class QueueManager : IDisposable
             RequestedByUserId = item.RequestedByUserId,
             RequestedByDisplayName = item.RequestedByDisplayName,
             QueuedAt = DateTimeOffset.UtcNow,
-            GuildId = item.GuildId
+            GuildId = _guildId
         };
 
         Task<long> addTask;
