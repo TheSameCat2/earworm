@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -325,5 +326,67 @@ public sealed class QueueManagerTests
             GC.WaitForPendingFinalizers();
             try { File.Delete(config.Persistence.SqlitePath); } catch { /* ignore */ }
         }
+    }
+
+    [Fact]
+    public async Task RequeueFront_InterleavedWithDequeues_StaysConsistent_AndNeverThrows()
+    {
+        // Regression for the stale-position race: RequeueFrontAsync captured the
+        // insert index before its DB await, then moved by that (possibly stale)
+        // position after the lock was released — so a concurrent dequeue could make
+        // the move target out of bounds (ArgumentOutOfRangeException) or shift it
+        // onto the wrong track. The fix backfills + moves by row id under one lock,
+        // so these invariants hold under any interleaving.
+        await RunWithQueueManagerAsync(async (manager, _) =>
+        {
+            const int N = 20;
+            for (int i = 0; i < N; i++)
+            {
+                await manager.AddTrackAsync("youtube", $"id_{i}", $"Track {i}", "Artist", 60, "u", "U", "g1");
+            }
+
+            var exceptions = new ConcurrentQueue<Exception>();
+            var tasks = new List<Task>();
+
+            for (int i = 0; i < 5; i++)
+            {
+                int local = i;
+                tasks.Add(Task.Run(async () =>
+                {
+                    try
+                    {
+                        await manager.RequeueFrontAsync(new QueueItem
+                        {
+                            SourceType = "youtube",
+                            SourceId = $"rewind_{local}",
+                            Title = $"Rewind {local}",
+                            Artist = "DJ",
+                            DurationSeconds = 90,
+                            RequestedByUserId = "dj",
+                            RequestedByDisplayName = "DJ",
+                            GuildId = "g1",
+                        });
+                    }
+                    catch (Exception ex) { exceptions.Enqueue(ex); }
+                }));
+            }
+            for (int i = 0; i < 5; i++)
+            {
+                tasks.Add(Task.Run(async () =>
+                {
+                    try { await manager.DequeueAsync(); }
+                    catch (Exception ex) { exceptions.Enqueue(ex); }
+                }));
+            }
+
+            await Task.WhenAll(tasks);
+
+            exceptions.Should().BeEmpty("RequeueFront must not throw under concurrent dequeues");
+
+            var queue = manager.GetQueue();
+            queue.Select(q => q.Position).Should().Equal(Enumerable.Range(0, queue.Count),
+                "positions stay dense and contiguous regardless of interleaving");
+            queue.Select(q => q.QueueItemId).Distinct().Should().HaveCount(queue.Count, "no duplicate ids");
+        });
     }
 }

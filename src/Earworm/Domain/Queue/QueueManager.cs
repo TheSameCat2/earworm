@@ -184,8 +184,9 @@ public class QueueManager : IDisposable
 
             pos = _queue.Count;
             // SubmitWriteAsync only enqueues to an unbounded channel (no I/O),
-            // so we can safely call it under the lock and capture the Task.
-            writeTask = _queueRepository.AddTrackAsync(item, pos);
+            // so we can safely call it under the lock and capture the Task. The DB
+            // assigns its own gap-free position; pos here is the dense in-memory one.
+            writeTask = _queueRepository.AddTrackAsync(item);
 
             finalItem = item with { Position = pos };
             _queue.Add(finalItem);
@@ -484,16 +485,23 @@ public class QueueManager : IDisposable
         lock (_lock)
         {
             lastPos = _queue.Count;
-            addTask = _queueRepository.AddTrackAsync(fresh, lastPos);
+            addTask = _queueRepository.AddTrackAsync(fresh);
             _queue.Add(fresh with { Position = lastPos });
         }
 
         long newId = await addTask;
 
-        // Backfill the new row id so any subsequent ID-keyed operation
-        // (MoveTrackAsync below) sees it.
+        // Backfill the row id and move it to the front atomically under one lock.
+        // The position captured before the await (lastPos) can be stale — a
+        // concurrent Dequeue/Remove may have shifted the queue while addTask was in
+        // flight — so locate the row by id now and move by id, never by the stale
+        // position (which could be out of bounds or point at a different track).
+        Task moveTask = Task.CompletedTask;
+        QueueItem finalItem;
+        Action<QueueItem>? handler;
         lock (_lock)
         {
+            int idx = -1;
             for (int i = 0; i < _queue.Count; i++)
             {
                 if (_queue[i].QueueItemId == 0
@@ -501,26 +509,32 @@ public class QueueManager : IDisposable
                     && _queue[i].QueuedAt == fresh.QueuedAt)
                 {
                     _queue[i] = _queue[i] with { QueueItemId = newId };
+                    idx = i;
                     break;
                 }
             }
-        }
 
-        if (lastPos > 0)
-        {
-            await MoveTrackAsync(lastPos, 0);
-        }
+            if (idx > 0)
+            {
+                var moving = _queue[idx];
+                _queue.RemoveAt(idx);
+                _queue.Insert(0, moving);
+                for (int i = 0; i < _queue.Count; i++)
+                {
+                    _queue[i] = _queue[i] with { Position = i };
+                }
+                // Repo write only enqueues to the channel, safe under the lock.
+                moveTask = _queueRepository.MoveTrackAsync(_guildId, newId, 0);
+            }
 
-        QueueItem finalItem;
-        Action<QueueItem>? handler;
-        lock (_lock)
-        {
-            int idx = _queue.FindIndex(q => q.QueueItemId == newId);
-            finalItem = idx >= 0
-                ? _queue[idx]
+            int finalIdx = _queue.FindIndex(q => q.QueueItemId == newId);
+            finalItem = finalIdx >= 0
+                ? _queue[finalIdx]
                 : fresh with { QueueItemId = newId, Position = 0 };
             handler = TrackQueued;
         }
+
+        await moveTask;
 
         handler?.Invoke(finalItem);
     }

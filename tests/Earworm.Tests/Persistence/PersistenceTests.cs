@@ -152,8 +152,8 @@ public sealed class PersistenceTests
             };
 
             // Act: Add Tracks
-            long id1 = await repo.AddTrackAsync(item1, 0);
-            long id2 = await repo.AddTrackAsync(item2, 1);
+            long id1 = await repo.AddTrackAsync(item1);
+            long id2 = await repo.AddTrackAsync(item2);
 
             // Assert Get Queue
             var queue = await repo.GetQueueAsync(G);
@@ -235,13 +235,13 @@ public sealed class PersistenceTests
                 SourceType = "youtube", SourceId = "a", Title = "A", Artist = "x",
                 RequestedByUserId = "u", RequestedByDisplayName = "U",
                 QueuedAt = DateTimeOffset.UtcNow, GuildId = "gA"
-            }, 0);
+            });
             await repo.AddTrackAsync(new QueueItem
             {
                 SourceType = "youtube", SourceId = "b", Title = "B", Artist = "x",
                 RequestedByUserId = "u", RequestedByDisplayName = "U",
                 QueuedAt = DateTimeOffset.UtcNow, GuildId = "gB"
-            }, 0);
+            });
 
             (await repo.GetQueueAsync("gA")).Should().ContainSingle().Which.SourceId.Should().Be("a");
             (await repo.GetQueueAsync("gB")).Should().ContainSingle().Which.SourceId.Should().Be("b");
@@ -285,7 +285,7 @@ public sealed class PersistenceTests
                 QueuedAt = DateTimeOffset.UtcNow,
                 GuildId = G
             };
-            await queueRepo.AddTrackAsync(item, 0);
+            await queueRepo.AddTrackAsync(item);
 
             var activeState = new PlaybackState
             {
@@ -384,8 +384,8 @@ public sealed class PersistenceTests
                 QueuedAt = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_001_000),
                 GuildId = G
             };
-            await queueRepo.AddTrackAsync(item1, 0);
-            await queueRepo.AddTrackAsync(item2, 1);
+            await queueRepo.AddTrackAsync(item1);
+            await queueRepo.AddTrackAsync(item2);
 
             var originalState = new PlaybackState
             {
@@ -748,7 +748,7 @@ public sealed class PersistenceTests
                     RequestedByDisplayName = "User",
                     QueuedAt = DateTimeOffset.UtcNow,
                     GuildId = G
-                }, i);
+                });
             }
 
             // Move the last item (index 49) to the front (position 0)
@@ -803,7 +803,7 @@ public sealed class PersistenceTests
                     RequestedByDisplayName = "User",
                     QueuedAt = DateTimeOffset.UtcNow,
                     GuildId = G
-                }, i);
+                });
             }
 
             // Dequeue first 5 items (simulating front-of-queue pops)
