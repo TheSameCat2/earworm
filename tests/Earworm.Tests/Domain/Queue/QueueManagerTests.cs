@@ -270,4 +270,60 @@ public sealed class QueueManagerTests
             manager.Count.Should().Be(0);
         });
     }
+
+    [Fact]
+    public async Task AddTrack_OnUnhydratedManagerWithPersistedRows_LazilyLoadsAndDoesNotCollide()
+    {
+        // Regression for the multi-tenant lazy-hydration fix: a QueueManager
+        // created outside the startup loop (runtime add-server, re-admit after
+        // suspend, or a swallowed startup-init failure) is never InitializeAsync'd.
+        // Without lazy hydration its in-memory queue starts empty, so the first
+        // enqueue computes position 0 and collides with the persisted row on
+        // UNIQUE(guild_id, position) — throwing on every /play until restart.
+        var config = BuildConfig();
+        var stateStore = new StateStore(config, NullLogger<StateStore>.Instance);
+        try
+        {
+            new SchemaMigrator(stateStore.ConnectionString, NullLogger<SchemaMigrator>.Instance).Migrate();
+            var queueRepo = new QueueRepository(stateStore);
+            var snapshotRepo = new SnapshotRepository(stateStore);
+
+            // Seed 3 persisted rows for g1 via a first, properly-hydrated manager.
+            var seeder = new QueueManager(queueRepo, snapshotRepo, config, NullLogger<QueueManager>.Instance, "g1");
+            await seeder.InitializeAsync();
+            for (int i = 0; i < 3; i++)
+            {
+                await seeder.AddTrackAsync("youtube", $"seed_{i}", $"Seed {i}", "Seeder", 60, "u", "U", "g1");
+            }
+
+            // A brand-new manager for the SAME guild that is never InitializeAsync'd.
+            var fresh = new QueueManager(queueRepo, snapshotRepo, config, NullLogger<QueueManager>.Instance, "g1");
+
+            // Must not throw, and must land after the lazily-loaded persisted rows.
+            var added = await fresh.AddTrackAsync("youtube", "new", "New", "Newcomer", 60, "u2", "U2", "g1");
+
+            added.Position.Should().Be(3, "the new track follows the 3 lazily-loaded persisted rows");
+            var queue = fresh.GetQueue();
+            queue.Should().HaveCount(4, "the persisted rows are now visible alongside the new one");
+            queue.Select(q => q.Position).Should().Equal(Enumerable.Range(0, 4));
+            queue.Select(q => q.SourceId).Should().Equal("seed_0", "seed_1", "seed_2", "new");
+
+            // A second add does not re-hydrate / wipe state — it appends at 4.
+            var added2 = await fresh.AddTrackAsync("youtube", "new2", "New 2", "Newcomer", 60, "u2", "U2", "g1");
+            added2.Position.Should().Be(4);
+            fresh.GetQueue().Should().HaveCount(5);
+
+            // DB agrees: 5 distinct rows, positions 0..4.
+            var dbQueue = await queueRepo.GetQueueAsync("g1");
+            dbQueue.Should().HaveCount(5);
+            dbQueue.Select(q => q.Position).Should().Equal(Enumerable.Range(0, 5));
+        }
+        finally
+        {
+            stateStore.Dispose();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            try { File.Delete(config.Persistence.SqlitePath); } catch { /* ignore */ }
+        }
+    }
 }
