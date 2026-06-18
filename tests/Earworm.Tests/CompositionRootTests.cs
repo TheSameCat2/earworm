@@ -10,6 +10,7 @@ using Earworm.Discord;
 using Earworm.Domain.DJ;
 using Earworm.Domain.Player;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
 using Earworm.Persistence;
 using Earworm.Persistence.Schema;
 
@@ -60,12 +61,16 @@ public sealed class CompositionRootTests
         await using var provider = BuildProvider();
 
         provider.GetRequiredService<StateStore>().Should().NotBeNull();
-        provider.GetRequiredService<QueueManager>().Should().NotBeNull();
-        provider.GetRequiredService<PlayerEngine>().Should().NotBeNull();
+
+        // Per-guild engines are resolved through PerGuildRegistry<T>. Creating
+        // one for a guild exercises the full factory graph (QueueManager →
+        // AudioTransitionController → DJEngine → PlayerEngine + DJ hook wiring).
+        provider.GetRequiredService<PerGuildRegistry<QueueManager>>().GetOrCreate("1").Should().NotBeNull();
         // DJEngine pulls in GeminiClient and ITtsProvider, which transitively
         // pull in HttpClient. Regression guard against the original startup
         // crash (Microsoft.Extensions.Http not registered).
-        provider.GetRequiredService<DJEngine>().Should().NotBeNull();
+        provider.GetRequiredService<PerGuildRegistry<DJEngine>>().GetOrCreate("1").Should().NotBeNull();
+        provider.GetRequiredService<PerGuildRegistry<PlayerEngine>>().GetOrCreate("1").Should().NotBeNull();
         // IAudioService should resolve too — this is what was missing pre-pivot.
         provider.GetRequiredService<Lavalink4NET.IAudioService>().Should().NotBeNull();
     }

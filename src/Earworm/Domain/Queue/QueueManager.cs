@@ -15,6 +15,7 @@ public class QueueManager
     private readonly ISnapshotRepository _snapshotRepository;
     private readonly EarwormConfig _config;
     private readonly ILogger<QueueManager> _logger;
+    private readonly string _guildId;
 
     private readonly List<QueueItem> _queue = new();
     private readonly object _lock = new();
@@ -31,13 +32,18 @@ public class QueueManager
         IQueueRepository queueRepository,
         ISnapshotRepository snapshotRepository,
         EarwormConfig config,
-        ILogger<QueueManager> logger)
+        ILogger<QueueManager> logger,
+        string guildId)
     {
         _queueRepository = queueRepository;
         _snapshotRepository = snapshotRepository;
         _config = config;
         _logger = logger;
+        _guildId = guildId;
     }
+
+    /// <summary>The Discord guild this queue belongs to.</summary>
+    public string GuildId => _guildId;
 
     /// <summary>
     /// Loads the persisted queue from SQLite into memory. Call this once at
@@ -46,7 +52,7 @@ public class QueueManager
     /// </summary>
     public async Task InitializeAsync()
     {
-        var dbQueue = await _queueRepository.GetQueueAsync();
+        var dbQueue = await _queueRepository.GetQueueAsync(_guildId);
         lock (_lock)
         {
             _queue.Clear();
@@ -313,7 +319,7 @@ public class QueueManager
             }
 
             var item = _queue[fromPosition];
-            writeTask = _queueRepository.MoveTrackAsync(item.QueueItemId, toPosition);
+            writeTask = _queueRepository.MoveTrackAsync(_guildId, item.QueueItemId, toPosition);
 
             _queue.RemoveAt(fromPosition);
             _queue.Insert(toPosition, item);
@@ -339,7 +345,7 @@ public class QueueManager
         Action? handler;
         lock (_lock)
         {
-            writeTask = _queueRepository.ClearQueueAsync();
+            writeTask = _queueRepository.ClearQueueAsync(_guildId);
             _queue.Clear();
             handler = QueueCleared;
         }
@@ -457,7 +463,7 @@ public class QueueManager
     /// </summary>
     public async Task SaveSnapshotAsync(string savedByUserId)
     {
-        await _snapshotRepository.SaveSnapshotAsync(savedByUserId);
+        await _snapshotRepository.SaveSnapshotAsync(_guildId, savedByUserId);
         _logger.LogInformation("Saved snapshot of queue for user {UserId}.", savedByUserId);
         SnapshotSaved?.Invoke();
     }
@@ -468,7 +474,7 @@ public class QueueManager
     /// </summary>
     public async Task<PlaybackState?> RestoreSnapshotAsync()
     {
-        var restored = await _snapshotRepository.RestoreSnapshotAsync();
+        var restored = await _snapshotRepository.RestoreSnapshotAsync(_guildId);
         if (restored == null)
         {
             return null;

@@ -33,7 +33,7 @@ public sealed class PersistenceTests
         var migratorLogger = NullLogger<SchemaMigrator>.Instance;
 
         var stateStore = new StateStore(config, stateStoreLogger);
-        
+
         // Execute migrations
         var migrator = new SchemaMigrator(stateStore.ConnectionString, migratorLogger);
         migrator.Migrate();
@@ -67,31 +67,53 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild123";
             // Arrange
             var repo = new SettingsRepository(stateStore);
 
             // Assert Defaults
-            (await repo.IsDjEnabledAsync()).Should().BeFalse();
-            (await repo.GetDjRoleIdAsync()).Should().BeNull();
-            (await repo.GetLoggingChannelIdAsync()).Should().BeNull();
+            (await repo.IsDjEnabledAsync(G)).Should().BeFalse();
+            (await repo.GetDjRoleIdAsync(G)).Should().BeNull();
+            (await repo.GetLoggingChannelIdAsync(G)).Should().BeNull();
 
             // Act
-            await repo.SetDjEnabledAsync(true);
-            await repo.SetDjRoleIdAsync(123456789UL);
-            await repo.SetLoggingChannelIdAsync(987654321UL);
+            await repo.SetDjEnabledAsync(G, true);
+            await repo.SetDjRoleIdAsync(G, 123456789UL);
+            await repo.SetLoggingChannelIdAsync(G, 987654321UL);
 
             // Assert Updated Values
-            (await repo.IsDjEnabledAsync()).Should().BeTrue();
-            (await repo.GetDjRoleIdAsync()).Should().Be(123456789UL);
-            (await repo.GetLoggingChannelIdAsync()).Should().Be(987654321UL);
+            (await repo.IsDjEnabledAsync(G)).Should().BeTrue();
+            (await repo.GetDjRoleIdAsync(G)).Should().Be(123456789UL);
+            (await repo.GetLoggingChannelIdAsync(G)).Should().Be(987654321UL);
 
             // Act: Reset values to null
-            await repo.SetDjRoleIdAsync(null);
-            await repo.SetLoggingChannelIdAsync(null);
+            await repo.SetDjRoleIdAsync(G, null);
+            await repo.SetLoggingChannelIdAsync(G, null);
 
             // Assert Resets
-            (await repo.GetDjRoleIdAsync()).Should().BeNull();
-            (await repo.GetLoggingChannelIdAsync()).Should().BeNull();
+            (await repo.GetDjRoleIdAsync(G)).Should().BeNull();
+            (await repo.GetLoggingChannelIdAsync(G)).Should().BeNull();
+        });
+    }
+
+    [Fact]
+    public async Task SettingsRepository_ValuesAreIsolatedPerGuild()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var repo = new SettingsRepository(stateStore);
+
+            await repo.SetDjEnabledAsync("guildA", true);
+            await repo.SetDjRoleIdAsync("guildA", 111UL);
+
+            // guildB must not see guildA's settings.
+            (await repo.IsDjEnabledAsync("guildB")).Should().BeFalse();
+            (await repo.GetDjRoleIdAsync("guildB")).Should().BeNull();
+
+            // And setting guildB independently must not affect guildA.
+            await repo.SetDjRoleIdAsync("guildB", 222UL);
+            (await repo.GetDjRoleIdAsync("guildA")).Should().Be(111UL);
+            (await repo.GetDjRoleIdAsync("guildB")).Should().Be(222UL);
         });
     }
 
@@ -100,6 +122,7 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild123";
             // Arrange
             var repo = new QueueRepository(stateStore);
             var item1 = new QueueItem
@@ -112,7 +135,7 @@ public sealed class PersistenceTests
                 RequestedByUserId = "111",
                 RequestedByDisplayName = "Alice",
                 QueuedAt = DateTimeOffset.UtcNow,
-                GuildId = "guild123"
+                GuildId = G
             };
 
             var item2 = new QueueItem
@@ -125,7 +148,7 @@ public sealed class PersistenceTests
                 RequestedByUserId = "222",
                 RequestedByDisplayName = "Bob",
                 QueuedAt = DateTimeOffset.UtcNow.AddSeconds(1),
-                GuildId = "guild123"
+                GuildId = G
             };
 
             // Act: Add Tracks
@@ -133,7 +156,7 @@ public sealed class PersistenceTests
             long id2 = await repo.AddTrackAsync(item2, 1);
 
             // Assert Get Queue
-            var queue = await repo.GetQueueAsync();
+            var queue = await repo.GetQueueAsync(G);
             queue.Should().HaveCount(2);
             queue[0].Position.Should().Be(0);
             queue[0].SourceId.Should().Be("t1");
@@ -143,9 +166,9 @@ public sealed class PersistenceTests
             queue[1].QueueItemId.Should().Be(id2);
 
             // Act: Move t2 to position 0 (by id, not by old position)
-            await repo.MoveTrackAsync(id2, 0);
+            await repo.MoveTrackAsync(G, id2, 0);
 
-            var queueAfterMove = await repo.GetQueueAsync();
+            var queueAfterMove = await repo.GetQueueAsync(G);
             queueAfterMove[0].SourceId.Should().Be("t2");
             queueAfterMove[0].Position.Should().Be(0);
             queueAfterMove[1].SourceId.Should().Be("t1");
@@ -154,14 +177,14 @@ public sealed class PersistenceTests
             // Act: Remove t2 by ID
             await repo.RemoveTrackAsync(id2);
 
-            var queueAfterRemove = await repo.GetQueueAsync();
+            var queueAfterRemove = await repo.GetQueueAsync(G);
             queueAfterRemove.Should().HaveCount(1);
             queueAfterRemove[0].SourceId.Should().Be("t1");
             // Position gaps are intentional: the DB skips renumbering on delete.
             // QueueManager maintains dense in-memory positions for display.
 
-            // Playback State singleton tests
-            var defaultState = await repo.GetPlaybackStateAsync();
+            // Playback State per-guild tests
+            var defaultState = await repo.GetPlaybackStateAsync(G);
             defaultState.IsPlaying.Should().BeFalse();
 
             var newState = new PlaybackState
@@ -177,25 +200,64 @@ public sealed class PersistenceTests
                 CurrentRequestedByDisplayName = "Charlie",
                 CurrentPositionMs = 5000,
                 VoiceChannelId = "vc1",
-                VoiceGuildId = "guild123",
+                VoiceGuildId = G,
                 UpdatedAt = DateTimeOffset.UtcNow
             };
 
-            await repo.UpdatePlaybackStateAsync(newState);
+            await repo.UpdatePlaybackStateAsync(G, newState);
 
-            var updatedState = await repo.GetPlaybackStateAsync();
+            var updatedState = await repo.GetPlaybackStateAsync(G);
             updatedState.IsPlaying.Should().BeTrue();
             updatedState.CurrentSourceId.Should().Be("playing_now");
             updatedState.CurrentPositionMs.Should().Be(5000);
 
             // Update position ms
-            await repo.UpdatePlaybackPositionAsync(12000);
-            var updatedPosState = await repo.GetPlaybackStateAsync();
+            await repo.UpdatePlaybackPositionAsync(G, 12000);
+            var updatedPosState = await repo.GetPlaybackStateAsync(G);
             updatedPosState.CurrentPositionMs.Should().Be(12000);
 
             // Clear queue
-            await repo.ClearQueueAsync();
-            (await repo.GetQueueAsync()).Should().BeEmpty();
+            await repo.ClearQueueAsync(G);
+            (await repo.GetQueueAsync(G)).Should().BeEmpty();
+        });
+    }
+
+    [Fact]
+    public async Task QueueRepository_QueueAndPlaybackState_AreIsolatedPerGuild()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var repo = new QueueRepository(stateStore);
+
+            // Two guilds can both hold a track at position 0 — UNIQUE is per-guild.
+            await repo.AddTrackAsync(new QueueItem
+            {
+                SourceType = "youtube", SourceId = "a", Title = "A", Artist = "x",
+                RequestedByUserId = "u", RequestedByDisplayName = "U",
+                QueuedAt = DateTimeOffset.UtcNow, GuildId = "gA"
+            }, 0);
+            await repo.AddTrackAsync(new QueueItem
+            {
+                SourceType = "youtube", SourceId = "b", Title = "B", Artist = "x",
+                RequestedByUserId = "u", RequestedByDisplayName = "U",
+                QueuedAt = DateTimeOffset.UtcNow, GuildId = "gB"
+            }, 0);
+
+            (await repo.GetQueueAsync("gA")).Should().ContainSingle().Which.SourceId.Should().Be("a");
+            (await repo.GetQueueAsync("gB")).Should().ContainSingle().Which.SourceId.Should().Be("b");
+
+            // Clearing one guild must not touch the other.
+            await repo.ClearQueueAsync("gA");
+            (await repo.GetQueueAsync("gA")).Should().BeEmpty();
+            (await repo.GetQueueAsync("gB")).Should().HaveCount(1);
+
+            // Playback state is keyed per guild.
+            await repo.UpdatePlaybackStateAsync("gB", new PlaybackState
+            {
+                IsPlaying = true, CurrentSourceId = "b", VoiceGuildId = "gB", UpdatedAt = DateTimeOffset.UtcNow
+            });
+            (await repo.GetPlaybackStateAsync("gA")).IsPlaying.Should().BeFalse();
+            (await repo.GetPlaybackStateAsync("gB")).IsPlaying.Should().BeTrue();
         });
     }
 
@@ -204,11 +266,12 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild123";
             // Arrange
             var queueRepo = new QueueRepository(stateStore);
             var snapshotRepo = new SnapshotRepository(stateStore);
 
-            (await snapshotRepo.HasSnapshotAsync()).Should().BeFalse();
+            (await snapshotRepo.HasSnapshotAsync(G)).Should().BeFalse();
 
             // Set up active state
             var item = new QueueItem
@@ -220,7 +283,7 @@ public sealed class PersistenceTests
                 RequestedByUserId = "u1",
                 RequestedByDisplayName = "User 1",
                 QueuedAt = DateTimeOffset.UtcNow,
-                GuildId = "guild123"
+                GuildId = G
             };
             await queueRepo.AddTrackAsync(item, 0);
 
@@ -237,29 +300,30 @@ public sealed class PersistenceTests
                 CurrentRequestedByDisplayName = "User 2",
                 CurrentPositionMs = 45000,
                 VoiceChannelId = "vc2",
-                VoiceGuildId = "guild123",
+                VoiceGuildId = G,
                 UpdatedAt = DateTimeOffset.UtcNow
             };
-            await queueRepo.UpdatePlaybackStateAsync(activeState);
+            await queueRepo.UpdatePlaybackStateAsync(G, activeState);
 
             // Act: Save snapshot
-            await snapshotRepo.SaveSnapshotAsync("admin1");
+            await snapshotRepo.SaveSnapshotAsync(G, "admin1");
 
             // Assert snapshot exists
-            (await snapshotRepo.HasSnapshotAsync()).Should().BeTrue();
+            (await snapshotRepo.HasSnapshotAsync(G)).Should().BeTrue();
 
             // Act: Mutate/Clear active queue & state to verify restore overwrites correctly
-            await queueRepo.ClearQueueAsync();
-            await queueRepo.UpdatePlaybackStateAsync(new PlaybackState
+            await queueRepo.ClearQueueAsync(G);
+            await queueRepo.UpdatePlaybackStateAsync(G, new PlaybackState
             {
                 IsPlaying = false,
                 IsPaused = false,
                 CurrentPositionMs = 0,
+                VoiceGuildId = G,
                 UpdatedAt = DateTimeOffset.UtcNow
             });
 
             // Restore snapshot
-            var restored = await snapshotRepo.RestoreSnapshotAsync();
+            var restored = await snapshotRepo.RestoreSnapshotAsync(G);
             restored.Should().NotBeNull();
 
             var restoredPlay = restored!.Value.PlaybackState;
@@ -275,15 +339,15 @@ public sealed class PersistenceTests
             restoredQueue[0].Position.Should().Be(0);
 
             // Check db active states are updated
-            var dbPlay = await queueRepo.GetPlaybackStateAsync();
+            var dbPlay = await queueRepo.GetPlaybackStateAsync(G);
             dbPlay.CurrentSourceId.Should().Be("playing_in_snapshot");
 
-            var dbQueue = await queueRepo.GetQueueAsync();
+            var dbQueue = await queueRepo.GetQueueAsync(G);
             dbQueue.Should().HaveCount(1);
 
             // Act: Clear snapshot
-            await snapshotRepo.ClearSnapshotAsync();
-            (await snapshotRepo.HasSnapshotAsync()).Should().BeFalse();
+            await snapshotRepo.ClearSnapshotAsync(G);
+            (await snapshotRepo.HasSnapshotAsync(G)).Should().BeFalse();
         });
     }
 
@@ -292,6 +356,7 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild_snap";
             var queueRepo = new QueueRepository(stateStore);
             var snapshotRepo = new SnapshotRepository(stateStore);
 
@@ -305,7 +370,7 @@ public sealed class PersistenceTests
                 RequestedByUserId = "u10",
                 RequestedByDisplayName = "SnapUser10",
                 QueuedAt = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_000),
-                GuildId = "guild_snap"
+                GuildId = G
             };
             var item2 = new QueueItem
             {
@@ -317,7 +382,7 @@ public sealed class PersistenceTests
                 RequestedByUserId = "u11",
                 RequestedByDisplayName = "SnapUser11",
                 QueuedAt = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_001_000),
-                GuildId = "guild_snap"
+                GuildId = G
             };
             await queueRepo.AddTrackAsync(item1, 0);
             await queueRepo.AddTrackAsync(item2, 1);
@@ -335,16 +400,16 @@ public sealed class PersistenceTests
                 CurrentRequestedByDisplayName = "SnapUser12",
                 CurrentPositionMs = 77777,
                 VoiceChannelId = "vc_snap",
-                VoiceGuildId = "guild_snap",
+                VoiceGuildId = G,
                 UpdatedAt = DateTimeOffset.UtcNow
             };
-            await queueRepo.UpdatePlaybackStateAsync(originalState);
+            await queueRepo.UpdatePlaybackStateAsync(G, originalState);
 
-            await snapshotRepo.SaveSnapshotAsync("snap_admin");
+            await snapshotRepo.SaveSnapshotAsync(G, "snap_admin");
 
             // Mutate active state to something completely different
-            await queueRepo.ClearQueueAsync();
-            await queueRepo.UpdatePlaybackStateAsync(new PlaybackState
+            await queueRepo.ClearQueueAsync(G);
+            await queueRepo.UpdatePlaybackStateAsync(G, new PlaybackState
             {
                 IsPlaying = false,
                 IsPaused = false,
@@ -357,15 +422,15 @@ public sealed class PersistenceTests
                 CurrentRequestedByDisplayName = null,
                 CurrentPositionMs = 0,
                 VoiceChannelId = null,
-                VoiceGuildId = null,
+                VoiceGuildId = G,
                 UpdatedAt = DateTimeOffset.UtcNow
             });
 
-            (await queueRepo.GetQueueAsync()).Should().BeEmpty();
-            (await queueRepo.GetPlaybackStateAsync()).CurrentSourceId.Should().BeNull();
+            (await queueRepo.GetQueueAsync(G)).Should().BeEmpty();
+            (await queueRepo.GetPlaybackStateAsync(G)).CurrentSourceId.Should().BeNull();
 
             // Restore and assert byte-identical field values
-            var restored = await snapshotRepo.RestoreSnapshotAsync();
+            var restored = await snapshotRepo.RestoreSnapshotAsync(G);
             restored.Should().NotBeNull();
 
             var ps = restored!.Value.PlaybackState;
@@ -407,8 +472,8 @@ public sealed class PersistenceTests
             qi[1].Position.Should().Be(1);
 
             // Also verify no-snapshot case returns null without side effects
-            await snapshotRepo.ClearSnapshotAsync();
-            var noRestore = await snapshotRepo.RestoreSnapshotAsync();
+            await snapshotRepo.ClearSnapshotAsync(G);
+            var noRestore = await snapshotRepo.RestoreSnapshotAsync(G);
             noRestore.Should().BeNull();
         });
     }
@@ -418,9 +483,10 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild123";
             // Arrange
             var repo = new HistoryRepository(stateStore);
-            
+
             var entry1 = new PlayHistoryEntry
             {
                 PlayedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
@@ -434,7 +500,7 @@ public sealed class PersistenceTests
                 RequestedByDisplayName = "User A",
                 Skipped = false,
                 Failed = false,
-                GuildId = "guild123"
+                GuildId = G
             };
 
             var entry2 = new PlayHistoryEntry
@@ -450,7 +516,7 @@ public sealed class PersistenceTests
                 RequestedByDisplayName = "User B",
                 Skipped = true,
                 Failed = false,
-                GuildId = "guild123"
+                GuildId = G
             };
 
             var entry3 = new PlayHistoryEntry
@@ -467,7 +533,7 @@ public sealed class PersistenceTests
                 Skipped = false,
                 Failed = true,
                 FailureReason = "FFmpeg extraction error",
-                GuildId = "guild123"
+                GuildId = G
             };
 
             // Act & Assert insertions
@@ -475,7 +541,7 @@ public sealed class PersistenceTests
             await repo.AddHistoryEntryAsync(entry2, retentionCount: 3);
             await repo.AddHistoryEntryAsync(entry3, retentionCount: 3);
 
-            var recent = await repo.GetRecentHistoryAsync(limit: 10);
+            var recent = await repo.GetRecentHistoryAsync(G, limit: 10);
             recent.Should().HaveCount(3);
             recent[0].SourceId.Should().Be("h3"); // played_at desc
             recent[1].SourceId.Should().Be("h2");
@@ -494,12 +560,12 @@ public sealed class PersistenceTests
                 Artist = "Artist 4",
                 RequestedByUserId = "userC",
                 RequestedByDisplayName = "User C",
-                GuildId = "guild123"
+                GuildId = G
             };
             await repo.AddHistoryEntryAsync(entry4, retentionCount: 3);
 
             // Assert that h1 was pruned (since retention cap is 3 and h4 is newest)
-            var postPrune = await repo.GetRecentHistoryAsync(limit: 10);
+            var postPrune = await repo.GetRecentHistoryAsync(G, limit: 10);
             postPrune.Should().HaveCount(3);
             postPrune[0].SourceId.Should().Be("h4");
             postPrune[1].SourceId.Should().Be("h3");
@@ -511,10 +577,41 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task HistoryRepository_PruneIsScopedPerGuild()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var repo = new HistoryRepository(stateStore);
+
+            // Fill guildA past a retention cap of 2; guildB has its own independent history.
+            for (int i = 0; i < 5; i++)
+            {
+                await repo.AddHistoryEntryAsync(new PlayHistoryEntry
+                {
+                    PlayedAt = DateTimeOffset.UtcNow.AddSeconds(i),
+                    SourceType = "youtube", SourceId = $"a{i}", Title = $"A{i}",
+                    RequestedByUserId = "u", RequestedByDisplayName = "U", GuildId = "gA"
+                }, retentionCount: 2);
+            }
+            await repo.AddHistoryEntryAsync(new PlayHistoryEntry
+            {
+                PlayedAt = DateTimeOffset.UtcNow,
+                SourceType = "youtube", SourceId = "b0", Title = "B0",
+                RequestedByUserId = "u", RequestedByDisplayName = "U", GuildId = "gB"
+            }, retentionCount: 2);
+
+            // guildA pruned to 2; guildB's single entry untouched by guildA's prune.
+            (await repo.GetRecentHistoryAsync("gA", 100)).Should().HaveCount(2);
+            (await repo.GetRecentHistoryAsync("gB", 100)).Should().ContainSingle().Which.SourceId.Should().Be("b0");
+        });
+    }
+
+    [Fact]
     public async Task HistoryRepository_Prune_KeepsExactlyRetentionCountAfterBulkInsert()
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild_bulk";
             var repo = new HistoryRepository(stateStore);
             const int total = 200;
             const int retention = 100;
@@ -529,11 +626,11 @@ public sealed class PersistenceTests
                     Title = $"Bulk Track {i}",
                     RequestedByUserId = "u1",
                     RequestedByDisplayName = "Bulk User",
-                    GuildId = "guild_bulk"
+                    GuildId = G
                 }, retention);
             }
 
-            var history = await repo.GetRecentHistoryAsync(total + 1);
+            var history = await repo.GetRecentHistoryAsync(G, total + 1);
             history.Should().HaveCount(retention, "prune must keep exactly {0} entries after {1} inserts", retention, total);
 
             // Newest entry should be the last inserted
@@ -548,33 +645,34 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "guild123";
             // Arrange
             var repo = new MetricsRepository(stateStore);
 
             // 1. Global Metrics
-            await repo.IncrementGlobalMetricAsync("songs_played", 1);
-            await repo.IncrementGlobalMetricAsync("songs_played", 2);
-            await repo.IncrementGlobalMetricAsync("bytes_streamed", 500000);
+            await repo.IncrementGlobalMetricAsync(G, "songs_played", 1);
+            await repo.IncrementGlobalMetricAsync(G, "songs_played", 2);
+            await repo.IncrementGlobalMetricAsync(G, "bytes_streamed", 500000);
 
-            (await repo.GetGlobalMetricAsync("songs_played")).Should().Be(3);
-            (await repo.GetGlobalMetricAsync("bytes_streamed")).Should().Be(500000);
-            (await repo.GetGlobalMetricAsync("non_existent")).Should().Be(0);
+            (await repo.GetGlobalMetricAsync(G, "songs_played")).Should().Be(3);
+            (await repo.GetGlobalMetricAsync(G, "bytes_streamed")).Should().Be(500000);
+            (await repo.GetGlobalMetricAsync(G, "non_existent")).Should().Be(0);
 
-            var globalDict = await repo.GetGlobalMetricsAsync();
+            var globalDict = await repo.GetGlobalMetricsAsync(G);
             globalDict.Should().HaveCount(2);
             globalDict["songs_played"].Should().Be(3);
             globalDict["bytes_streamed"].Should().Be(500000);
 
             // 2. User Metrics (UPSERT validation)
-            await repo.IncrementUserMetricAsync("user1", "Alice", "tracks_queued", 1);
-            await repo.IncrementUserMetricAsync("user1", "Alice", "tracks_queued", 2);
-            await repo.IncrementUserMetricAsync("user1", "Alice", "listening_seconds", 300);
-            await repo.IncrementUserMetricAsync("user1", "Alice", "requests_youtube", 3);
+            await repo.IncrementUserMetricAsync(G, "user1", "Alice", "tracks_queued", 1);
+            await repo.IncrementUserMetricAsync(G, "user1", "Alice", "tracks_queued", 2);
+            await repo.IncrementUserMetricAsync(G, "user1", "Alice", "listening_seconds", 300);
+            await repo.IncrementUserMetricAsync(G, "user1", "Alice", "requests_youtube", 3);
 
-            await repo.IncrementUserMetricAsync("user2", "Bob", "tracks_queued", 5);
-            await repo.IncrementUserMetricAsync("user2", "Bob", "listening_seconds", 1200);
+            await repo.IncrementUserMetricAsync(G, "user2", "Bob", "tracks_queued", 5);
+            await repo.IncrementUserMetricAsync(G, "user2", "Bob", "listening_seconds", 1200);
 
-            var user1Metrics = await repo.GetUserMetricsAsync("user1");
+            var user1Metrics = await repo.GetUserMetricsAsync(G, "user1");
             user1Metrics.Should().NotBeNull();
             user1Metrics!.DisplayNameLastSeen.Should().Be("Alice");
             user1Metrics.TracksQueued.Should().Be(3);
@@ -582,25 +680,48 @@ public sealed class PersistenceTests
             user1Metrics.RequestsYoutube.Should().Be(3);
             user1Metrics.RequestsSoundcloud.Should().Be(0); // default
 
-            var user2Metrics = await repo.GetUserMetricsAsync("user2");
+            var user2Metrics = await repo.GetUserMetricsAsync(G, "user2");
             user2Metrics!.DisplayNameLastSeen.Should().Be("Bob");
             user2Metrics.TracksQueued.Should().Be(5);
             user2Metrics.ListeningSeconds.Should().Be(1200);
 
             // Top Users Lists
-            var topListening = await repo.GetTopUsersByListeningTimeAsync(5);
+            var topListening = await repo.GetTopUsersByListeningTimeAsync(G, 5);
             topListening.Should().HaveCount(2);
             topListening[0].UserId.Should().Be("user2"); // 1200 seconds > 300 seconds
             topListening[1].UserId.Should().Be("user1");
 
-            var topQueuers = await repo.GetTopUsersByTracksQueuedAsync(5);
+            var topQueuers = await repo.GetTopUsersByTracksQueuedAsync(G, 5);
             topQueuers.Should().HaveCount(2);
             topQueuers[0].UserId.Should().Be("user2"); // 5 tracks > 3 tracks
             topQueuers[1].UserId.Should().Be("user1");
 
             // Invalid column validation
-            Func<Task> act = async () => await repo.IncrementUserMetricAsync("user1", "Alice", "invalid_col_name", 1);
+            Func<Task> act = async () => await repo.IncrementUserMetricAsync(G, "user1", "Alice", "invalid_col_name", 1);
             await act.Should().ThrowAsync<ArgumentException>();
+        });
+    }
+
+    [Fact]
+    public async Task MetricsRepository_UserAndGlobalCounters_AreIsolatedPerGuild()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var repo = new MetricsRepository(stateStore);
+
+            // Same user id in two guilds must accumulate independently — this is
+            // the ON CONFLICT(guild_id, user_id) fix: a shared user can't clobber.
+            await repo.IncrementUserMetricAsync("gA", "sharedUser", "Alice", "tracks_queued", 4);
+            await repo.IncrementUserMetricAsync("gB", "sharedUser", "Alice", "tracks_queued", 7);
+
+            (await repo.GetUserMetricsAsync("gA", "sharedUser"))!.TracksQueued.Should().Be(4);
+            (await repo.GetUserMetricsAsync("gB", "sharedUser"))!.TracksQueued.Should().Be(7);
+
+            // Global counters likewise isolated per guild.
+            await repo.IncrementGlobalMetricAsync("gA", "tracks_queued", 4);
+            await repo.IncrementGlobalMetricAsync("gB", "tracks_queued", 7);
+            (await repo.GetGlobalMetricAsync("gA", "tracks_queued")).Should().Be(4);
+            (await repo.GetGlobalMetricAsync("gB", "tracks_queued")).Should().Be(7);
         });
     }
 
@@ -609,6 +730,7 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "g1";
             const int N = 50;
             var repo = new QueueRepository(stateStore);
 
@@ -625,14 +747,14 @@ public sealed class PersistenceTests
                     RequestedByUserId = "u1",
                     RequestedByDisplayName = "User",
                     QueuedAt = DateTimeOffset.UtcNow,
-                    GuildId = "g1"
+                    GuildId = G
                 }, i);
             }
 
             // Move the last item (index 49) to the front (position 0)
-            await repo.MoveTrackAsync(ids[N - 1], 0);
+            await repo.MoveTrackAsync(G, ids[N - 1], 0);
 
-            var queue = await repo.GetQueueAsync();
+            var queue = await repo.GetQueueAsync(G);
             queue.Should().HaveCount(N);
             queue[0].SourceId.Should().Be($"track_{N - 1}", "last track moved to front");
             for (int i = 1; i < N; i++)
@@ -641,9 +763,9 @@ public sealed class PersistenceTests
             }
 
             // Move item from index 0 (track_49) to the middle (position 25)
-            await repo.MoveTrackAsync(ids[N - 1], 25);
+            await repo.MoveTrackAsync(G, ids[N - 1], 25);
 
-            var queue2 = await repo.GetQueueAsync();
+            var queue2 = await repo.GetQueueAsync(G);
             queue2.Should().HaveCount(N);
             queue2[25].SourceId.Should().Be($"track_{N - 1}", "moved item should be at index 25");
             // Items before the moved item: track_0..track_24
@@ -664,6 +786,7 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "g1";
             const int N = 20;
             var repo = new QueueRepository(stateStore);
 
@@ -679,7 +802,7 @@ public sealed class PersistenceTests
                     RequestedByUserId = "u1",
                     RequestedByDisplayName = "User",
                     QueuedAt = DateTimeOffset.UtcNow,
-                    GuildId = "g1"
+                    GuildId = G
                 }, i);
             }
 
@@ -691,7 +814,7 @@ public sealed class PersistenceTests
 
             // Remaining items must be in correct relative order by position column,
             // even though positions are no longer dense (gaps exist).
-            var remaining = await repo.GetQueueAsync();
+            var remaining = await repo.GetQueueAsync(G);
             remaining.Should().HaveCount(N - 5);
             for (int i = 0; i < remaining.Count; i++)
             {
@@ -699,8 +822,8 @@ public sealed class PersistenceTests
             }
 
             // Compact positions and verify dense 0-based assignment
-            await repo.CompactPositionsAsync();
-            var compacted = await repo.GetQueueAsync();
+            await repo.CompactPositionsAsync(G);
+            var compacted = await repo.GetQueueAsync(G);
             compacted.Should().HaveCount(N - 5);
             for (int i = 0; i < compacted.Count; i++)
             {
@@ -715,6 +838,7 @@ public sealed class PersistenceTests
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "g1";
             var repo = new MetricsRepository(stateStore);
 
             // 5 increments: 2 user (different columns), 1 user listening_seconds, 2 global.
@@ -727,32 +851,32 @@ public sealed class PersistenceTests
                 new MetricIncrement("listening_seconds", 90),
             };
 
-            await repo.IncrementBatchAsync(batch);
+            await repo.IncrementBatchAsync(G, batch);
 
             // Per-user assertions
-            var userA = await repo.GetUserMetricsAsync("userA");
+            var userA = await repo.GetUserMetricsAsync(G, "userA");
             userA.Should().NotBeNull();
             userA!.TracksQueued.Should().Be(2);
             userA.ListeningSeconds.Should().Be(90);
             userA.RequestsYoutube.Should().Be(3);
 
             // Global assertions
-            (await repo.GetGlobalMetricAsync("tracks_queued")).Should().Be(2);
-            (await repo.GetGlobalMetricAsync("listening_seconds")).Should().Be(90);
+            (await repo.GetGlobalMetricAsync(G, "tracks_queued")).Should().Be(2);
+            (await repo.GetGlobalMetricAsync(G, "listening_seconds")).Should().Be(90);
 
             // A second batch accumulates correctly (upsert semantics)
-            await repo.IncrementBatchAsync(new[]
+            await repo.IncrementBatchAsync(G, new[]
             {
                 new MetricIncrement("tracks_queued", 1, "userA", "Alice"),
                 new MetricIncrement("tracks_queued", 1),
             });
 
-            var userAAfter = await repo.GetUserMetricsAsync("userA");
+            var userAAfter = await repo.GetUserMetricsAsync(G, "userA");
             userAAfter!.TracksQueued.Should().Be(3);
-            (await repo.GetGlobalMetricAsync("tracks_queued")).Should().Be(3);
+            (await repo.GetGlobalMetricAsync(G, "tracks_queued")).Should().Be(3);
 
             // Invalid column should throw before reaching the DB
-            Func<Task> badBatch = async () => await repo.IncrementBatchAsync(new[]
+            Func<Task> badBatch = async () => await repo.IncrementBatchAsync(G, new[]
             {
                 new MetricIncrement("bad_column", 1, "userA", "Alice"),
             });
@@ -779,10 +903,35 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public async Task SchemaMigrator_PlaybackStateAndSnapshot_AreKeyedByGuildAfterMigration()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            // After 004, playback_state and snapshot must have a guild_id column
+            // and no legacy `id` column.
+            using var connection = new Microsoft.Data.Sqlite.SqliteConnection(stateStore.ConnectionString);
+            await connection.OpenAsync();
+
+            foreach (var table in new[] { "playback_state", "snapshot" })
+            {
+                var columns = new List<string>();
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = $"SELECT name FROM pragma_table_info('{table}');";
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync()) columns.Add(reader.GetString(0));
+
+                columns.Should().Contain("guild_id", $"{table} must be keyed by guild_id after migration 004");
+                columns.Should().NotContain("id", $"{table} must drop the legacy singleton id column");
+            }
+        });
+    }
+
+    [Fact]
     public async Task StateStore_ConcurrentWrites_ShouldExecuteSequentiallyWithoutLockingExceptions()
     {
         await RunTestWithDbAsync(async stateStore =>
         {
+            const string G = "g1";
             // Arrange
             var repo = new MetricsRepository(stateStore);
             const int totalTasks = 100;
@@ -793,7 +942,7 @@ public sealed class PersistenceTests
             {
                 tasks.Add(Task.Run(async () =>
                 {
-                    await repo.IncrementGlobalMetricAsync("concurrent_counter", 1);
+                    await repo.IncrementGlobalMetricAsync(G, "concurrent_counter", 1);
                 }));
             }
 
@@ -801,7 +950,7 @@ public sealed class PersistenceTests
             await Task.WhenAll(tasks);
 
             // Assert: Confirm counter matches exactly, and zero SQLITE_BUSY exceptions occurred
-            var finalCount = await repo.GetGlobalMetricAsync("concurrent_counter");
+            var finalCount = await repo.GetGlobalMetricAsync(G, "concurrent_counter");
             finalCount.Should().Be(totalTasks);
         });
     }

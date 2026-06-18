@@ -7,11 +7,13 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using DSharpPlus;
+using DSharpPlus.Entities;
 using DSharpPlus.SlashCommands;
 using Lavalink4NET;
 using Lavalink4NET.Extensions;
 using Lavalink4NET.InactivityTracking.Extensions;
 using Earworm.Config;
+using Earworm.Infrastructure;
 using Earworm.Persistence;
 using Earworm.Persistence.Schema;
 using Earworm.Persistence.Repositories;
@@ -97,64 +99,21 @@ public static class Program
 
         var client = serviceProvider.GetRequiredService<DiscordClient>();
 
-        // Slash commands. UseSlashCommands accepts a ServiceProvider; command
-        // classes are resolved from it per-invocation.
-        var slash = client.UseSlashCommands(new SlashCommandsConfiguration { Services = serviceProvider });
-
-        ulong commandGuildId = 0;
-        ulong.TryParse(earwormConfig.Discord.GuildId, out commandGuildId);
-        if (commandGuildId == 0)
-        {
-            logger.LogWarning("No guild_id configured — slash commands will register globally (can take up to 1 hour to propagate).");
-        }
-
-        slash.RegisterCommands<PlaybackCommands>(commandGuildId);
-        slash.RegisterCommands<QueueCommands>(commandGuildId);
-        slash.RegisterCommands<InfoCommands>(commandGuildId);
-        slash.RegisterCommands<DJCommands>(commandGuildId);
-        slash.RegisterCommands<ConfigCommands>(commandGuildId);
-        slash.RegisterCommands<AdminCommands>(commandGuildId);
-
-        // Migrations.
+        // Migrations + multi-tenant backfill. Must run before slash registration
+        // (which reads the tenants table) and before any per-guild engine hydrates.
         try
         {
             var stateStore = serviceProvider.GetRequiredService<StateStore>();
             var migrationLogger = serviceProvider.GetRequiredService<ILogger<SchemaMigrator>>();
             new SchemaMigrator(stateStore.ConnectionString, migrationLogger).Migrate();
 
-            // Ensure singleton rows exist for databases created before the seed
-            // statements were added to the migration, or restored from a backup
-            // that is missing them.
-            using var seedConn = new Microsoft.Data.Sqlite.SqliteConnection(stateStore.ConnectionString);
-            await seedConn.OpenAsync();
-            using (var seedCmd = seedConn.CreateCommand())
-            {
-                seedCmd.CommandText = @"
-                    INSERT OR IGNORE INTO playback_state (id, is_playing, is_paused, current_position_ms, updated_at)
-                        VALUES (1, 0, 0, 0, $now);
-                    INSERT OR IGNORE INTO snapshot (id) VALUES (1);
-                ";
-                seedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                await seedCmd.ExecuteNonQueryAsync();
-            }
-
-            // Seed initial tenant row from config (one-time; idempotent)
             if (ulong.TryParse(earwormConfig.Discord.GuildId, out _))
             {
-                using (var tenantSeedCmd = seedConn.CreateCommand())
-                {
-                    tenantSeedCmd.CommandText = @"
-                        INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
-                        VALUES ($guild_id, 'free', 'active', $now);
-                    ";
-                    tenantSeedCmd.Parameters.AddWithValue("$guild_id", earwormConfig.Discord.GuildId);
-                    tenantSeedCmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                    await tenantSeedCmd.ExecuteNonQueryAsync();
-                }
+                await BackfillLegacyTenantAsync(stateStore.ConnectionString, earwormConfig);
             }
             else
             {
-                logger.LogWarning("Skipped tenant seed: Discord.GuildId '{GuildId}' is not a valid numeric snowflake.", earwormConfig.Discord.GuildId);
+                logger.LogWarning("Skipped tenant backfill: Discord.GuildId '{GuildId}' is not a valid numeric snowflake.", earwormConfig.Discord.GuildId);
             }
         }
         catch (Exception ex)
@@ -163,20 +122,39 @@ public static class Program
             Environment.Exit(1);
         }
 
-        try
-        {
-            await serviceProvider.GetRequiredService<QueueManager>().InitializeAsync();
-        }
-        catch (Exception ex)
-        {
-            logger.LogCritical(ex, "Queue initialization failed. Shutting down.");
-            Environment.Exit(1);
-        }
+        // Slash commands. UseSlashCommands accepts a ServiceProvider; command
+        // classes are resolved from it per-invocation. Registration is per active
+        // tenant (instant propagation) via TenantLifecycleListener.
+        var slash = client.UseSlashCommands(new SlashCommandsConfiguration { Services = serviceProvider });
 
-        // Wire DJ commentary hook into PlayerEngine (avoids ctor-cycle DI).
-        var djEngine = serviceProvider.GetRequiredService<DJEngine>();
-        var playerEngine = serviceProvider.GetRequiredService<PlayerEngine>();
-        playerEngine.SetPreTrackHook(djEngine.MaybePlayCommentaryAsync);
+        var lifecycle = serviceProvider.GetRequiredService<TenantLifecycleListener>();
+        lifecycle.Attach(slash);
+        await lifecycle.RegisterStartupCommandsAsync();
+
+        // Convert failed command checks (not-whitelisted, not-DJ, …) into an
+        // ephemeral reply instead of a silent no-op.
+        slash.SlashCommandErrored += async (_, e) =>
+        {
+            if (e.Exception is SlashExecutionChecksFailedException)
+            {
+                try
+                {
+                    await e.Context.CreateResponseAsync(
+                        InteractionResponseType.ChannelMessageWithSource,
+                        new DiscordInteractionResponseBuilder
+                        {
+                            IsEphemeral = true,
+                            Content = "⛔ Not available here — this server isn't authorized, or you lack permission for this command."
+                        });
+                }
+                catch
+                {
+                    // Interaction may already be acknowledged; ignore.
+                }
+                return;
+            }
+            logger.LogError(e.Exception, "Slash command '{Name}' errored.", e.Context?.CommandName);
+        };
 
         // HTTP host (PRD §11 — /health, /metrics, /tts/{id}).
         var healthEndpoint = serviceProvider.GetRequiredService<HealthEndpoint>();
@@ -196,12 +174,43 @@ public static class Program
         janitor.SweepOnStartup();
         janitor.StartPeriodicSweep();
 
-        // Eagerly resolve event-handler singletons so their ctor-time gateway
-        // event subscriptions are wired before SessionCreated fires.
+        // Eagerly resolve event-handler singletons so their PerGuildRegistry
+        // initializers and gateway subscriptions are wired before any per-guild
+        // engine is created or any gateway event fires.
         _ = serviceProvider.GetRequiredService<MessageListener>();
         _ = serviceProvider.GetRequiredService<NowPlayingPoster>();
         _ = serviceProvider.GetRequiredService<VoiceManager>();
         _ = serviceProvider.GetRequiredService<TrackFailureHandler>();
+
+        // Pre-create + hydrate each active tenant's engines: PlayerEngine so it
+        // subscribes to Lavalink events and wires its DJ hook, QueueManager so
+        // its persisted queue comes back after a restart.
+        try
+        {
+            var tenantService = serviceProvider.GetRequiredService<ITenantService>();
+            var queueRegistry = serviceProvider.GetRequiredService<PerGuildRegistry<QueueManager>>();
+            var playerRegistry = serviceProvider.GetRequiredService<PerGuildRegistry<PlayerEngine>>();
+
+            foreach (var tenant in await tenantService.GetAllTenantsAsync())
+            {
+                if (!string.Equals(tenant.Status, "active", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!ulong.TryParse(tenant.GuildId, out _)) continue;
+                try
+                {
+                    playerRegistry.GetOrCreate(tenant.GuildId);
+                    await queueRegistry.GetOrCreate(tenant.GuildId).InitializeAsync();
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to initialize tenant {GuildId}; continuing.", tenant.GuildId);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(ex, "Per-guild engine initialization failed. Shutting down.");
+            Environment.Exit(1);
+        }
 
         // Discord gateway connect.
         var gateway = serviceProvider.GetRequiredService<DiscordGateway>();
@@ -318,11 +327,6 @@ public static class Program
         services.AddSingleton<ITenantRepository, TenantRepository>();
         services.AddSingleton<ITenantService, TenantService>();
 
-        services.AddSingleton<QueueManager>();
-        services.AddSingleton<TrackQueuingService>();
-        services.AddSingleton<AudioTransitionController>();
-        services.AddSingleton<PlayerEngine>();
-
         // Per-call timeouts. Without these, a hung external API blocks the
         // caller for the OS-default ~100s TCP timeout, which during DJ commentary
         // generation freezes PlayNextAsync and stalls music playback.
@@ -331,11 +335,54 @@ public static class Program
         services.AddSingleton<GeminiClient>();
         services.AddSingleton<ElevenLabsTtsProvider>();
         services.AddSingleton<ITtsProvider>(sp => sp.GetRequiredService<ElevenLabsTtsProvider>());
-        services.AddSingleton<DJEngine>();
         services.AddSingleton<TtsScratchJanitor>();
+
+        // Per-guild stateful engines. Each guild gets its own QueueManager,
+        // AudioTransitionController, DJEngine, and PlayerEngine, created lazily
+        // and cached by PerGuildRegistry<T>. The PlayerEngine factory also wires
+        // that guild's DJ pre-track hook, replacing the old global SetPreTrackHook.
+        services.AddSingleton(sp => new PerGuildRegistry<QueueManager>(gid => new QueueManager(
+            sp.GetRequiredService<IQueueRepository>(),
+            sp.GetRequiredService<ISnapshotRepository>(),
+            sp.GetRequiredService<EarwormConfig>(),
+            sp.GetRequiredService<ILogger<QueueManager>>(),
+            gid)));
+
+        services.AddSingleton(sp => new PerGuildRegistry<AudioTransitionController>(_ => new AudioTransitionController(
+            sp.GetRequiredService<EarwormConfig>(),
+            sp.GetRequiredService<ILogger<AudioTransitionController>>())));
+
+        services.AddSingleton(sp => new PerGuildRegistry<DJEngine>(gid => new DJEngine(
+            sp.GetRequiredService<GeminiClient>(),
+            sp.GetRequiredService<ITtsProvider>(),
+            sp.GetRequiredService<ISettingsRepository>(),
+            sp.GetRequiredService<IMetricsRepository>(),
+            sp.GetRequiredService<EarwormConfig>(),
+            sp.GetRequiredService<ILogger<DJEngine>>(),
+            gid)));
+
+        services.AddSingleton(sp => new PerGuildRegistry<PlayerEngine>(gid =>
+        {
+            var engine = new PlayerEngine(
+                sp.GetRequiredService<IAudioService>(),
+                sp.GetRequiredService<PerGuildRegistry<QueueManager>>().GetOrCreate(gid),
+                sp.GetRequiredService<IQueueRepository>(),
+                sp.GetRequiredService<IHistoryRepository>(),
+                sp.GetRequiredService<IMetricsRepository>(),
+                sp.GetRequiredService<PerGuildRegistry<AudioTransitionController>>().GetOrCreate(gid),
+                sp.GetRequiredService<EarwormConfig>(),
+                sp.GetRequiredService<ILogger<PlayerEngine>>(),
+                sp.GetRequiredService<ShutdownLifetime>(),
+                gid);
+            engine.SetPreTrackHook(sp.GetRequiredService<PerGuildRegistry<DJEngine>>().GetOrCreate(gid).MaybePlayCommentaryAsync);
+            return engine;
+        }));
+
+        services.AddSingleton<TrackQueuingService>();
 
         services.AddSingleton<VoiceManager>();
         services.AddSingleton<DiscordGateway>();
+        services.AddSingleton<TenantLifecycleListener>();
         services.AddSingleton<MessageListener>();
         services.AddSingleton<NowPlayingPoster>();
         services.AddSingleton<TrackFailureHandler>();
@@ -348,6 +395,58 @@ public static class Program
         services.AddSingleton<AdminCommands>();
 
         services.AddSingleton<HealthEndpoint>();
+    }
+
+    /// <summary>
+    /// One-time multi-tenant backfill run after migration 004: rewrites the
+    /// sentinel '' guild_id rows the migration left behind to the configured
+    /// Discord.GuildId, seeds the legacy tenant row, and seeds the now-playing
+    /// channel setting from YAML. Idempotent — re-runs are no-ops.
+    /// </summary>
+    private static async Task BackfillLegacyTenantAsync(string connectionString, EarwormConfig config)
+    {
+        var guildId = config.Discord.GuildId;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection(connectionString);
+        await conn.OpenAsync();
+
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"
+                UPDATE playback_state   SET guild_id = $g WHERE guild_id = '';
+                UPDATE snapshot         SET guild_id = $g WHERE guild_id = '';
+                UPDATE settings         SET guild_id = $g WHERE guild_id = '';
+                UPDATE metrics_global   SET guild_id = $g WHERE guild_id = '';
+                UPDATE metrics_per_user SET guild_id = $g WHERE guild_id = '';
+            ";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"
+                INSERT OR IGNORE INTO tenants (guild_id, plan, status, created_at)
+                VALUES ($g, 'free', 'active', $now);
+            ";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$now", now);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        if (!string.IsNullOrWhiteSpace(config.Discord.NowPlayingChannelId))
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                INSERT OR IGNORE INTO settings (guild_id, key, value, updated_at)
+                VALUES ($g, 'now_playing_channel_id', $value, $now);
+            ";
+            cmd.Parameters.AddWithValue("$g", guildId);
+            cmd.Parameters.AddWithValue("$value", config.Discord.NowPlayingChannelId);
+            cmd.Parameters.AddWithValue("$now", now);
+            await cmd.ExecuteNonQueryAsync();
+        }
     }
 
     private static void ValidateConfig(EarwormConfig config)

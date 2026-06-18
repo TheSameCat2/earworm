@@ -1,0 +1,111 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace Earworm.Infrastructure;
+
+/// <summary>
+/// Lazily creates and caches one <typeparamref name="T"/> instance per guild.
+/// This is the single abstraction the multi-tenant model leans on: every
+/// stateful per-guild engine (PlayerEngine, QueueManager, DJEngine, …) is
+/// resolved through a registry keyed by Discord guild id.
+///
+/// Two correctness properties matter here:
+///   1. <b>Exactly-once construction.</b> The value is wrapped in
+///      <see cref="Lazy{T}"/> with <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/>
+///      so a concurrent <see cref="GetOrCreate"/> race can't construct two
+///      instances and discard one. That would be catastrophic for engines that
+///      subscribe to Lavalink events in their constructor — the discarded
+///      instance's subscription would leak and double-handle events.
+///   2. <b>Initializer exactly-once.</b> Global singletons (VoiceManager,
+///      TrackFailureHandler, NowPlayingPoster) need to attach to every per-guild
+///      engine's events, including engines created before AND after they
+///      register. <see cref="AddInitializer"/> runs the callback against all
+///      existing instances and every future one, exactly once each, by holding
+///      a single lock across both the create path and the register path.
+/// </summary>
+public sealed class PerGuildRegistry<T> where T : class
+{
+    private readonly Func<string, T> _factory;
+    private readonly ConcurrentDictionary<string, Lazy<T>> _instances = new();
+    private readonly List<Action<T>> _initializers = new();
+    private readonly List<T> _created = new();
+    private readonly object _initLock = new();
+
+    public PerGuildRegistry(Func<string, T> factory)
+    {
+        _factory = factory ?? throw new ArgumentNullException(nameof(factory));
+    }
+
+    /// <summary>
+    /// Returns the guild's instance, constructing it on first access.
+    /// </summary>
+    public T GetOrCreate(string guildId)
+    {
+        var lazy = _instances.GetOrAdd(
+            guildId,
+            gid => new Lazy<T>(() => Create(gid), LazyThreadSafetyMode.ExecutionAndPublication));
+        return lazy.Value;
+    }
+
+    /// <summary>
+    /// Returns the guild's instance only if it has already been constructed,
+    /// without triggering construction.
+    /// </summary>
+    public bool TryGet(string guildId, out T instance)
+    {
+        if (_instances.TryGetValue(guildId, out var lazy) && lazy.IsValueCreated)
+        {
+            instance = lazy.Value;
+            return true;
+        }
+        instance = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Snapshot of all instances constructed so far.
+    /// </summary>
+    public IReadOnlyList<T> CreatedInstances()
+    {
+        lock (_initLock)
+        {
+            return _created.ToArray();
+        }
+    }
+
+    /// <summary>
+    /// Registers a callback run exactly once against every instance — those
+    /// already created and all future ones. The factory itself runs outside the
+    /// lock; only the cheap bookkeeping and initializer invocation are guarded,
+    /// which is safe because initializers only do non-reentrant work like
+    /// <c>engine.TrackStarted += handler</c>.
+    /// </summary>
+    public void AddInitializer(Action<T> initializer)
+    {
+        if (initializer is null) throw new ArgumentNullException(nameof(initializer));
+        lock (_initLock)
+        {
+            _initializers.Add(initializer);
+            foreach (var inst in _created)
+            {
+                initializer(inst);
+            }
+        }
+    }
+
+    private T Create(string guildId)
+    {
+        var instance = _factory(guildId);
+        lock (_initLock)
+        {
+            _created.Add(instance);
+            foreach (var init in _initializers)
+            {
+                init(instance);
+            }
+        }
+        return instance;
+    }
+}

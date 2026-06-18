@@ -39,7 +39,7 @@ public sealed class QueueManagerTests
 
             var queueRepo = new QueueRepository(stateStore);
             var snapshotRepo = new SnapshotRepository(stateStore);
-            var manager = new QueueManager(queueRepo, snapshotRepo, config, NullLogger<QueueManager>.Instance);
+            var manager = new QueueManager(queueRepo, snapshotRepo, config, NullLogger<QueueManager>.Instance, "g1");
 
             await body(manager, queueRepo);
         }
@@ -82,7 +82,7 @@ public sealed class QueueManagerTests
             inMemory.Select(q => q.QueueItemId).Distinct().Should().HaveCount(N, "every row must have a unique queue_item_id");
 
             // DB must agree.
-            var dbQueue = await queueRepo.GetQueueAsync();
+            var dbQueue = await queueRepo.GetQueueAsync("g1");
             dbQueue.Should().HaveCount(N);
             dbQueue.Select(q => q.Position).Should().Equal(Enumerable.Range(0, N));
         });
@@ -148,7 +148,7 @@ public sealed class QueueManagerTests
             // DB matches in-memory state by identity and order.
             // Positions in the DB may have gaps after removals (lazy renumber);
             // QueueManager holds the authoritative dense in-memory positions.
-            var dbQueue = await queueRepo.GetQueueAsync();
+            var dbQueue = await queueRepo.GetQueueAsync("g1");
             dbQueue.Select(q => q.QueueItemId).Should().Equal(remaining.Select(q => q.QueueItemId));
             dbQueue.Should().HaveCount(N - 10);
         });

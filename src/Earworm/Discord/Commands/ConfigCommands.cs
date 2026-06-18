@@ -9,6 +9,7 @@ using Earworm.Persistence.Repositories;
 namespace Earworm.Discord.Commands;
 
 [SlashCommandGroup("config", "Configure earworm bot settings.")]
+[WhitelistedGuild]
 public sealed class ConfigCommands : ApplicationCommandModule
 {
     private readonly ISettingsRepository _settings;
@@ -25,7 +26,7 @@ public sealed class ConfigCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            await _settings.SetDjRoleIdAsync(role.Id);
+            await _settings.SetDjRoleIdAsync(ctx.Guild!.Id.ToString(), role.Id);
             await ctx.EditResponseAsync(Text($"⚙️ Authorized DJ role has been set to: **{role.Name}** (`{role.Id}`). Only users with this role (or Administrators) can execute DJ actions now."));
         }
         catch (Exception ex)
@@ -48,12 +49,35 @@ public sealed class ConfigCommands : ApplicationCommandModule
 
         try
         {
-            await _settings.SetLoggingChannelIdAsync(channel.Id);
+            await _settings.SetLoggingChannelIdAsync(ctx.Guild!.Id.ToString(), channel.Id);
             await ctx.EditResponseAsync(Text($"⚙️ System logging channel has been set to: <#{channel.Id}> (`{channel.Id}`)."));
         }
         catch (Exception ex)
         {
             await ctx.EditResponseAsync(Text($"⚠️ Failed to set logging channel: {ex.Message}"));
+        }
+    }
+
+    [SlashCommand("now-playing-channel", "Set the text channel where 'Now Playing' embeds are posted."), ManageRolesOrAdmin]
+    public async Task SetNowPlayingChannelAsync(InteractionContext ctx,
+        [Option("channel", "The text channel for Now Playing announcements")] DiscordChannel channel)
+    {
+        await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
+
+        if (channel.Type != ChannelType.Text)
+        {
+            await ctx.EditResponseAsync(Text("⚠️ The now-playing channel must be a text channel."));
+            return;
+        }
+
+        try
+        {
+            await _settings.SetNowPlayingChannelIdAsync(ctx.Guild!.Id.ToString(), channel.Id);
+            await ctx.EditResponseAsync(Text($"⚙️ Now Playing announcements will be posted to: <#{channel.Id}> (`{channel.Id}`)."));
+        }
+        catch (Exception ex)
+        {
+            await ctx.EditResponseAsync(Text($"⚠️ Failed to set now-playing channel: {ex.Message}"));
         }
     }
 
@@ -63,12 +87,15 @@ public sealed class ConfigCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            bool djEnabled = await _settings.IsDjEnabledAsync();
-            var djRoleId = await _settings.GetDjRoleIdAsync();
-            var loggingChannelId = await _settings.GetLoggingChannelIdAsync();
+            var gid = ctx.Guild!.Id.ToString();
+            bool djEnabled = await _settings.IsDjEnabledAsync(gid);
+            var djRoleId = await _settings.GetDjRoleIdAsync(gid);
+            var loggingChannelId = await _settings.GetLoggingChannelIdAsync(gid);
+            var nowPlayingChannelId = await _settings.GetNowPlayingChannelIdAsync(gid);
 
             string djRoleStr = djRoleId.HasValue ? $"<@&{djRoleId.Value}> (`{djRoleId.Value}`)" : "*None configured (Admins only)*";
             string loggingChanStr = loggingChannelId.HasValue ? $"<#{loggingChannelId.Value}> (`{loggingChannelId.Value}`)" : "*None configured*";
+            string nowPlayingStr = nowPlayingChannelId.HasValue ? $"<#{nowPlayingChannelId.Value}> (`{nowPlayingChannelId.Value}`)" : "*None configured*";
 
             var embed = new DiscordEmbedBuilder()
                 .WithTitle("earworm Active Settings ⚙️")
@@ -76,6 +103,7 @@ public sealed class ConfigCommands : ApplicationCommandModule
                 .AddField("AI DJ Commentary", djEnabled ? "📻 **Enabled**" : "📻 **Disabled**", inline: false)
                 .AddField("Authorized DJ Role", djRoleStr, inline: false)
                 .AddField("System Logging Channel", loggingChanStr, inline: false)
+                .AddField("Now Playing Channel", nowPlayingStr, inline: false)
                 .WithTimestamp(DateTimeOffset.UtcNow);
 
             await ctx.EditResponseAsync(new DiscordWebhookBuilder().AddEmbed(embed));

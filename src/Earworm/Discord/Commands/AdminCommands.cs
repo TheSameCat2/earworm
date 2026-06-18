@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.SlashCommands;
+using Earworm.Discord;
 using Earworm.Discord.Attributes;
 using Earworm.Domain.Tenants;
 
@@ -15,8 +16,13 @@ namespace Earworm.Discord.Commands;
 public sealed class AdminCommands : ApplicationCommandModule
 {
     private readonly ITenantService _tenantService;
+    private readonly TenantLifecycleListener _lifecycle;
 
-    public AdminCommands(ITenantService tenantService) => _tenantService = tenantService;
+    public AdminCommands(ITenantService tenantService, TenantLifecycleListener lifecycle)
+    {
+        _tenantService = tenantService;
+        _lifecycle = lifecycle;
+    }
 
     private static DiscordWebhookBuilder Text(string s) =>
         new DiscordWebhookBuilder().WithContent(s);
@@ -38,7 +44,8 @@ public sealed class AdminCommands : ApplicationCommandModule
         try
         {
             await _tenantService.AddTenantAsync(guildId, ctx.User.Id.ToString());
-            await ctx.EditResponseAsync(Text($"Server `{guildId}` has been added as a tenant."));
+            await _lifecycle.RegisterForGuildAsync(guildId);
+            await ctx.EditResponseAsync(Text($"Server `{guildId}` has been added as a tenant. Slash commands are being registered for it now."));
         }
         catch (Exception ex)
         {

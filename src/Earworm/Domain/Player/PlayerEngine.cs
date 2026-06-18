@@ -36,6 +36,7 @@ public class PlayerEngine : IDisposable
     private readonly ShutdownLifetime _shutdown;
 
     private readonly ulong _guildId;
+    private readonly string _guildIdStr;
     private readonly object _stateLock = new();
 
     private QueueItem? _currentTrack;
@@ -81,7 +82,8 @@ public class PlayerEngine : IDisposable
         AudioTransitionController transitions,
         EarwormConfig config,
         ILogger<PlayerEngine> logger,
-        ShutdownLifetime shutdown)
+        ShutdownLifetime shutdown,
+        string guildId)
     {
         _audioService = audioService;
         _queueManager = queueManager;
@@ -93,9 +95,10 @@ public class PlayerEngine : IDisposable
         _logger = logger;
         _shutdown = shutdown;
 
-        if (!ulong.TryParse(_config.Discord.GuildId, out _guildId))
+        _guildIdStr = guildId;
+        if (!ulong.TryParse(guildId, out _guildId))
         {
-            throw new InvalidOperationException("PlayerEngine requires a valid discord.guild_id (ulong) in config.");
+            throw new InvalidOperationException($"PlayerEngine requires a valid numeric guild id; got '{guildId}'.");
         }
 
         _cachedState = BuildIdleState();
@@ -225,7 +228,7 @@ public class PlayerEngine : IDisposable
                     _isPaused = false;
                     RebuildStateLocked();
                 }
-                await _queueRepository.UpdatePlaybackStateAsync(State);
+                await _queueRepository.UpdatePlaybackStateAsync(_guildIdStr, State);
                 return;
             }
 
@@ -307,7 +310,7 @@ public class PlayerEngine : IDisposable
                         _isPaused = false;
                         RebuildStateLocked();
                     }
-                    await _queueRepository.UpdatePlaybackStateAsync(State);
+                    await _queueRepository.UpdatePlaybackStateAsync(_guildIdStr, State);
                     return;
                 }
                 continue;
@@ -327,7 +330,7 @@ public class PlayerEngine : IDisposable
                         _isPaused = false;
                         RebuildStateLocked();
                     }
-                    await _queueRepository.UpdatePlaybackStateAsync(State);
+                    await _queueRepository.UpdatePlaybackStateAsync(_guildIdStr, State);
                     return;
                 }
                 continue;
@@ -349,7 +352,7 @@ public class PlayerEngine : IDisposable
             await _transitions.PlayMusicAsync(player, duration, () => player.PlayAsync(musicTrack));
             TrackStarted?.Invoke(next);
 
-            await _queueRepository.UpdatePlaybackStateAsync(State);
+            await _queueRepository.UpdatePlaybackStateAsync(_guildIdStr, State);
 
             // Metrics: tracks_completed gets incremented on TrackEnded (Finished),
             // not here. Here we just record a per-user "request played" beat by
@@ -363,7 +366,7 @@ public class PlayerEngine : IDisposable
                     "mp3_upload" => "requests_mp3_upload",
                     _ => "requests_search"
                 };
-                await _metricsRepository.IncrementGlobalMetricAsync(sourceMetric, 1);
+                await _metricsRepository.IncrementGlobalMetricAsync(_guildIdStr, sourceMetric, 1);
             }
             catch (Exception ex)
             {
@@ -466,7 +469,7 @@ public class PlayerEngine : IDisposable
 
     public async Task PreviousAsync()
     {
-        var history = await _historyRepository.GetRecentHistoryAsync(1);
+        var history = await _historyRepository.GetRecentHistoryAsync(_guildIdStr, 1);
         if (history.Count == 0)
         {
             throw new InvalidOperationException("No track has been played yet in this session.");
@@ -562,7 +565,7 @@ public class PlayerEngine : IDisposable
 
             if (metricsBatch.Count > 0)
             {
-                await _metricsRepository.IncrementBatchAsync(metricsBatch);
+                await _metricsRepository.IncrementBatchAsync(_guildIdStr, metricsBatch);
             }
         }
         catch (Exception ex)

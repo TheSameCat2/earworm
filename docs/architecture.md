@@ -173,9 +173,20 @@ The `cache_index` table is a leftover from the pre-Lavalink era and isn't used b
 
 Migrations live in `Persistence/Schema/Migrations/*.sql`, applied in filename-sorted order by `SchemaMigrator`. Each is wrapped in a transaction and recorded in a `schema_versions` table; re-runs are no-ops.
 
+## Multi-tenancy
+
+earworm serves a whitelist of Discord guilds simultaneously. Each admitted guild ("tenant") gets its own queue, playback state, snapshot, settings, history, and metrics — fully isolated.
+
+- **Admission**: the `tenants` table (status `active` | `suspended`) is the whitelist. Bot owners (`Bot.OwnerUserIds`) manage it via `/admin add-server | list-servers | remove-server`. `ITenantService.IsAdmittedAsync` is the gate; the `[WhitelistedGuild]` class attribute enforces it on every user-facing command module, and `MessageListener` checks it before serving an @mention.
+- **Per-guild engines**: `PerGuildRegistry<T>` (`Infrastructure/PerGuildRegistry.cs`) lazily constructs and caches one instance per guild of each stateful engine — `QueueManager`, `PlayerEngine`, `DJEngine`, `AudioTransitionController`. It wraps each value in `Lazy<T>` with `ExecutionAndPublication` so a concurrent first-access race can't build two `PlayerEngine`s and leak a Lavalink subscription.
+- **The single shared `IAudioService`**: Lavalink4NET's audio service is one process-wide singleton, so every per-guild `PlayerEngine` subscribes to the same global `TrackEnded`. Each engine filters by `e.Player.GuildId != _guildId` — that filter is the event-routing mechanism, not dead defensiveness.
+- **Global event bridges**: `VoiceManager`, `NowPlayingPoster`, and `TrackFailureHandler` stay process-wide singletons but subscribe to *every* per-guild engine via `PerGuildRegistry<PlayerEngine>.AddInitializer`, which runs the subscription callback against existing instances and all future ones, exactly once each.
+- **Persistence**: every table carries `guild_id`; composite primary keys and `UNIQUE(guild_id, …)` constraints scope rows per guild (migration `004_multi_tenant.sql`). The legacy single-guild `Discord.GuildId` is a one-time seed only — a post-migrate backfill in `Program.cs` rewrites the pre-migration rows to it and seeds its `tenants` row.
+- **Slash registration**: `TenantLifecycleListener` registers commands per active tenant guild (instant propagation) at startup and on `/admin add-server`.
+
 ## DI conventions
 
-All bot services are **singletons**. Many subscribe to events in their constructors (`MessageListener` → `DiscordClient.MessageCreated`, `NowPlayingPoster` → `PlayerEngine.TrackStarted`, etc.). The DI container is built once at startup; eager-resolution at the end of `Program.Main` forces those constructors to run before any events arrive.
+Repositories and the process-wide bridges are **singletons**; the per-guild engines live behind `PerGuildRegistry<T>` singletons (the registry is the singleton; the engines inside are per-guild). Many bridges subscribe to events in their constructors (`MessageListener` → `DiscordClient.MessageCreated`, `NowPlayingPoster` → each `PlayerEngine.TrackStarted`, etc.). The DI container is built once at startup; eager-resolution near the end of `Program.Main` forces those constructors to run before any events arrive, and the active tenants' engines are pre-created so a restored queue resumes after a restart.
 
 `HttpClient` is registered via `services.AddHttpClient<GeminiClient>()` (and similar for `ElevenLabsTtsProvider`). This is the canonical pattern — never construct `new HttpClient()` directly.
 
@@ -217,8 +228,7 @@ The `TtsServeBaseUrl` config key handles the routing weirdness:
 A few "could be better" things that are deliberately not:
 
 - **No connection pooling for SQLite**. We use a single connection guarded by a single-writer channel. The bot's load is tiny.
-- **The `cleanup` callback in `TtsPreroll` is fire-and-forget on completion**. A crash between Lavalink finishing and cleanup running leaks a file. There's no periodic janitor — the next bot restart cleans up via `Directory.Delete` only if you wire it. (Realistically, restart frequency >> leak rate.)
-- **Single-guild assumption everywhere**. Multi-guild support would mean threading guild IDs through every operation. Not worth it for a hobby bot.
+- **The `cleanup` callback in `TtsPreroll` is fire-and-forget on completion**. A crash between Lavalink finishing and cleanup running leaks a file. `TtsScratchJanitor` sweeps orphans on startup and on a periodic timer (`Dj.TtsScratchMaxAgeMinutes` / `Dj.TtsScratchMaxFiles`), so leaks are bounded regardless of restart frequency.
 - **Health endpoint has no auth**. It's only bound to `127.0.0.1` on the host via the compose `ports:` config, so external traffic can't reach it.
 
 ## What's deliberately defensive

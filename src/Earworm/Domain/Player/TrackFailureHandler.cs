@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using DSharpPlus;
 using DSharpPlus.Entities;
 using Earworm.Domain.Queue;
+using Earworm.Infrastructure;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Domain.Player;
@@ -24,26 +25,26 @@ namespace Earworm.Domain.Player;
 /// </summary>
 public sealed class TrackFailureHandler : IDisposable
 {
-    private readonly PlayerEngine _player;
+    private readonly PerGuildRegistry<PlayerEngine> _playerEngines;
     private readonly DiscordClient _discord;
     private readonly ISettingsRepository _settings;
     private readonly ILogger<TrackFailureHandler> _logger;
     private readonly ShutdownLifetime _shutdown;
 
     public TrackFailureHandler(
-        PlayerEngine player,
+        PerGuildRegistry<PlayerEngine> playerEngines,
         DiscordClient discord,
         ISettingsRepository settings,
         ILogger<TrackFailureHandler> logger,
         ShutdownLifetime shutdown)
     {
-        _player = player;
+        _playerEngines = playerEngines;
         _discord = discord;
         _settings = settings;
         _logger = logger;
         _shutdown = shutdown;
 
-        _player.TrackFailed += OnTrackFailed;
+        _playerEngines.AddInitializer(engine => engine.TrackFailed += OnTrackFailed);
     }
 
     private void OnTrackFailed(QueueItem track, string failureReason)
@@ -58,7 +59,7 @@ public sealed class TrackFailureHandler : IDisposable
         {
             ct.ThrowIfCancellationRequested();
 
-            var channelId = await _settings.GetLoggingChannelIdAsync();
+            var channelId = await _settings.GetLoggingChannelIdAsync(track.GuildId);
             if (!channelId.HasValue)
             {
                 _logger.LogInformation("Track failed but no logging channel configured; skipping notice. Title='{Title}' reason='{Reason}'", track.Title, failureReason);
@@ -104,6 +105,9 @@ public sealed class TrackFailureHandler : IDisposable
 
     public void Dispose()
     {
-        _player.TrackFailed -= OnTrackFailed;
+        foreach (var engine in _playerEngines.CreatedInstances())
+        {
+            engine.TrackFailed -= OnTrackFailed;
+        }
     }
 }

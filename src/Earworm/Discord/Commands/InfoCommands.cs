@@ -5,10 +5,12 @@ using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.SlashCommands;
 using Earworm.Config;
+using Earworm.Discord.Attributes;
 using Earworm.Persistence.Repositories;
 
 namespace Earworm.Discord.Commands;
 
+[WhitelistedGuild]
 public sealed class InfoCommands : ApplicationCommandModule
 {
     private readonly IHistoryRepository _history;
@@ -29,7 +31,7 @@ public sealed class InfoCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
         int finalLimit = Math.Clamp((int)limit, 1, Math.Max(1, _config.Persistence.HistoryMaxN));
-        var history = await _history.GetRecentHistoryAsync(finalLimit);
+        var history = await _history.GetRecentHistoryAsync(ctx.Guild!.Id.ToString(), finalLimit);
 
         var embed = new DiscordEmbedBuilder()
             .WithTitle("Recently Played Tracks 📜")
@@ -69,9 +71,10 @@ public sealed class InfoCommands : ApplicationCommandModule
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
-        var globalMetrics = await _metrics.GetGlobalMetricsAsync();
-        var topListeners = await _metrics.GetTopUsersByListeningTimeAsync(5);
-        var topQueuers = await _metrics.GetTopUsersByTracksQueuedAsync(5);
+        var gid = ctx.Guild!.Id.ToString();
+        var globalMetrics = await _metrics.GetGlobalMetricsAsync(gid);
+        var topListeners = await _metrics.GetTopUsersByListeningTimeAsync(gid, 5);
+        var topQueuers = await _metrics.GetTopUsersByTracksQueuedAsync(gid, 5);
 
         var embed = new DiscordEmbedBuilder()
             .WithTitle("earworm Bot Statistics & Leaderboard 📊")
