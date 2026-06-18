@@ -160,6 +160,7 @@ public static class Program
             // staring at "the application did not respond". Log it and best-effort
             // surface a generic error.
             logger.LogError(e.Exception, "Slash command '{Name}' errored.", e.Context?.CommandName);
+            if (e.Context == null) return; // nothing to respond to
             try
             {
                 await e.Context.CreateResponseAsync(
