@@ -42,7 +42,9 @@ public sealed class QueueCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
         var gid = ctx.Guild!.Id.ToString();
-        var queue = _queues.GetOrCreate(gid).GetQueue();
+        var queueManager = _queues.GetOrCreate(gid);
+        await queueManager.EnsureInitializedAsync();
+        var queue = queueManager.GetQueue();
         var state = _players.GetOrCreate(gid).State;
 
         var embed = new DiscordEmbedBuilder()
@@ -125,6 +127,7 @@ public sealed class QueueCommands : ApplicationCommandModule
 
         var gid = ctx.Guild!.Id.ToString();
         var queueManager = _queues.GetOrCreate(gid);
+        await queueManager.EnsureInitializedAsync();
         int index = (int)position - 1;
         int queueCount = queueManager.Count;
         if (index >= queueCount)
@@ -156,6 +159,7 @@ public sealed class QueueCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
         var queueManager = _queues.GetOrCreate(ctx.Guild!.Id.ToString());
+        await queueManager.EnsureInitializedAsync();
         var queue = queueManager.GetQueue();
         if (from <= 0 || from > queue.Count || to <= 0 || to > queue.Count)
         {

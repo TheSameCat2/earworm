@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Earworm.Config;
@@ -19,6 +20,14 @@ public class QueueManager
 
     private readonly List<QueueItem> _queue = new();
     private readonly object _lock = new();
+
+    // Lazy-hydration gate. Only the startup loop calls InitializeAsync; engines
+    // created lazily (runtime-admitted / re-admitted guilds, or a guild whose
+    // startup hydration threw and was swallowed) never go through it. Every
+    // mutating op funnels through EnsureInitializedAsync first so the in-memory
+    // queue always reflects the persisted rows before positions are computed.
+    private readonly SemaphoreSlim _initGate = new(1, 1);
+    private volatile bool _initialized;
 
     // Event definitions. Virtual so tests using NSubstitute can Raise.Event them
     // — see PlayerEngine_WakesUp_WhenTrackQueuedAfterEmptyQueue.
@@ -46,19 +55,56 @@ public class QueueManager
     public string GuildId => _guildId;
 
     /// <summary>
-    /// Loads the persisted queue from SQLite into memory. Call this once at
-    /// startup after schema migrations have completed. Safe to call again to
-    /// re-sync from the database.
+    /// Loads the persisted queue from SQLite into memory. Called once at startup
+    /// after schema migrations; safe to call again to force a re-sync.
     /// </summary>
     public async Task InitializeAsync()
+    {
+        await _initGate.WaitAsync();
+        try
+        {
+            await LoadFromDatabaseLockedAsync();
+        }
+        finally
+        {
+            _initGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Loads the persisted queue exactly once on first access. A guild whose
+    /// QueueManager was created outside the startup loop (runtime <c>add-server</c>,
+    /// re-admit after suspend, or a startup hydration that failed) would otherwise
+    /// start with an empty in-memory queue — hiding its persisted rows and making
+    /// the next enqueue compute position 0, colliding with the existing row on
+    /// UNIQUE(guild_id, position). Cheap no-op once hydrated.
+    /// </summary>
+    public async Task EnsureInitializedAsync()
+    {
+        if (_initialized) return;
+        await _initGate.WaitAsync();
+        try
+        {
+            if (_initialized) return; // another caller hydrated while we waited
+            await LoadFromDatabaseLockedAsync();
+        }
+        finally
+        {
+            _initGate.Release();
+        }
+    }
+
+    /// <summary>Reload from the DB. Caller must hold <see cref="_initGate"/>.</summary>
+    private async Task LoadFromDatabaseLockedAsync()
     {
         var dbQueue = await _queueRepository.GetQueueAsync(_guildId);
         lock (_lock)
         {
             _queue.Clear();
             _queue.AddRange(dbQueue);
-            _logger.LogInformation("QueueManager initialized with {Count} tracks from database.", _queue.Count);
         }
+        _initialized = true;
+        _logger.LogInformation("QueueManager[{GuildId}] loaded {Count} tracks from database.", _guildId, _queue.Count);
     }
 
     /// <summary>
@@ -101,6 +147,8 @@ public class QueueManager
         string requestedByDisplayName,
         string guildId)
     {
+        await EnsureInitializedAsync();
+
         var item = new QueueItem
         {
             SourceType = sourceType,
@@ -262,6 +310,8 @@ public class QueueManager
     /// </summary>
     public async Task<QueueItem> RemoveTrackAsync(int position, string userId, bool isDj)
     {
+        await EnsureInitializedAsync();
+
         QueueItem itemToRemove;
         Task writeTask;
         Action<QueueItem>? handler;
@@ -305,6 +355,8 @@ public class QueueManager
     /// </summary>
     public async Task MoveTrackAsync(int fromPosition, int toPosition)
     {
+        await EnsureInitializedAsync();
+
         Task writeTask;
         lock (_lock)
         {
@@ -361,6 +413,8 @@ public class QueueManager
     /// </summary>
     public virtual async Task<QueueItem?> DequeueAsync()
     {
+        await EnsureInitializedAsync();
+
         QueueItem head;
         Task writeTask;
         Action<QueueItem>? handler;
@@ -399,6 +453,8 @@ public class QueueManager
     /// </summary>
     public virtual async Task RequeueFrontAsync(QueueItem item)
     {
+        await EnsureInitializedAsync();
+
         var fresh = new QueueItem
         {
             SourceType = item.SourceType,
