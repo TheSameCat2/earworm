@@ -29,7 +29,15 @@ public sealed class RequesterOrDjAttribute : SlashCheckBaseAttribute
         var djRoleId = await settings.GetDjRoleIdAsync(ctx.Guild.Id.ToString());
         if (djRoleId.HasValue && ctx.Member.Roles.Any(r => r.Id == djRoleId.Value)) return true;
 
-        var player = ctx.Services.GetRequiredService<PerGuildRegistry<PlayerEngine>>().GetOrCreate(ctx.Guild.Id.ToString());
+        // Use TryGet, not GetOrCreate: if no engine exists nothing is playing, so
+        // the caller cannot be the requester of the current track — and we must
+        // not construct an engine from inside an authorization check (it would
+        // run even when the class-level [WhitelistedGuild] check fails).
+        var players = ctx.Services.GetRequiredService<PerGuildRegistry<PlayerEngine>>();
+        if (!players.TryGet(ctx.Guild.Id.ToString(), out var player))
+        {
+            return false;
+        }
         var state = player.State;
         return state != null && state.CurrentRequestedByUserId == ctx.User.Id.ToString();
     }

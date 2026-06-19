@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,8 +13,7 @@ using Microsoft.Extensions.Logging;
 using Lavalink4NET;
 using Earworm.Config;
 using Earworm.Discord;
-using Earworm.Domain.Player;
-using Earworm.Infrastructure;
+using Earworm.Domain.Tenants;
 
 namespace Earworm.Health;
 
@@ -37,7 +37,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
     private readonly EarwormConfig _config;
     private readonly DiscordGateway _gateway;
     private readonly IAudioService _audioService;
-    private readonly PerGuildRegistry<PlayerEngine> _playerEngines;
+    private readonly ITenantService _tenants;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<HealthEndpoint> _logger;
     private WebApplication? _app;
@@ -46,14 +46,14 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
         EarwormConfig config,
         DiscordGateway gateway,
         IAudioService audioService,
-        PerGuildRegistry<PlayerEngine> playerEngines,
+        ITenantService tenants,
         ILoggerFactory loggerFactory,
         ILogger<HealthEndpoint> logger)
     {
         _config = config;
         _gateway = gateway;
         _audioService = audioService;
-        _playerEngines = playerEngines;
+        _tenants = tenants;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -77,7 +77,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
 
         var app = builder.Build();
 
-        app.MapGet("/health", () =>
+        app.MapGet("/health", async () =>
         {
             bool discordReady = _gateway.IsReady;
             // IAudioService exposes only WaitForReadyAsync; the underlying TCS
@@ -87,8 +87,22 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
 
             string discordStatus = discordReady ? "ok" : "starting";
             string lavalinkStatus = lavalinkReady ? "ok" : "down";
-            // Number of guilds with a live (constructed) per-guild engine.
-            int activeTenants = _playerEngines.CreatedInstances().Count;
+
+            // Admitted tenants per the whitelist table (status 'active') — the
+            // authoritative count. Best-effort: a transient DB error must NOT flip
+            // liveness, so fall back to -1 and keep status driven purely by the
+            // gateway + lavalink readiness.
+            int activeTenants;
+            try
+            {
+                var tenants = await _tenants.GetAllTenantsAsync();
+                activeTenants = tenants.Count(t => string.Equals(t.Status, "active", StringComparison.OrdinalIgnoreCase));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to read tenant count for /health.");
+                activeTenants = -1;
+            }
 
             if (discordReady && lavalinkReady)
             {

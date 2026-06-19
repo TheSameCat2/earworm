@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Earworm.Config;
@@ -9,7 +10,7 @@ using Earworm.Domain.Player;
 
 namespace Earworm.Domain.Queue;
 
-public class QueueManager
+public class QueueManager : IDisposable
 {
     private readonly IQueueRepository _queueRepository;
     private readonly ISnapshotRepository _snapshotRepository;
@@ -19,6 +20,14 @@ public class QueueManager
 
     private readonly List<QueueItem> _queue = new();
     private readonly object _lock = new();
+
+    // Lazy-hydration gate. Only the startup loop calls InitializeAsync; engines
+    // created lazily (runtime-admitted / re-admitted guilds, or a guild whose
+    // startup hydration threw and was swallowed) never go through it. Every
+    // mutating op funnels through EnsureInitializedAsync first so the in-memory
+    // queue always reflects the persisted rows before positions are computed.
+    private readonly SemaphoreSlim _initGate = new(1, 1);
+    private volatile bool _initialized;
 
     // Event definitions. Virtual so tests using NSubstitute can Raise.Event them
     // — see PlayerEngine_WakesUp_WhenTrackQueuedAfterEmptyQueue.
@@ -46,19 +55,56 @@ public class QueueManager
     public string GuildId => _guildId;
 
     /// <summary>
-    /// Loads the persisted queue from SQLite into memory. Call this once at
-    /// startup after schema migrations have completed. Safe to call again to
-    /// re-sync from the database.
+    /// Loads the persisted queue from SQLite into memory. Called once at startup
+    /// after schema migrations; safe to call again to force a re-sync.
     /// </summary>
     public async Task InitializeAsync()
+    {
+        await _initGate.WaitAsync();
+        try
+        {
+            await LoadFromDatabaseLockedAsync();
+        }
+        finally
+        {
+            _initGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Loads the persisted queue exactly once on first access. A guild whose
+    /// QueueManager was created outside the startup loop (runtime <c>add-server</c>,
+    /// re-admit after suspend, or a startup hydration that failed) would otherwise
+    /// start with an empty in-memory queue — hiding its persisted rows and making
+    /// the next enqueue compute position 0, colliding with the existing row on
+    /// UNIQUE(guild_id, position). Cheap no-op once hydrated.
+    /// </summary>
+    public async Task EnsureInitializedAsync()
+    {
+        if (_initialized) return;
+        await _initGate.WaitAsync();
+        try
+        {
+            if (_initialized) return; // another caller hydrated while we waited
+            await LoadFromDatabaseLockedAsync();
+        }
+        finally
+        {
+            _initGate.Release();
+        }
+    }
+
+    /// <summary>Reload from the DB. Caller must hold <see cref="_initGate"/>.</summary>
+    private async Task LoadFromDatabaseLockedAsync()
     {
         var dbQueue = await _queueRepository.GetQueueAsync(_guildId);
         lock (_lock)
         {
             _queue.Clear();
             _queue.AddRange(dbQueue);
-            _logger.LogInformation("QueueManager initialized with {Count} tracks from database.", _queue.Count);
         }
+        _initialized = true;
+        _logger.LogInformation("QueueManager[{GuildId}] loaded {Count} tracks from database.", _guildId, _queue.Count);
     }
 
     /// <summary>
@@ -101,6 +147,19 @@ public class QueueManager
         string requestedByDisplayName,
         string guildId)
     {
+        await EnsureInitializedAsync();
+
+        // The row belongs to THIS manager's guild, never the caller-supplied
+        // argument. Positions are computed against our own in-memory queue, so a
+        // mismatched guild_id would write into another tenant at a position that
+        // can collide on UNIQUE(guild_id, position). Flag a mismatch defensively.
+        if (!string.Equals(guildId, _guildId, StringComparison.Ordinal))
+        {
+            _logger.LogWarning(
+                "AddTrackAsync received guildId '{Arg}' on the QueueManager for '{Owner}'; using the owner guild.",
+                guildId, _guildId);
+        }
+
         var item = new QueueItem
         {
             SourceType = sourceType,
@@ -111,7 +170,7 @@ public class QueueManager
             RequestedByUserId = requestedByUserId,
             RequestedByDisplayName = requestedByDisplayName,
             QueuedAt = DateTimeOffset.UtcNow,
-            GuildId = guildId
+            GuildId = _guildId
         };
 
         Task<long> writeTask;
@@ -125,8 +184,9 @@ public class QueueManager
 
             pos = _queue.Count;
             // SubmitWriteAsync only enqueues to an unbounded channel (no I/O),
-            // so we can safely call it under the lock and capture the Task.
-            writeTask = _queueRepository.AddTrackAsync(item, pos);
+            // so we can safely call it under the lock and capture the Task. The DB
+            // assigns its own gap-free position; pos here is the dense in-memory one.
+            writeTask = _queueRepository.AddTrackAsync(item);
 
             finalItem = item with { Position = pos };
             _queue.Add(finalItem);
@@ -262,6 +322,8 @@ public class QueueManager
     /// </summary>
     public async Task<QueueItem> RemoveTrackAsync(int position, string userId, bool isDj)
     {
+        await EnsureInitializedAsync();
+
         QueueItem itemToRemove;
         Task writeTask;
         Action<QueueItem>? handler;
@@ -305,6 +367,8 @@ public class QueueManager
     /// </summary>
     public async Task MoveTrackAsync(int fromPosition, int toPosition)
     {
+        await EnsureInitializedAsync();
+
         Task writeTask;
         lock (_lock)
         {
@@ -361,6 +425,8 @@ public class QueueManager
     /// </summary>
     public virtual async Task<QueueItem?> DequeueAsync()
     {
+        await EnsureInitializedAsync();
+
         QueueItem head;
         Task writeTask;
         Action<QueueItem>? handler;
@@ -399,6 +465,8 @@ public class QueueManager
     /// </summary>
     public virtual async Task RequeueFrontAsync(QueueItem item)
     {
+        await EnsureInitializedAsync();
+
         var fresh = new QueueItem
         {
             SourceType = item.SourceType,
@@ -409,7 +477,7 @@ public class QueueManager
             RequestedByUserId = item.RequestedByUserId,
             RequestedByDisplayName = item.RequestedByDisplayName,
             QueuedAt = DateTimeOffset.UtcNow,
-            GuildId = item.GuildId
+            GuildId = _guildId
         };
 
         Task<long> addTask;
@@ -417,16 +485,23 @@ public class QueueManager
         lock (_lock)
         {
             lastPos = _queue.Count;
-            addTask = _queueRepository.AddTrackAsync(fresh, lastPos);
+            addTask = _queueRepository.AddTrackAsync(fresh);
             _queue.Add(fresh with { Position = lastPos });
         }
 
         long newId = await addTask;
 
-        // Backfill the new row id so any subsequent ID-keyed operation
-        // (MoveTrackAsync below) sees it.
+        // Backfill the row id and move it to the front atomically under one lock.
+        // The position captured before the await (lastPos) can be stale — a
+        // concurrent Dequeue/Remove may have shifted the queue while addTask was in
+        // flight — so locate the row by id now and move by id, never by the stale
+        // position (which could be out of bounds or point at a different track).
+        Task moveTask = Task.CompletedTask;
+        QueueItem finalItem;
+        Action<QueueItem>? handler;
         lock (_lock)
         {
+            int idx = -1;
             for (int i = 0; i < _queue.Count; i++)
             {
                 if (_queue[i].QueueItemId == 0
@@ -434,26 +509,32 @@ public class QueueManager
                     && _queue[i].QueuedAt == fresh.QueuedAt)
                 {
                     _queue[i] = _queue[i] with { QueueItemId = newId };
+                    idx = i;
                     break;
                 }
             }
-        }
 
-        if (lastPos > 0)
-        {
-            await MoveTrackAsync(lastPos, 0);
-        }
+            if (idx > 0)
+            {
+                var moving = _queue[idx];
+                _queue.RemoveAt(idx);
+                _queue.Insert(0, moving);
+                for (int i = 0; i < _queue.Count; i++)
+                {
+                    _queue[i] = _queue[i] with { Position = i };
+                }
+                // Repo write only enqueues to the channel, safe under the lock.
+                moveTask = _queueRepository.MoveTrackAsync(_guildId, newId, 0);
+            }
 
-        QueueItem finalItem;
-        Action<QueueItem>? handler;
-        lock (_lock)
-        {
-            int idx = _queue.FindIndex(q => q.QueueItemId == newId);
-            finalItem = idx >= 0
-                ? _queue[idx]
+            int finalIdx = _queue.FindIndex(q => q.QueueItemId == newId);
+            finalItem = finalIdx >= 0
+                ? _queue[finalIdx]
                 : fresh with { QueueItemId = newId, Position = 0 };
             handler = TrackQueued;
         }
+
+        await moveTask;
 
         handler?.Invoke(finalItem);
     }
@@ -494,5 +575,11 @@ public class QueueManager
         handler?.Invoke();
 
         return restored.Value.PlaybackState;
+    }
+
+    /// <summary>Disposes the hydration gate. Called when the guild is evicted.</summary>
+    public void Dispose()
+    {
+        _initGate.Dispose();
     }
 }

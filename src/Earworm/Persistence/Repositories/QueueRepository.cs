@@ -54,19 +54,25 @@ public sealed class QueueRepository : IQueueRepository
         return list;
     }
 
-    public async Task<long> AddTrackAsync(QueueItem item, int position)
+    public async Task<long> AddTrackAsync(QueueItem item)
     {
         return await _stateStore.SubmitWriteAsync(async connection =>
         {
             using var cmd = connection.CreateCommand();
+            // Let the DB assign the next gap-free position for this guild. The
+            // in-memory queue stays densely 0-based, but DB positions develop gaps
+            // after dequeues/removes (those only DELETE by id, never renumber).
+            // Computing the slot as MAX(position)+1 — atomic on the single-writer
+            // connection — avoids colliding with a surviving row on
+            // UNIQUE(guild_id, position) when adding after a front dequeue.
             cmd.CommandText = @"
                 INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
                                    requested_by_user_id, requested_by_display_name, queued_at, guild_id)
-                VALUES ($position, $sourceType, $sourceId, $title, $artist, $duration,
+                VALUES ((SELECT COALESCE(MAX(position), -1) + 1 FROM queue WHERE guild_id = $guildId),
+                        $sourceType, $sourceId, $title, $artist, $duration,
                         $userId, $displayName, $queuedAt, $guildId)
                 RETURNING queue_item_id;
             ";
-            cmd.Parameters.AddWithValue("$position", position);
             cmd.Parameters.AddWithValue("$sourceType", item.SourceType);
             cmd.Parameters.AddWithValue("$sourceId", item.SourceId);
             cmd.Parameters.AddWithValue("$title", (object?)item.Title ?? DBNull.Value);

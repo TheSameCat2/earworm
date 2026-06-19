@@ -35,7 +35,7 @@ public sealed class ConfigCommands : ApplicationCommandModule
         }
     }
 
-    [SlashCommand("logging-channel", "Set the text channel for bot system alerts and announcements."), DjOnly]
+    [SlashCommand("logging-channel", "Set the text channel for bot system alerts and announcements."), ManageRolesOrAdmin]
     public async Task SetLoggingChannelAsync(InteractionContext ctx,
         [Option("channel", "The text channel to send logs to")] DiscordChannel channel)
     {

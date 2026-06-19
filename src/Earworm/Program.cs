@@ -153,7 +153,38 @@ public static class Program
                 }
                 return;
             }
+
+            // Any other failure — including an exception THROWN by a check (e.g. a
+            // transient SQLite error in IsAdmittedAsync / GetDjRoleIdAsync) rather
+            // than the check returning false — would otherwise leave the user
+            // staring at "the application did not respond". Log it and best-effort
+            // surface a generic error.
             logger.LogError(e.Exception, "Slash command '{Name}' errored.", e.Context?.CommandName);
+            if (e.Context == null) return; // nothing to respond to
+            try
+            {
+                await e.Context.CreateResponseAsync(
+                    InteractionResponseType.ChannelMessageWithSource,
+                    new DiscordInteractionResponseBuilder
+                    {
+                        IsEphemeral = true,
+                        Content = "⚠️ Something went wrong running that command. Please try again."
+                    });
+            }
+            catch
+            {
+                // Already acknowledged/deferred (command body failed after
+                // responding) — fall back to editing the deferred response.
+                try
+                {
+                    await e.Context.EditResponseAsync(
+                        new DiscordWebhookBuilder().WithContent("⚠️ Something went wrong running that command. Please try again."));
+                }
+                catch
+                {
+                    // Interaction expired or already finalized; nothing more to do.
+                }
+            }
         };
 
         // HTTP host (PRD §11 — /health, /metrics, /tts/{id}).
@@ -481,6 +512,12 @@ public static class Program
 
         if (string.IsNullOrWhiteSpace(config.Discord.GuildId) || config.Discord.GuildId.Contains("REQUIRED"))
             throw new InvalidOperationException("discord.guild_id is required in conf/earworm.yaml.");
+        // Must be a real snowflake: a non-numeric value passes the check above but
+        // then fails ulong.TryParse downstream, which silently skips the tenant
+        // backfill AND registers commands for zero guilds — the bot comes up but
+        // admits and serves nobody. Fail fast instead.
+        if (!ulong.TryParse(config.Discord.GuildId, out _))
+            throw new InvalidOperationException($"discord.guild_id must be a numeric Discord snowflake; got '{config.Discord.GuildId}'.");
 
         if (string.IsNullOrWhiteSpace(config.Dj.Tts.VoiceId) || config.Dj.Tts.VoiceId.Contains("REQUIRED"))
             throw new InvalidOperationException("dj.tts.voice_id is required in conf/earworm.yaml.");
