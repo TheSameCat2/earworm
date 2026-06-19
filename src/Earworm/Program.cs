@@ -261,15 +261,22 @@ public static class Program
 
         // Lavalink connect. Must come AFTER Discord client is connected so
         // Lavalink4NET can read currentUser.Id for its WebSocket handshake.
+        // In Docker, the Lavalink container frequently starts slower than the bot
+        // container. Retry with exponential backoff instead of crashing so the
+        // orchestrator can rely on the health check and we don't hammer the
+        // Lavalink server with connection attempts.
         var audioService = serviceProvider.GetRequiredService<IAudioService>();
         try
         {
-            await audioService.StartAsync();
-            logger.LogInformation("Lavalink audio service started.");
+            await StartLavalinkWithBackoffAsync(audioService, shutdownLifetime, logger);
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogWarning("Lavalink connection retry cancelled because shutdown was requested.");
         }
         catch (Exception ex)
         {
-            logger.LogCritical(ex, "Failed to start Lavalink audio service. Is the Lavalink server running and reachable?");
+            logger.LogCritical(ex, "Failed to start Lavalink audio service after retries. Is the Lavalink server running and reachable?");
             Environment.Exit(1);
         }
 
@@ -430,6 +437,60 @@ public static class Program
         services.AddSingleton<AdminCommands>();
 
         services.AddSingleton<HealthEndpoint>();
+    }
+
+    /// <summary>
+    /// Starts the Lavalink audio service, retrying with exponential backoff until
+    /// the server responds or shutdown is requested. Prevents the bot from exiting
+    /// immediately when the Lavalink container is slower to start (e.g. Docker
+    /// compose) and avoids flooding the server with reconnection attempts.
+    /// </summary>
+    private static async Task StartLavalinkWithBackoffAsync(
+        IAudioService audioService,
+        ShutdownLifetime shutdownLifetime,
+        ILogger logger)
+    {
+        var initialDelay = TimeSpan.FromSeconds(1);
+        var maxDelay = TimeSpan.FromSeconds(30);
+        var delay = initialDelay;
+        var attempt = 1;
+
+        while (true)
+        {
+            shutdownLifetime.Token.ThrowIfCancellationRequested();
+
+            try
+            {
+                logger.LogInformation("Connecting to Lavalink (attempt {Attempt})...", attempt);
+                await audioService.StartAsync();
+                logger.LogInformation("Lavalink audio service started.");
+                return;
+            }
+            catch (OperationCanceledException) when (shutdownLifetime.Token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Failed to connect to Lavalink on attempt {Attempt}. Retrying in {DelayMs}ms...",
+                    attempt,
+                    delay.TotalMilliseconds);
+
+                try
+                {
+                    await Task.Delay(delay, shutdownLifetime.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+
+                delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, maxDelay.TotalSeconds));
+                attempt++;
+            }
+        }
     }
 
     /// <summary>
