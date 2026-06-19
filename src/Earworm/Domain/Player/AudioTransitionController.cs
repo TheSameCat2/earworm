@@ -32,6 +32,7 @@ public sealed class AudioTransitionController
     private const float FullVolume = 1.0f;
     private const float Silent = 0.0f;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan MinVolumeInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly EarwormConfig _config;
     private readonly ILogger<AudioTransitionController> _logger;
@@ -121,6 +122,7 @@ public sealed class AudioTransitionController
         {
             double fadeSec = FadeSeconds;
             float lastSent = -1f;
+            DateTime lastVolumeCall = DateTime.MinValue;
 
             while (!ct.IsCancellationRequested)
             {
@@ -145,12 +147,19 @@ public sealed class AudioTransitionController
                 float tail = (float)Math.Clamp(remaining.TotalSeconds / fadeSec, 0, 1);
                 float target = Math.Min(head, tail);
 
-                // Skip the REST round-trip during the plateau — Lavalink doesn't
-                // need to hear "still 1.0" every 200 ms.
-                if (Math.Abs(target - lastSent) > 0.001f)
+                // Rate-limit: skip the REST round-trip if we just sent a volume
+                // update within MinVolumeInterval. Lavalink's volume endpoint is
+                // a REST call — pounding it every 200ms across N guilds generates
+                // unnecessary load.
+                var now = DateTime.UtcNow;
+                bool volumeChanged = Math.Abs(target - lastSent) > 0.001f;
+                bool rateLimitPassed = (now - lastVolumeCall) >= MinVolumeInterval;
+
+                if (volumeChanged && rateLimitPassed)
                 {
                     await SafeSetVolumeAsync(player, target);
                     lastSent = target;
+                    lastVolumeCall = now;
                 }
 
                 await Task.Delay(PollInterval, ct);

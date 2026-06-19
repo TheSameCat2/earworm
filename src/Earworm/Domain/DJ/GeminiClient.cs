@@ -33,7 +33,7 @@ public class GeminiClient
         using var _httpClient = _httpClientFactory.CreateClient(nameof(GeminiClient));
 
         string model = _config.Dj.GeminiModel;
-        string endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={_apiKey}";
+        string endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent";
 
         // Format prompt using the configured persona
         string trackMetadata = $"'{trackTitle}' by '{trackArtist}'";
@@ -57,6 +57,7 @@ public class GeminiClient
 
         string json = JsonSerializer.Serialize(requestBody);
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        request.Headers.Add("X-Goog-Api-Key", _apiKey);
         request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
         using var response = await _httpClient.SendAsync(request, cancellationToken);

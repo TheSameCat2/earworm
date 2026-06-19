@@ -160,6 +160,7 @@ public class QueueManager : IDisposable
                 guildId, _guildId);
         }
 
+        var correlationId = Guid.NewGuid();
         var item = new QueueItem
         {
             SourceType = sourceType,
@@ -170,7 +171,8 @@ public class QueueManager : IDisposable
             RequestedByUserId = requestedByUserId,
             RequestedByDisplayName = requestedByDisplayName,
             QueuedAt = DateTimeOffset.UtcNow,
-            GuildId = _guildId
+            GuildId = _guildId,
+            CorrelationId = correlationId
         };
 
         Task<long> writeTask;
@@ -202,19 +204,11 @@ public class QueueManager : IDisposable
         catch
         {
             // Best-effort rollback if persistence fails after in-memory append.
+            // Uses CorrelationId (a Guid) instead of SourceId + QueuedAt so two
+            // identical tracks queued in the same tick don't match each other.
             lock (_lock)
             {
-                int idx = -1;
-                for (int i = 0; i < _queue.Count; i++)
-                {
-                    if (_queue[i].QueueItemId == 0
-                        && _queue[i].SourceId == finalItem.SourceId
-                        && _queue[i].QueuedAt == finalItem.QueuedAt)
-                    {
-                        idx = i;
-                        break;
-                    }
-                }
+                int idx = _queue.FindIndex(q => q.QueueItemId == 0 && q.CorrelationId == correlationId);
                 if (idx >= 0)
                 {
                     _queue.RemoveAt(idx);
@@ -231,17 +225,7 @@ public class QueueManager : IDisposable
         bool orphaned;
         lock (_lock)
         {
-            int idx = -1;
-            for (int i = 0; i < _queue.Count; i++)
-            {
-                if (_queue[i].QueueItemId == 0
-                    && _queue[i].SourceId == finalItem.SourceId
-                    && _queue[i].QueuedAt == finalItem.QueuedAt)
-                {
-                    idx = i;
-                    break;
-                }
-            }
+            int idx = _queue.FindIndex(q => q.QueueItemId == 0 && q.CorrelationId == correlationId);
             if (idx >= 0)
             {
                 _queue[idx] = _queue[idx] with { QueueItemId = newId };
@@ -467,6 +451,7 @@ public class QueueManager : IDisposable
     {
         await EnsureInitializedAsync();
 
+        var correlationId = Guid.NewGuid();
         var fresh = new QueueItem
         {
             SourceType = item.SourceType,
@@ -477,7 +462,8 @@ public class QueueManager : IDisposable
             RequestedByUserId = item.RequestedByUserId,
             RequestedByDisplayName = item.RequestedByDisplayName,
             QueuedAt = DateTimeOffset.UtcNow,
-            GuildId = _guildId
+            GuildId = _guildId,
+            CorrelationId = correlationId
         };
 
         Task<long> addTask;
@@ -501,17 +487,10 @@ public class QueueManager : IDisposable
         Action<QueueItem>? handler;
         lock (_lock)
         {
-            int idx = -1;
-            for (int i = 0; i < _queue.Count; i++)
+            int idx = _queue.FindIndex(q => q.QueueItemId == 0 && q.CorrelationId == correlationId);
+            if (idx >= 0)
             {
-                if (_queue[i].QueueItemId == 0
-                    && _queue[i].SourceId == fresh.SourceId
-                    && _queue[i].QueuedAt == fresh.QueuedAt)
-                {
-                    _queue[i] = _queue[i] with { QueueItemId = newId };
-                    idx = i;
-                    break;
-                }
+                _queue[idx] = _queue[idx] with { QueueItemId = newId };
             }
 
             if (idx > 0)

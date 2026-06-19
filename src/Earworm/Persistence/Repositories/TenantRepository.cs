@@ -50,10 +50,36 @@ public sealed class TenantRepository : ITenantRepository
     {
         await _stateStore.SubmitWriteAsync(async connection =>
         {
-            using var cmd = connection.CreateCommand();
-            cmd.CommandText = "UPDATE tenants SET status = 'suspended' WHERE guild_id = $guild_id;";
-            cmd.Parameters.AddWithValue("$guild_id", guildId);
-            await cmd.ExecuteNonQueryAsync();
+            using var transaction = connection.BeginTransaction();
+            try
+            {
+                // Soft-delete the tenant row.
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = "UPDATE tenants SET status = 'suspended' WHERE guild_id = $guild_id;";
+                    cmd.Parameters.AddWithValue("$guild_id", guildId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+
+                // Purge orphaned data for this guild so the database doesn't
+                // accumulate stale rows across add/remove cycles.
+                foreach (var table in new[] { "queue", "playback_state", "settings", "metrics_global", "metrics_per_user", "snapshot", "play_history" })
+                {
+                    using var delCmd = connection.CreateCommand();
+                    delCmd.Transaction = transaction;
+                    delCmd.CommandText = $"DELETE FROM {table} WHERE guild_id = $guild_id;";
+                    delCmd.Parameters.AddWithValue("$guild_id", guildId);
+                    await delCmd.ExecuteNonQueryAsync();
+                }
+
+                transaction.Commit();
+            }
+            catch
+            {
+                transaction.Rollback();
+                throw;
+            }
         });
     }
 

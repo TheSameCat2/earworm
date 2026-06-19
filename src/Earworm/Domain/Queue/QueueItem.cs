@@ -15,4 +15,13 @@ public sealed record QueueItem
     public string RequestedByDisplayName { get; init; } = string.Empty;
     public DateTimeOffset QueuedAt { get; init; }
     public string GuildId { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Correlation GUID set when the item is first constructed, used to
+    /// unambiguously identify this item during the rollback / backfill
+    /// window between in-memory append and DB-assigned queue_item_id.
+    /// This avoids the race where two items with the same SourceId
+    /// queued in the same millisecond would match each other's search.
+    /// </summary>
+    public Guid CorrelationId { get; init; } = Guid.NewGuid();
 }

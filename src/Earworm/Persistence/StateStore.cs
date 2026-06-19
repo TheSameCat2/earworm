@@ -206,16 +206,43 @@ public sealed class StateStore : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        // Signal the worker to stop accepting new jobs.
         _writeChannel.Writer.TryComplete();
         _cts.Cancel();
+
         try
         {
-            _writeWorkerTask.Wait(TimeSpan.FromSeconds(2));
+            // Give the worker up to 5s to drain in-flight writes and exit.
+            // Docker sends SIGTERM with a 10s grace, so 5s leaves headroom
+            // for the outer shutdown sequence (Lavalink disconnect, etc.).
+            _writeWorkerTask.Wait(TimeSpan.FromSeconds(5));
         }
         catch
         {
-            // Ignore worker termination exceptions
+            // Ignore worker termination exceptions.
         }
+
+        // WAL checkpoint: flush the write-ahead log into the main database
+        // file so a subsequent process doesn't need to replay the WAL. Use
+        // TRUNCATE mode to shrink the WAL file to zero.
+        try
+        {
+            using var conn = new SqliteConnection(_connectionString);
+            conn.Open();
+            // Set per-connection pragmas so busy_timeout applies and we don't
+            // fail immediately if another process (e.g. Docker healthcheck
+            // reading the DB) holds a shared lock.
+            ApplyPragmas(conn);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+            cmd.ExecuteNonQuery();
+            _logger.LogInformation("StateStore WAL checkpointed (TRUNCATE).");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WAL checkpoint on dispose failed; WAL will be replayed on next open.");
+        }
+
         _cts.Dispose();
     }
 

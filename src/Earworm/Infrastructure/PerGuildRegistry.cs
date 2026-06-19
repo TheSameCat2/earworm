@@ -8,7 +8,7 @@ namespace Earworm.Infrastructure;
 /// <summary>
 /// Lazily creates and caches one <typeparamref name="T"/> instance per guild.
 /// This is the single abstraction the multi-tenant model leans on: every
-/// stateful per-guild engine (PlayerEngine, QueueManager, DJEngine, …) is
+/// stateful per-guild engine (PlayerEngine, QueueManager, DJEngine, ...) is
 /// resolved through a registry keyed by Discord guild id.
 ///
 /// Two correctness properties matter here:
@@ -16,7 +16,7 @@ namespace Earworm.Infrastructure;
 ///      <see cref="Lazy{T}"/> with <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/>
 ///      so a concurrent <see cref="GetOrCreate"/> race can't construct two
 ///      instances and discard one. That would be catastrophic for engines that
-///      subscribe to Lavalink events in their constructor — the discarded
+///      subscribe to Lavalink events in their constructor - the discarded
 ///      instance's subscription would leak and double-handle events.
 ///   2. <b>Initializer exactly-once.</b> Global singletons (VoiceManager,
 ///      TrackFailureHandler, NowPlayingPoster) need to attach to every per-guild
@@ -32,6 +32,7 @@ public sealed class PerGuildRegistry<T> where T : class
     private readonly List<Action<T>> _initializers = new();
     private readonly List<T> _created = new();
     private readonly object _initLock = new();
+    private int _createReentrantGuard;
 
     public PerGuildRegistry(Func<string, T> factory)
     {
@@ -76,7 +77,7 @@ public sealed class PerGuildRegistry<T> where T : class
     }
 
     /// <summary>
-    /// Registers a callback run exactly once against every instance — those
+    /// Registers a callback run exactly once against every instance - those
     /// already created and all future ones. The factory itself runs outside the
     /// lock; only the cheap bookkeeping and initializer invocation are guarded,
     /// which is safe because initializers only do non-reentrant work like
@@ -96,15 +97,43 @@ public sealed class PerGuildRegistry<T> where T : class
     }
 
     /// <summary>
-    /// Removes a guild's instance and disposes it if it is <see cref="IDisposable"/>.
+    /// Removes a guild's instance and disposes it if it is <see cref="IDisposable"/>. 
     /// Called when a tenant is removed so per-guild engines — and their
     /// subscriptions to shared singletons like the audio service — don't linger
     /// for the process lifetime. Returns true if a constructed instance was
     /// dropped (and disposed).
     /// </summary>
+    /// <remarks>
+    /// <para>SAFETY: Initializers registered via <see cref="AddInitializer"/> must
+    /// NOT call Evict on the same guild being constructed — doing so would cause
+    /// infinite recursion (lazy.Value → Create → Evict → lazy.Value → …).
+    /// Evict on a different guild is safe because it blocks on <c>_initLock</c>
+    /// until the outer Create finishes its initializer loop.</para>
+    /// <para>If called re-entrantly from an initializer (detected via
+    /// <c>_createReentrantGuard</c>), the instance is removed from
+    /// <c>_instances</c> but NOT resolved from the Lazy (to avoid recursion)
+    /// and NOT disposed here. The outer Create owns disposal and cleanup.
+    /// The re-created instance from a later GetOrCreate will function correctly.</para>
+    /// </remarks>
     public bool Evict(string guildId)
     {
         if (!_instances.TryRemove(guildId, out var lazy)) return false;
+
+        bool isReentrant;
+        lock (_initLock)
+        {
+            isReentrant = _createReentrantGuard > 0;
+        }
+
+        if (isReentrant)
+        {
+            // Don't touch the Lazy — resolving it would re-enter Create and
+            // cause infinite recursion on this thread. The instance has already
+            // been or is about to be added to _created by the outer Create.
+            // It was removed from _instances above, so GetOrCreate will make
+            // a fresh instance next time.
+            return true;
+        }
 
         // Force resolution rather than checking IsValueCreated. If another thread
         // is mid-construction inside GetOrCreate, IsValueCreated is still false but
@@ -117,11 +146,11 @@ public sealed class PerGuildRegistry<T> where T : class
         lock (_initLock)
         {
             _created.Remove(instance);
-        }
 
-        if (instance is IDisposable disposable)
-        {
-            disposable.Dispose();
+            if (instance is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
         }
         return true;
     }
@@ -131,10 +160,24 @@ public sealed class PerGuildRegistry<T> where T : class
         var instance = _factory(guildId);
         lock (_initLock)
         {
-            _created.Add(instance);
-            foreach (var init in _initializers)
+            // Re-entrancy guard: if an initializer calls Evict() on another
+            // guild, that eviction will try to acquire _initLock. Because
+            // Monitor allows re-entrancy on the same thread, the eviction
+            // succeeds — but it must NOT call initializers on the instance
+            // being created here (that would cause infinite recursion or
+            // a double-subscription). The guard is checked in Evict().
+            _createReentrantGuard++;
+            try
             {
-                init(instance);
+                _created.Add(instance);
+                foreach (var init in _initializers)
+                {
+                    init(instance);
+                }
+            }
+            finally
+            {
+                _createReentrantGuard--;
             }
         }
         return instance;
