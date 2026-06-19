@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
@@ -387,6 +388,33 @@ public sealed class QueueManagerTests
             queue.Select(q => q.Position).Should().Equal(Enumerable.Range(0, queue.Count),
                 "positions stay dense and contiguous regardless of interleaving");
             queue.Select(q => q.QueueItemId).Distinct().Should().HaveCount(queue.Count, "no duplicate ids");
+        });
+    }
+
+    [Fact]
+    public async Task RestoreSnapshotAsync_MarksManagerInitialized()
+    {
+        // Regression: RestoreSnapshotAsync updated the in-memory queue and the DB
+        // but never set _initialized = true, leaving the manager in a misleading
+        // state and forcing a redundant DB reload on the next EnsureInitialized.
+        await RunWithQueueManagerAsync(async (manager, queueRepo) =>
+        {
+            // Seed a snapshot: add a track then save via the public API.
+            await manager.AddTrackAsync("youtube", "seed", "Seed", "Seeder", 60, "u", "U", "g1");
+            await manager.SaveSnapshotAsync("admin");
+
+            // Clear the in-memory + persisted queue so restore is meaningful.
+            await manager.ClearQueueAsync();
+            manager.GetQueue().Should().BeEmpty("precondition: queue cleared before restore");
+
+            var restored = await manager.RestoreSnapshotAsync();
+            restored.Should().NotBeNull();
+            manager.GetQueue().Should().HaveCount(1, "restored track is back in memory");
+
+            // The private _initialized flag must now be true.
+            var initField = typeof(QueueManager).GetField("_initialized", BindingFlags.NonPublic | BindingFlags.Instance);
+            initField.Should().NotBeNull();
+            ((bool)initField!.GetValue(manager)!).Should().BeTrue("RestoreSnapshotAsync must mark the manager initialized");
         });
     }
 }

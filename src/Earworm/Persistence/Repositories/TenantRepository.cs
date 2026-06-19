@@ -64,7 +64,7 @@ public sealed class TenantRepository : ITenantRepository
 
                 // Purge orphaned data for this guild so the database doesn't
                 // accumulate stale rows across add/remove cycles.
-                foreach (var table in new[] { "queue", "playback_state", "settings", "metrics_global", "metrics_per_user", "snapshot", "play_history" })
+                foreach (var table in new[] { "queue", "playback_state", "settings", "metrics_global", "metrics_per_user", "snapshot", "history" })
                 {
                     using var delCmd = connection.CreateCommand();
                     delCmd.Transaction = transaction;

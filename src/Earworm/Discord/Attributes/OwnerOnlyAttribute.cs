@@ -13,6 +13,14 @@ public sealed class OwnerOnlyAttribute : SlashCheckBaseAttribute
     public override Task<bool> ExecuteChecksAsync(InteractionContext ctx)
     {
         var config = ctx.Services.GetRequiredService<EarwormConfig>();
-        return Task.FromResult(config.Bot.OwnerUserIds.Contains(ctx.User.Id.ToString()));
+        var userId = ctx.User.Id.ToString();
+        for (int i = 0; i < config.Bot.OwnerUserIds.Count; i++)
+        {
+            if (string.Equals(config.Bot.OwnerUserIds[i]?.Trim(), userId, StringComparison.Ordinal))
+            {
+                return Task.FromResult(true);
+            }
+        }
+        return Task.FromResult(false);
     }
 }

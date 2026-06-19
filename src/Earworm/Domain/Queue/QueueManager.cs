@@ -550,6 +550,7 @@ public class QueueManager : IDisposable
             handler = SnapshotRestored;
         }
 
+        _initialized = true;
         _logger.LogInformation("Restored snapshot with {Count} tracks.", restoredCount);
         handler?.Invoke();
 

@@ -954,4 +954,54 @@ public sealed class PersistenceTests
             finalCount.Should().Be(totalTasks);
         });
     }
+
+    [Fact]
+    public async Task TenantRepository_RemoveTenantAsync_PurgesHistoryAndSoftDeletes_WithoutRollingBack()
+    {
+        // Regression for the wrong table name in RemoveTenantAsync: the migration
+        // schema creates the play-history table as `history`, but the purge loop
+        // referenced `play_history`. That made the whole soft-delete transaction
+        // roll back, so /admin remove-server failed and the tenant was never
+        // suspended. This test seeds a tenant + history row and asserts the
+        // removal commits (history purged, tenant suspended) rather than throwing.
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            const string G = "guild-tenant-1";
+
+            var tenants = new TenantRepository(stateStore);
+            var history = new HistoryRepository(stateStore);
+
+            await tenants.AddTenantAsync(G, ownerUserId: "owner-1");
+
+            await history.AddHistoryEntryAsync(new PlayHistoryEntry
+            {
+                PlayedAt = DateTimeOffset.UtcNow,
+                SourceType = "youtube",
+                SourceId = "h1",
+                Title = "Title 1",
+                Artist = "Artist 1",
+                DurationSeconds = 100,
+                PlayedSeconds = 100,
+                RequestedByUserId = "userA",
+                RequestedByDisplayName = "User A",
+                Skipped = false,
+                Failed = false,
+                GuildId = G,
+            }, retentionCount: 10);
+
+            // Act — must not throw (the old `play_history` reference rolled back
+            // the transaction with a SQLite "no such table" error).
+            await tenants.RemoveTenantAsync(G);
+
+            // Assert: the soft-delete committed.
+            (await tenants.IsAdmittedAsync(G)).Should().BeFalse("tenant is suspended after removal");
+            var all = await tenants.GetAllTenantsAsync();
+            var row = all.Should().ContainSingle(t => t.GuildId == G).Which;
+            row.Status.Should().Be("suspended");
+
+            // And the per-guild history was purged from the correctly-named table.
+            var remaining = await history.GetRecentHistoryAsync(G, 10);
+            remaining.Should().BeEmpty("RemoveTenantAsync must purge the `history` table");
+        });
+    }
 }

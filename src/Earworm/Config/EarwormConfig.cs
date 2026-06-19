@@ -98,6 +98,17 @@ public sealed record DjConfig
     /// Default 100.
     /// </summary>
     public int TtsScratchMaxFiles { get; init; } = 100;
+
+    /// <summary>
+    /// Minimum age (in minutes) a staged TTS file must reach before the periodic
+    /// retention sweep is allowed to delete it. This protects files that are
+    /// still being streamed by Lavalink (staged but not yet consumed by the
+    /// <c>OnConsumedAsync</c> cleanup callback) from being pruned by the count
+    /// cap when the scratch directory overflows. Default 2 minutes — long enough
+    /// for a typical commentary clip to finish streaming, short enough that the
+    /// count cap still keeps the directory bounded under load.
+    /// </summary>
+    public int TtsScratchMinAgeMinutes { get; init; } = 2;
 }
 
 public sealed record TtsConfig

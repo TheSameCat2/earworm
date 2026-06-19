@@ -73,7 +73,11 @@ public static class Program
         Console.WriteLine("Configuration loaded and verified successfully.");
         Console.ResetColor();
 
-        var botToken = Environment.GetEnvironmentVariable("EARWORM_DISCORD_BOT_TOKEN") ?? "PLACEHOLDER";
+        // ValidateConfig above already exits the process if the token is missing,
+        // so the environment variable is guaranteed non-null here. Reading it
+        // again (rather than carrying a value through ValidateConfig) keeps the
+        // two code paths independent and avoids a dead "PLACEHOLDER" fallback.
+        var botToken = Environment.GetEnvironmentVariable("EARWORM_DISCORD_BOT_TOKEN")!;
 
         var services = new ServiceCollection();
         ConfigureServices(services, earwormConfig, botToken);

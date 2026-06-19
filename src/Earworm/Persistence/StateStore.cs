@@ -119,7 +119,7 @@ public sealed class StateStore : IDisposable
         using var connection = CreateConnection();
         try
         {
-            connection.Open();
+            await connection.OpenAsync();
         }
         catch (Exception ex)
         {
@@ -160,7 +160,7 @@ public sealed class StateStore : IDisposable
                     {
                         using var cmd = connection.CreateCommand();
                         cmd.CommandText = "PRAGMA incremental_vacuum;";
-                        cmd.ExecuteNonQuery();
+                        await cmd.ExecuteNonQueryAsync();
                     }
                     catch (Exception ex)
                     {

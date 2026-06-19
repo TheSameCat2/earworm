@@ -26,6 +26,7 @@ public sealed class VoiceManager : IDisposable
     private readonly PerGuildRegistry<QueueManager> _queueManagers;
     private readonly EarwormConfig _config;
     private readonly ILogger<VoiceManager> _logger;
+    private readonly ShutdownLifetime _shutdown;
 
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _emptyChannelTimers = new();
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _idleTimers = new();
@@ -36,7 +37,8 @@ public sealed class VoiceManager : IDisposable
         PerGuildRegistry<PlayerEngine> playerEngines,
         PerGuildRegistry<QueueManager> queueManagers,
         EarwormConfig config,
-        ILogger<VoiceManager> logger)
+        ILogger<VoiceManager> logger,
+        ShutdownLifetime? shutdown = null)
     {
         _discordClient = discordClient;
         _audioService = audioService;
@@ -44,6 +46,10 @@ public sealed class VoiceManager : IDisposable
         _queueManagers = queueManagers;
         _config = config;
         _logger = logger;
+        // ShutdownLifetime is a process-wide singleton in production DI, but the
+        // tests construct VoiceManager directly without it. Fall back to a local
+        // instance so the fire-and-forget paths always have a token to observe.
+        _shutdown = shutdown ?? new ShutdownLifetime();
 
         // Attach idle/empty-channel bookkeeping to every per-guild engine —
         // those already created and any created later.
@@ -122,10 +128,13 @@ public sealed class VoiceManager : IDisposable
 
     private Task OnVoiceStateUpdatedAsync(DiscordClient sender, VoiceStateUpdateEventArgs e)
     {
+        var ct = _shutdown.Token;
         _ = Task.Run(async () =>
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
+
                 var guild = e.Guild;
                 if (guild == null) return;
                 var bot = guild.CurrentMember;
@@ -164,11 +173,15 @@ public sealed class VoiceManager : IDisposable
                 var botChannel = bot.VoiceState?.Channel;
                 if (botChannel != null) CheckChannelEmptyState(botChannel);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown: swallow.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error handling VoiceStateUpdated event.");
             }
-        });
+        }, ct);
         return Task.CompletedTask;
     }
 
@@ -181,7 +194,7 @@ public sealed class VoiceManager : IDisposable
         {
             int graceSeconds = _config.AutoBehavior.EmptyChannelGraceSeconds;
 
-            var cts = new CancellationTokenSource();
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
             var stored = _emptyChannelTimers.GetOrAdd(guildId, cts);
             if (!ReferenceEquals(stored, cts))
             {
@@ -196,6 +209,7 @@ public sealed class VoiceManager : IDisposable
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(graceSeconds), cts.Token);
+                    if (_shutdown.IsShuttingDown) return;
                     _logger.LogInformation("Empty-channel grace expired; auto-disconnecting.");
                     await LeaveChannelAsync(guildId);
                 }
@@ -208,7 +222,7 @@ public sealed class VoiceManager : IDisposable
                     _emptyChannelTimers.TryRemove(guildId, out _);
                     cts.Dispose();
                 }
-            });
+            }, _shutdown.Token);
         }
         else
         {
@@ -226,27 +240,33 @@ public sealed class VoiceManager : IDisposable
 
     private void OnTrackEnded(QueueItem track, bool skipped, string? failureReason)
     {
+        var ct = _shutdown.Token;
         _ = Task.Run(() =>
         {
             try
             {
+                ct.ThrowIfCancellationRequested();
                 if (ulong.TryParse(track.GuildId, out ulong guildId))
                 {
                     if (_queueManagers.GetOrCreate(track.GuildId).Count == 0) StartIdleTimer(guildId);
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown: swallow.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error checking queue state on TrackEnded.");
             }
-        });
+        }, ct);
     }
 
     private void StartIdleTimer(ulong guildId)
     {
         int idleSeconds = _config.AutoBehavior.IdleDisconnectSeconds;
 
-        var cts = new CancellationTokenSource();
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
         var stored = _idleTimers.GetOrAdd(guildId, cts);
         if (!ReferenceEquals(stored, cts))
         {
@@ -261,6 +281,7 @@ public sealed class VoiceManager : IDisposable
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(idleSeconds), cts.Token);
+                if (_shutdown.IsShuttingDown) return;
                 _logger.LogInformation("Idle timer expired; auto-disconnecting.");
                 await LeaveChannelAsync(guildId);
             }
@@ -273,7 +294,7 @@ public sealed class VoiceManager : IDisposable
                 _idleTimers.TryRemove(guildId, out _);
                 cts.Dispose();
             }
-        });
+        }, _shutdown.Token);
     }
 
     private void CancelEmptyChannelTimer(ulong guildId)

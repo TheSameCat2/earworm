@@ -43,14 +43,34 @@ public class PlayerEngine : IDisposable
     private DateTimeOffset _trackStartedAt;
     private bool _isPaused;
     private PlaybackState _cachedState;
+    private ulong? _voiceChannelId;
 
     private const int MaxConsecutiveLoadFailures = 10;
 
     // When we're playing a TTS commentary track ahead of music, this TCS is
     // non-null and gets signalled by the global TrackEnded handler so the
-    // music track can follow immediately. The handler distinguishes by the
-    // non-null state of this field, not by inspecting the track itself.
+    // music track can follow immediately. The handler also consults
+    // _currentTtsIdentifier (below) so a *late* TTS TrackEnded event arriving
+    // after the 30s timeout fired (which clears this TCS) is still recognized
+    // as a TTS event and ignored, rather than treated as the music track
+    // ending and advancing the queue a second time.
     private TaskCompletionSource? _ttsCompletion;
+
+    // Identifier of the TTS track currently staged/playing, set when we issue
+    // PlayAsync for a preroll and cleared once the matching TrackEnded event
+    // is observed OR when we start the music track. Survives the TTS timeout
+    // so the handler can still identify and discard a late TTS event.
+    private string? _currentTtsIdentifier;
+
+    // Set by StopAsync() (the /stop-worm and leave/disconnect path) to suppress
+    // the auto-advance that the TrackEnded handler would otherwise perform when
+    // it sees Reason == Stopped. The handler resets this flag after consuming
+    // the next TrackEnded event, so a subsequent SkipAsync() (which calls
+    // player.StopAsync() directly) still advances normally. Without this, the
+    // fire-and-forget TrackEnded handler races with leave/disconnect and either
+    // drops the next track from the queue or briefly starts it in a channel the
+    // bot has already left.
+    private bool _haltAfterTrackEnded;
 
     public virtual event Action<QueueItem>? TrackStarted;
     public virtual event Action<QueueItem, bool, string?>? TrackEnded; // (track, skipped, failureReason)
@@ -153,16 +173,51 @@ public class PlayerEngine : IDisposable
             try
             {
                 // TTS pre-roll just ended — signal the awaiter and bail. We do
-                // NOT log history or fire our events for TTS.
+                // NOT log history or fire our events for TTS. We identify the
+                // TTS event by the staged track identifier (not just by
+                // _ttsCompletion being non-null) so that a *late* event
+                // arriving after the 30s timeout already fired (and cleared
+                // _ttsCompletion) is still recognized and ignored instead of
+                // being treated as the music track ending.
+                string? endedIdentifier = e.Track?.Identifier;
+                bool isTtsEvent;
+                TaskCompletionSource? ttsTcs = null;
                 lock (_stateLock)
                 {
-                    if (_ttsCompletion != null)
+                    isTtsEvent = _currentTtsIdentifier != null
+                        && string.Equals(_currentTtsIdentifier, endedIdentifier, StringComparison.Ordinal);
+                    if (isTtsEvent)
                     {
-                        var tcs = _ttsCompletion;
+                        _currentTtsIdentifier = null;
+                        ttsTcs = _ttsCompletion;
                         _ttsCompletion = null;
-                        tcs.TrySetResult();
-                        return;
                     }
+                    else if (_ttsCompletion != null)
+                    {
+                        // Fallback: no identifier match but a TTS awaiter is still
+                        // pending (e.g. Lavalink didn't echo the track identifier).
+                        // Treat as the TTS ending so the music track can proceed.
+                        isTtsEvent = true;
+                        ttsTcs = _ttsCompletion;
+                        _ttsCompletion = null;
+                        _currentTtsIdentifier = null;
+                    }
+                }
+
+                if (isTtsEvent)
+                {
+                    ttsTcs?.TrySetResult();
+                    return;
+                }
+
+                // StopAsync() (the /stop-worm / leave / deregister path) asked us
+                // to suppress auto-advance. Consume and reset the flag here so the
+                // next real stop (e.g. /skip) advances normally.
+                bool halt;
+                lock (_stateLock)
+                {
+                    halt = _haltAfterTrackEnded;
+                    _haltAfterTrackEnded = false;
                 }
 
                 QueueItem? ended;
@@ -186,6 +241,13 @@ public class PlayerEngine : IDisposable
 
                     if (failed) TrackFailed?.Invoke(ended, "Lavalink load failed");
                     TrackEnded?.Invoke(ended, skipped, failed ? "Lavalink load failed" : null);
+                }
+
+                if (halt)
+                {
+                    // Explicit stop: persist the idle state and do NOT advance.
+                    await _queueRepository.UpdatePlaybackStateAsync(_guildIdStr, State);
+                    return;
                 }
 
                 // Advance to the next track only if the end reason allows it.
@@ -256,7 +318,16 @@ public class PlayerEngine : IDisposable
                     if (ttsTrack != null)
                     {
                         TaskCompletionSource tcs;
-                        lock (_stateLock) { _ttsCompletion = tcs = new TaskCompletionSource(); }
+                        lock (_stateLock)
+                        {
+                            _ttsCompletion = tcs = new TaskCompletionSource();
+                            // Record the staged TTS track's identifier so a late
+                            // TrackEnded event (after the 30s timeout below fires
+                            // and clears _ttsCompletion) can still be recognized as
+                            // a TTS event and ignored rather than advancing the
+                            // queue a second time.
+                            _currentTtsIdentifier = ttsTrack.Identifier;
+                        }
                         await _transitions.PrepareForPrerollAsync(player);
                         await player.PlayAsync(ttsTrack);
                         // Cap the wait: if Lavalink misses the TrackEnded event for
@@ -269,6 +340,10 @@ public class PlayerEngine : IDisposable
                             lock (_stateLock)
                             {
                                 if (_ttsCompletion == tcs) _ttsCompletion = null;
+                                // NOTE: _currentTtsIdentifier is intentionally left
+                                // set so a late TTS TrackEnded is still identified
+                                // and ignored. It is cleared when the music track
+                                // starts (below) or when the matching event arrives.
                             }
                         }
                     }
@@ -280,7 +355,7 @@ public class PlayerEngine : IDisposable
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to play TTS pre-roll; continuing to music.");
-                    lock (_stateLock) { _ttsCompletion = null; }
+                    lock (_stateLock) { _ttsCompletion = null; _currentTtsIdentifier = null; }
                 }
                 finally
                 {
@@ -343,6 +418,12 @@ public class PlayerEngine : IDisposable
                 _currentTrack = next;
                 _trackStartedAt = DateTimeOffset.UtcNow;
                 _isPaused = false;
+                // The music track is now authoritative; a late TTS TrackEnded
+                // (if any) should not be matched against the staged TTS id.
+                _currentTtsIdentifier = null;
+                // Track the bot's current voice channel so resume-after-restart
+                // state can report it (RebuildStateLocked reads this field).
+                _voiceChannelId = player.VoiceChannelId;
                 RebuildStateLocked();
             }
 
@@ -425,7 +506,7 @@ public class PlayerEngine : IDisposable
             CurrentRequestedByUserId = track?.RequestedByUserId,
             CurrentRequestedByDisplayName = track?.RequestedByDisplayName,
             CurrentPositionMs = 0,
-            VoiceChannelId = null,
+            VoiceChannelId = _voiceChannelId?.ToString(),
             VoiceGuildId = _guildId.ToString(),
             UpdatedAt = DateTimeOffset.UtcNow
         };
@@ -462,6 +543,10 @@ public class PlayerEngine : IDisposable
     {
         var player = await TryGetPlayerAsync();
         if (player == null) return;
+        // Skip is an explicit user action: clear any stale halt flag left by a
+        // prior StopAsync() whose TrackEnded never fired (e.g. stop called on an
+        // idle player) so this skip's own TrackEnded(Stopped) advances.
+        lock (_stateLock) { _haltAfterTrackEnded = false; }
         // StopAsync triggers TrackEnded with Reason=Stopped, which our handler
         // treats as "advance to next."
         await player.StopAsync();
@@ -502,11 +587,37 @@ public class PlayerEngine : IDisposable
     public async Task StopAsync()
     {
         var player = await TryGetPlayerAsync();
+
+        // Only arm the halt flag when a track is actually playing — that's the
+        // only case where player.StopAsync() will produce a TrackEnded(Stopped)
+        // event that the handler would (wrongly) auto-advance from. If nothing
+        // is playing, no event fires, so arming the flag here would just linger
+        // and suppress the next SkipAsync's advance.
+        bool hasCurrentTrack;
+        lock (_stateLock)
+        {
+            hasCurrentTrack = _currentTrack != null;
+            if (hasCurrentTrack) _haltAfterTrackEnded = true;
+        }
+
         if (player != null)
         {
             await player.StopAsync();
         }
-        lock (_stateLock) { _currentTrack = null; _isPaused = false; RebuildStateLocked(); }
+        lock (_stateLock)
+        {
+            _currentTrack = null;
+            _isPaused = false;
+            // Clear any in-flight TTS bookkeeping so a stale event can't fire
+            // the awaiter or be matched after we've gone idle.
+            _ttsCompletion = null;
+            _currentTtsIdentifier = null;
+            // If we did NOT have a current track, no TrackEnded will fire to
+            // consume the flag — make sure it's cleared so it can't suppress a
+            // future skip. (If we did, the handler will reset it.)
+            if (!hasCurrentTrack) _haltAfterTrackEnded = false;
+            RebuildStateLocked();
+        }
     }
 
     /// <summary>

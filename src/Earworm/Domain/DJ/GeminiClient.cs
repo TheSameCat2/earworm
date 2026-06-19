@@ -70,15 +70,54 @@ public class GeminiClient
 
         string resJson = await response.Content.ReadAsStringAsync(cancellationToken);
         using var doc = JsonDocument.Parse(resJson);
-        
+
+        // Gemini can return a 200 with no candidates — e.g. when the prompt is
+        // blocked by safety filters or the response is empty. Previously this
+        // threw an opaque index-out-of-range on `candidates[0]`; surface a
+        // clear, logged reason instead so the DJ caller can skip cleanly.
+        if (!doc.RootElement.TryGetProperty("candidates", out var candidates) || candidates.GetArrayLength() == 0)
+        {
+            string? blockReason = null;
+            if (doc.RootElement.TryGetProperty("promptFeedback", out var feedback) &&
+                feedback.TryGetProperty("blockReason", out var reason))
+            {
+                blockReason = reason.GetString();
+            }
+
+            _logger.LogWarning(
+                "Gemini returned no candidates (blockReason={BlockReason}); skipping commentary. JSON: {Json}",
+                blockReason ?? "none", resJson);
+            throw new InvalidOperationException(
+                "Gemini returned no commentary candidates" +
+                (blockReason != null ? $" (blockReason: {blockReason})" : string.Empty) + ".");
+        }
+
+        // A candidate may also be blocked at the per-candidate level (finishReason = SAFETY).
+        var candidate = candidates[0];
+        if (candidate.TryGetProperty("finishReason", out var finishReason))
+        {
+            var reasonText = finishReason.GetString();
+            if (!string.Equals(reasonText, "STOP", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(reasonText, "MAX_TOKENS", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "Gemini candidate finishReason={FinishReason}; skipping commentary. JSON: {Json}",
+                    reasonText, resJson);
+                throw new InvalidOperationException(
+                    $"Gemini commentary was not returned (finishReason: {reasonText}).");
+            }
+        }
+
         try
         {
-            var text = doc.RootElement
-                .GetProperty("candidates")[0]
-                .GetProperty("content")
-                .GetProperty("parts")[0]
-                .GetProperty("text")
-                .GetString();
+            if (!candidate.TryGetProperty("content", out var content) ||
+                !content.TryGetProperty("parts", out var parts) || parts.GetArrayLength() == 0 ||
+                !parts[0].TryGetProperty("text", out var textProp))
+            {
+                throw new InvalidOperationException("Gemini returned an empty/incomplete content payload.");
+            }
+
+            var text = textProp.GetString();
 
             if (string.IsNullOrEmpty(text))
             {

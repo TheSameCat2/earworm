@@ -175,4 +175,24 @@ public sealed class TtsScratchJanitorTests : IDisposable
         var act = () => janitor.RunRetentionPass();
         act.Should().NotThrow();
     }
+
+    [Fact]
+    public void RetentionPass_SkipsFilesYoungerThanMinAge_EvenWhenCountCapIsExceeded()
+    {
+        // Regression: count-based retention could delete a file Lavalink is still
+        // streaming when the scratch directory overflows. Files younger than the
+        // minimum-age window must be protected from BOTH age and count pruning.
+        // Here every file is brand-new (within the default 2-minute min-age), so
+        // even though the count cap (3) is exceeded by 5 files, none are deleted.
+        WriteFile("a.mp3");
+        WriteFile("b.mp3");
+        WriteFile("c.mp3");
+        WriteFile("d.mp3");
+        WriteFile("e.mp3");
+
+        BuildJanitor(maxAgeMinutes: 9999, maxFiles: 3).RunRetentionPass();
+
+        Directory.GetFiles(_scratchDir, "*.mp3").Should().HaveCount(5,
+            "files younger than the minimum-age window are protected from the count cap");
+    }
 }

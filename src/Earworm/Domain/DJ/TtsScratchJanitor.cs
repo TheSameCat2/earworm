@@ -114,12 +114,22 @@ public sealed class TtsScratchJanitor
 
         if (files.Count == 0) return;
 
+        // Minimum-age protection: a file younger than this is still likely being
+        // streamed by Lavalink (staged but not yet consumed via OnConsumedAsync).
+        // Never delete it from the retention pass — let the OnConsumedAsync
+        // callback or a future pass handle it once it's safely older.
+        var minAge = TimeSpan.FromMinutes(Math.Max(0, _config.Dj.TtsScratchMinAgeMinutes));
+        var minAgeCutoff = DateTime.UtcNow - minAge;
+
         // Age-based pruning.
         var maxAge = TimeSpan.FromMinutes(Math.Max(1, _config.Dj.TtsScratchMaxAgeMinutes));
         var cutoff = DateTime.UtcNow - maxAge;
         int deletedAge = 0;
         foreach (var fi in files.ToList())
         {
+            // Skip files still inside the minimum-age window (may be streaming).
+            if (fi.LastWriteTimeUtc > minAgeCutoff) continue;
+
             if (fi.LastWriteTimeUtc < cutoff)
             {
                 TryDelete(fi, "age");
@@ -132,15 +142,22 @@ public sealed class TtsScratchJanitor
             _logger.LogInformation("TTS scratch age sweep: deleted {Count} file(s) older than {MaxAgeMinutes} min.", deletedAge, _config.Dj.TtsScratchMaxAgeMinutes);
 
         // Count-based pruning: oldest excess files are already first after OrderBy.
+        // Skip any file younger than the minimum age — it may still be streaming.
         int maxFiles = Math.Max(1, _config.Dj.TtsScratchMaxFiles);
         if (files.Count > maxFiles)
         {
             int excess = files.Count - maxFiles;
-            for (int i = 0; i < excess; i++)
+            int deletedCount = 0;
+            for (int i = 0; i < files.Count && deletedCount < excess; i++)
             {
+                if (files[i].LastWriteTimeUtc > minAgeCutoff) continue; // protected
                 TryDelete(files[i], "count cap");
+                deletedCount++;
             }
-            _logger.LogInformation("TTS scratch count sweep: deleted {Count} excess file(s) (cap={Cap}).", excess, maxFiles);
+            if (deletedCount > 0)
+                _logger.LogInformation("TTS scratch count sweep: deleted {Count} excess file(s) (cap={Cap}).", deletedCount, maxFiles);
+            if (deletedCount < excess)
+                _logger.LogWarning("TTS scratch count sweep: {Protected} excess file(s) skipped because they are younger than {MinAgeMinutes} min and may still be streaming.", excess - deletedCount, _config.Dj.TtsScratchMinAgeMinutes);
         }
     }
 

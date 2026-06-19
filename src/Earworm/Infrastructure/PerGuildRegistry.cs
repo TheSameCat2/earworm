@@ -135,16 +135,28 @@ public sealed class PerGuildRegistry<T> where T : class
             return true;
         }
 
-        // Force resolution rather than checking IsValueCreated. If another thread
-        // is mid-construction inside GetOrCreate, IsValueCreated is still false but
-        // the factory is about to publish the instance into _created — skipping it
-        // here would orphan that instance (left in _created, subscribed to the
-        // shared audio service, never disposed). Lazy is ExecutionAndPublication,
-        // so .Value blocks until the in-flight construction completes and returns
-        // the one instance every caller sees.
-        var instance = lazy.Value;
+        // Hold the initializer lock across resolve + remove-from-_created + dispose
+        // so the operation is atomic with respect to Create. If a concurrent
+        // GetOrCreate is still inside Create (it holds _initLock), we block here
+        // until it publishes the instance into _created, then we resolve the
+        // already-constructed value (no second factory run), remove it, and
+        // dispose it under the same lock — so no other thread can observe the
+        // instance half-removed or publish a fresh Lazy's instance in between.
+        // Lazy<T> is ExecutionAndPublication, so .Value never runs the factory
+        // twice; if construction hasn't started, .Value runs Create re-entrantly
+        // on this thread (Monitor allows re-entrancy), which is guarded by
+        // _createReentrantGuard for nested Evict/GetOrCreate calls.
         lock (_initLock)
         {
+            // Re-check reentrancy under the lock: a re-entrant Evict from an
+            // initializer that ran between the first check and here must still
+            // skip resolution/disposal to avoid recursion.
+            if (_createReentrantGuard > 0)
+            {
+                return true;
+            }
+
+            var instance = lazy.Value;
             _created.Remove(instance);
 
             if (instance is IDisposable disposable)
