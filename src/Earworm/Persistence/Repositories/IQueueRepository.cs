@@ -9,6 +9,7 @@ public interface IQueueRepository
 {
     Task<List<QueueItem>> GetQueueAsync(string guildId);
     Task<long> AddTrackAsync(QueueItem item);
+    Task<long> AddTrackAtFrontAsync(QueueItem item);
     Task CompactPositionsAsync(string guildId);
     Task RemoveTrackAsync(long queueItemId);
     Task MoveTrackAsync(string guildId, long queueItemId, int toPosition);

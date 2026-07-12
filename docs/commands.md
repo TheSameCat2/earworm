@@ -27,7 +27,14 @@ Queue a track by URL or search term.
 /play discord music bot is fixed
 ```
 
-- **URLs**: YouTube, YouTube Music, SoundCloud, Bandcamp, Twitch, Vimeo, and direct audio file URLs (any `http://...mp3`).
+- **URLs**: YouTube, YouTube Music, SoundCloud, Bandcamp, Twitch, Vimeo, and public direct audio file URLs. Loopback, private-network, single-label, `.local`, `.internal`, and credential-bearing URLs are rejected so `/play` cannot be used to make Lavalink probe internal services.
+
+  This application-level check cannot eliminate DNS rebinding because Lavalink
+  resolves the hostname in a separate process after validation. Before serving
+  mutually untrusted tenants, enforce Lavalink egress policy (or use an
+  allowlisting proxy): allow its required public media destinations and the
+  Earworm TTS endpoint, while denying other private, link-local, and cloud
+  metadata destinations.
 - **Search terms**: query goes to YouTube search (`ytsearch:`), first result is queued.
 - **Auto-join**: if the bot isn't in voice, it joins your channel before queueing.
 
@@ -213,6 +220,10 @@ Display the current settings — DJ enabled state, configured DJ role, configure
 
 These commands manage the multi-tenant whitelist and are restricted to the bot owners listed in `Bot.OwnerUserIds`. earworm only serves guilds that have been admitted as tenants; all the commands above are gated on the calling guild being whitelisted.
 
+`OwnerUserIds` defaults to an empty list. This is fine for an existing
+single-tenant deployment, but at least one owner must be configured before a
+second server can be admitted or tenant access can be managed.
+
 ### `/admin add-server <guild-id>`  👑
 
 Whitelist a Discord guild as a tenant. Slash commands are registered to that guild immediately (instant propagation).
@@ -223,7 +234,7 @@ List every tenant guild with its plan and status.
 
 ### `/admin remove-server <guild-id>`  👑
 
-Suspend a tenant (soft delete — status becomes `suspended`). Commands stop working there; the data is retained.
+Suspend a tenant (soft delete — status becomes `suspended`). Commands stop working there; the data is retained. The final active tenant cannot be suspended; admit another server first.
 
 ---
 

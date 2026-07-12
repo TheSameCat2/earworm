@@ -10,4 +10,5 @@ public interface ITenantService
     Task AddTenantAsync(string guildId, string? ownerUserId);
     Task RemoveTenantAsync(string guildId);
     Task<IReadOnlyList<TenantRow>> GetAllTenantsAsync();
+    Task<int> NormalizeLegacyGuildIdsAsync();
 }

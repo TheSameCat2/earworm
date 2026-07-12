@@ -36,7 +36,9 @@ RUN apt-get update \
 # remove it first before creating our own at the same UID. The `|| true` keeps
 # the build going if Microsoft ever drops that default in a future image.
 RUN (userdel -r ubuntu 2>/dev/null || true) \
- && useradd --system --create-home --uid 1000 earworm
+ && useradd --system --create-home --user-group --uid 1000 earworm \
+ && mkdir -p /data \
+ && chown earworm:earworm /data
 
 WORKDIR /app
 COPY --from=build /app/publish .
@@ -48,6 +50,6 @@ VOLUME ["/data"]
 USER earworm
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
-    CMD curl -fsSL http://localhost:8080/health || exit 1
+    CMD curl -fsSL http://localhost:8080/live || exit 1
 
 ENTRYPOINT ["dotnet", "Earworm.dll"]

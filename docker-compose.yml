@@ -3,7 +3,9 @@ services:
     # fredboat/lavalink:dev tracks the v4 development branch of Lavalink —
     # current and actively maintained, with voice gateway v8 support that
     # the in-process DSharpPlus.VoiceNext path never got.
-    image: fredboat/lavalink:dev
+    # Override LAVALINK_IMAGE with an immutable tag or digest in production.
+    # The default preserves existing development deployments.
+    image: "${LAVALINK_IMAGE:-fredboat/lavalink:dev}"
     container_name: earworm-lavalink
     restart: unless-stopped
     environment:
@@ -40,6 +42,7 @@ services:
     image: earworm:latest
     container_name: earworm
     restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       lavalink:
         condition: service_healthy
@@ -63,6 +66,11 @@ services:
       # In compose Lavalink reaches the bot at http://earworm:8080 via the
       # shared docker network. host.docker.internal isn't needed.
       EARWORM_Dj__TtsServeBaseUrl: "http://earworm:8080"
+      # The checked-in YAML uses relative ./data paths for local development.
+      # These explicit container paths match the /data volume below.
+      EARWORM_Persistence__SqlitePath: "/data/earworm.db"
+      EARWORM_Dj__TtsScratchDirectory: "/data/tts"
+      EARWORM_Cache__Directory:         "/data/cache"
       TZ:                         "${TZ:-UTC}"
       DOTNET_RUNNING_IN_CONTAINER: "true"
 

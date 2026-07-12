@@ -16,6 +16,9 @@ namespace Earworm.Discord.Commands;
 [WhitelistedGuild]
 public sealed class QueueCommands : ApplicationCommandModule
 {
+    private const int MaxEmbedFieldLength = 1024;
+    private const string QueueTruncatedNotice = "*Additional tracks were omitted to fit Discord's message limit.*";
+
     private readonly PerGuildRegistry<QueueManager> _queues;
     private readonly PerGuildRegistry<PlayerEngine> _players;
     private readonly VoiceManager _voice;
@@ -72,12 +75,12 @@ public sealed class QueueCommands : ApplicationCommandModule
                 ? state.CurrentRequestedByDisplayName ?? "System"
                 : $"<@{state.CurrentRequestedByUserId}>";
 
-            embed.AddField("Now Playing",
+            string nowPlaying =
                 $"**{state.CurrentTitle}**\n" +
                 $"Artist: *{state.CurrentArtist ?? "Unknown"}*\n" +
                 $"Position: `{positionStr} / {durationStr}`\n" +
-                $"Requested By: {requesterStr}",
-                inline: false);
+                $"Requested By: {requesterStr}";
+            embed.AddField("Now Playing", TruncateWithEllipsis(nowPlaying, MaxEmbedFieldLength), inline: false);
         }
         else
         {
@@ -88,6 +91,7 @@ public sealed class QueueCommands : ApplicationCommandModule
         {
             var sb = new StringBuilder();
             int countToShow = Math.Min(queue.Count, 10);
+            bool outputTruncated = false;
             for (int i = 0; i < countToShow; i++)
             {
                 var item = queue[i];
@@ -100,9 +104,44 @@ public sealed class QueueCommands : ApplicationCommandModule
                 string reqStr = string.IsNullOrEmpty(item.RequestedByUserId)
                     ? item.RequestedByDisplayName
                     : $"<@{item.RequestedByUserId}>";
-                sb.AppendLine($"`{i + 1}.` **{item.Title}** - *{item.Artist ?? "Unknown"}* (`{durationStr}`) | Requested by {reqStr}");
+                string line = $"`{i + 1}.` **{item.Title}** - *{item.Artist ?? "Unknown"}* (`{durationStr}`) | Requested by {reqStr}";
+                bool hasMore = i < countToShow - 1 || queue.Count > countToShow;
+                int separatorLength = sb.Length == 0 ? 0 : Environment.NewLine.Length;
+                int noticeReserve = hasMore
+                    ? QueueTruncatedNotice.Length + Environment.NewLine.Length
+                    : 0;
+                int availableForLine = MaxEmbedFieldLength
+                    - sb.Length
+                    - separatorLength
+                    - noticeReserve;
+                if (availableForLine <= 0)
+                {
+                    if (sb.Length > 0) sb.AppendLine();
+                    sb.Append(QueueTruncatedNotice);
+                    outputTruncated = true;
+                    break;
+                }
+
+                if (sb.Length > 0) sb.AppendLine();
+                if (line.Length > availableForLine)
+                {
+                    sb.Append(TruncateWithEllipsis(line, availableForLine));
+                    if (hasMore)
+                    {
+                        sb.AppendLine();
+                        sb.Append(QueueTruncatedNotice);
+                    }
+                    outputTruncated = true;
+                    break;
+                }
+
+                sb.Append(line);
             }
-            if (queue.Count > 10) sb.AppendLine($"\n*... and {queue.Count - 10} more tracks in the queue.*");
+            if (!outputTruncated && queue.Count > countToShow)
+            {
+                sb.AppendLine();
+                sb.Append(QueueTruncatedNotice);
+            }
             embed.AddField("Next Up", sb.ToString(), inline: false);
         }
         else
@@ -111,6 +150,14 @@ public sealed class QueueCommands : ApplicationCommandModule
         }
 
         await ctx.EditResponseAsync(new DiscordWebhookBuilder().AddEmbed(embed));
+    }
+
+    private static string TruncateWithEllipsis(string value, int maxLength)
+    {
+        if (value.Length <= maxLength) return value;
+        if (maxLength <= 0) return string.Empty;
+        if (maxLength == 1) return "…";
+        return value[..(maxLength - 1)] + "…";
     }
 
     [SlashCommand("remove", "Remove a track from the queue at a specific position."), InVoice]
@@ -128,13 +175,13 @@ public sealed class QueueCommands : ApplicationCommandModule
         var gid = ctx.Guild!.Id.ToString();
         var queueManager = _queues.GetOrCreate(gid);
         await queueManager.EnsureInitializedAsync();
-        int index = (int)position - 1;
         int queueCount = queueManager.Count;
-        if (index >= queueCount)
+        if (position > queueCount)
         {
             await ctx.EditResponseAsync(Text($"⚠️ Invalid position. The queue currently only has {queueCount} tracks."));
             return;
         }
+        int index = checked((int)position - 1);
 
         try
         {
@@ -188,7 +235,7 @@ public sealed class QueueCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            await _queues.GetOrCreate(ctx.Guild!.Id.ToString()).SaveSnapshotAsync(ctx.User.Id.ToString());
+            await _players.GetOrCreate(ctx.Guild!.Id.ToString()).SaveSnapshotAsync(ctx.User.Id.ToString());
             await ctx.EditResponseAsync(Text("💾 Saved a snapshot of the current queue. Use `/restore` to reload it at any time!"));
         }
         catch (Exception ex)
@@ -203,10 +250,22 @@ public sealed class QueueCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
         try
         {
-            var restoredState = await _queues.GetOrCreate(ctx.Guild!.Id.ToString()).RestoreSnapshotAsync();
-            if (restoredState == null)
+            var guildId = ctx.Guild!.Id.ToString();
+            var queueManager = _queues.GetOrCreate(guildId);
+            if (!await queueManager.HasSnapshotAsync())
             {
                 await ctx.EditResponseAsync(Text("📂 No saved snapshot to restore."));
+                return;
+            }
+
+            var playerEngine = _players.GetOrCreate(guildId);
+            // PlayerEngine temporarily requeues the old current item before
+            // replacing the queue. If restore fails or races snapshot deletion,
+            // it renews playback from that rollback queue automatically.
+            var restoredState = await playerEngine.RestoreSnapshotAsync();
+            if (restoredState == null)
+            {
+                await ctx.EditResponseAsync(Text("📂 The saved snapshot disappeared before it could be restored."));
                 return;
             }
 
@@ -220,6 +279,12 @@ public sealed class QueueCommands : ApplicationCommandModule
                     return;
                 }
                 await _voice.JoinChannelAsync(memberChannel);
+            }
+            else
+            {
+                // JoinChannelAsync already calls MaybeStartAsync. When the bot is
+                // connected but idle, explicitly wake the existing guild player.
+                await playerEngine.MaybeStartAsync();
             }
 
             await ctx.EditResponseAsync(Text("📂 Snapshot restored. Resuming playback."));

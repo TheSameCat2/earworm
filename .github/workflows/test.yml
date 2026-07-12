@@ -9,6 +9,9 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Allows the image-publishing workflow to make this test suite an explicit
+  # prerequisite instead of racing it in an independent workflow run.
+  workflow_call:
 
 jobs:
   test:

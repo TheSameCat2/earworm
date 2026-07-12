@@ -15,7 +15,9 @@
 #        EARWORM_GEMINI_API_KEY=...
 #        EARWORM_ELEVENLABS_API_KEY=...
 #        LAVALINK_PASSWORD=<a long random string>
-#   5. docker compose up -d
+#        LAVALINK_IMAGE=fredboat/lavalink@sha256:<tested digest>  # recommended
+#   5. mkdir -p data && sudo chown 1000:1000 data
+#   6. docker compose up -d
 #
 # Expected directory layout:
 #   /opt/earworm/
@@ -25,11 +27,13 @@
 #   │   ├── earworm.yaml         (renamed from earworm.example.yaml)
 #   │   └── lavalink/
 #   │       └── application.yml
-#   └── data/                    (created automatically on first run)
+#   └── data/                    (owned by container UID 1000)
 
 services:
   lavalink:
-    image: fredboat/lavalink:dev
+    # Set LAVALINK_IMAGE in .env to an immutable tag or digest for predictable
+    # upgrades. The floating dev tag remains the compatibility default.
+    image: "${LAVALINK_IMAGE:-fredboat/lavalink:dev}"
     container_name: earworm-lavalink
     restart: unless-stopped
     environment:
@@ -59,11 +63,12 @@ services:
   earworm:
     # If you forked and republished to your own GHCR, swap the image owner
     # below. For production, consider pinning to a specific version tag
-    # (e.g. ghcr.io/TheSameCat2/earworm:v1.0.0) for predictable upgrades.
+    # (e.g. ghcr.io/thesamecat2/earworm:1.0.0) for predictable upgrades.
     # :latest is fine for casual self-hosting.
-    image: ghcr.io/TheSameCat2/earworm:latest
+    image: ghcr.io/thesamecat2/earworm:latest
     container_name: earworm
     restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       lavalink:
         condition: service_healthy
@@ -82,6 +87,11 @@ services:
       # Lavalink fetches DJ TTS audio from the bot at this URL — also via
       # service name, on the shared network.
       EARWORM_Dj__TtsServeBaseUrl:  "http://earworm:8080"
+      # Pin runtime state to the mounted /data volume even when the YAML keeps
+      # its local-development ./data defaults.
+      EARWORM_Persistence__SqlitePath: "/data/earworm.db"
+      EARWORM_Dj__TtsScratchDirectory: "/data/tts"
+      EARWORM_Cache__Directory:         "/data/cache"
       TZ:                           "${TZ:-UTC}"
       DOTNET_RUNNING_IN_CONTAINER:  "true"
 

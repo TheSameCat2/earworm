@@ -71,6 +71,38 @@ public sealed class PerGuildRegistryTests
     }
 
     [Fact]
+    public void NumericAliases_ResolveToOneCanonicalInstance()
+    {
+        var reg = new PerGuildRegistry<Tracker>(gid => new Tracker(gid));
+
+        var alias = reg.GetOrCreate("  +00123 ");
+        var canonical = reg.GetOrCreate("123");
+
+        alias.Should().BeSameAs(canonical);
+        alias.GuildId.Should().Be("123");
+    }
+
+    [Fact]
+    public void Block_PreventsResolutionUntilExplicitReadmission()
+    {
+        var reg = new PerGuildRegistry<Tracker>(gid => new Tracker(gid));
+        var first = reg.GetOrCreate("00123");
+
+        reg.Block("123").Should().BeTrue();
+        Action resolveWhileSuspended = () => reg.GetOrCreate("+123");
+        resolveWhileSuspended.Should().Throw<GuildAccessBlockedException>();
+        reg.TryGet("123", out var existing).Should().BeTrue();
+        existing.Should().BeSameAs(first, "lifecycle teardown must still be able to stop the existing instance");
+
+        reg.Evict("123").Should().BeTrue();
+        first.Disposed.Should().BeTrue();
+        resolveWhileSuspended.Should().Throw<GuildAccessBlockedException>();
+
+        reg.Unblock("123").Should().BeTrue();
+        reg.GetOrCreate("123").Should().NotBeSameAs(first);
+    }
+
+    [Fact]
     public void AddInitializer_RunsExactlyOncePerInstance_ForExistingAndFutureGuilds()
     {
         var reg = new PerGuildRegistry<Tracker>(gid => new Tracker(gid));
@@ -101,6 +133,24 @@ public sealed class PerGuildRegistryTests
 
         initRuns.Should().Be(2);
         second.Should().NotBeSameAs(first);
+    }
+
+    [Fact]
+    public void Dispose_RetiresAndDisposesAllCreatedInstances()
+    {
+        var reg = new PerGuildRegistry<Tracker>(gid => new Tracker(gid));
+        var first = reg.GetOrCreate("1");
+        var second = reg.GetOrCreate("2");
+
+        reg.Dispose();
+        reg.Dispose();
+
+        first.Disposed.Should().BeTrue();
+        second.Disposed.Should().BeTrue();
+        reg.CreatedInstances().Should().BeEmpty();
+        reg.TryGet("1", out _).Should().BeFalse();
+        Action recreate = () => reg.GetOrCreate("1");
+        recreate.Should().Throw<ObjectDisposedException>();
     }
 
     [Fact]

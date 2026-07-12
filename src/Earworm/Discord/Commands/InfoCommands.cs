@@ -13,6 +13,9 @@ namespace Earworm.Discord.Commands;
 [WhitelistedGuild]
 public sealed class InfoCommands : ApplicationCommandModule
 {
+    private const int MaxEmbedDescriptionLength = 4096;
+    private const string HistoryTruncatedNotice = "*Additional history entries were omitted to fit Discord's message limit.*";
+
     private readonly IHistoryRepository _history;
     private readonly IMetricsRepository _metrics;
     private readonly EarwormConfig _config;
@@ -30,7 +33,8 @@ public sealed class InfoCommands : ApplicationCommandModule
     {
         await ctx.CreateResponseAsync(InteractionResponseType.DeferredChannelMessageWithSource);
 
-        int finalLimit = Math.Clamp((int)limit, 1, Math.Max(1, _config.Persistence.HistoryMaxN));
+        int configuredMax = Math.Max(1, _config.Persistence.HistoryMaxN);
+        int finalLimit = (int)Math.Clamp(limit, 1L, configuredMax);
         var history = await _history.GetRecentHistoryAsync(ctx.Guild!.Id.ToString(), finalLimit);
 
         var embed = new DiscordEmbedBuilder()
@@ -54,7 +58,30 @@ public sealed class InfoCommands : ApplicationCommandModule
                 string reqStr = string.IsNullOrEmpty(entry.RequestedByUserId)
                     ? entry.RequestedByDisplayName ?? "System"
                     : $"<@{entry.RequestedByUserId}>";
-                sb.AppendLine($"`{i + 1}.` **{entry.Title}** - *{entry.Artist ?? "Unknown"}* (`{durationStr}`) | {timeAgo} | Requested by {reqStr}");
+                string line = $"`{i + 1}.` **{entry.Title}** - *{entry.Artist ?? "Unknown"}* (`{durationStr}`) | {timeAgo} | Requested by {reqStr}";
+                bool hasMore = i < history.Count - 1;
+                int noticeReserve = hasMore
+                    ? HistoryTruncatedNotice.Length + Environment.NewLine.Length
+                    : 0;
+                int availableForLine = MaxEmbedDescriptionLength
+                    - sb.Length
+                    - Environment.NewLine.Length
+                    - noticeReserve;
+
+                if (availableForLine <= 0)
+                {
+                    sb.Append(HistoryTruncatedNotice);
+                    break;
+                }
+
+                if (line.Length > availableForLine)
+                {
+                    sb.AppendLine(TruncateWithEllipsis(line, availableForLine));
+                    if (hasMore) sb.Append(HistoryTruncatedNotice);
+                    break;
+                }
+
+                sb.AppendLine(line);
             }
             embed.WithDescription(sb.ToString());
         }
@@ -150,5 +177,13 @@ public sealed class InfoCommands : ApplicationCommandModule
         if (ts.TotalHours < 24) return $"{(int)ts.TotalHours} hours ago";
         if (ts.TotalDays < 2) return "yesterday";
         return $"{(int)ts.TotalDays} days ago";
+    }
+
+    private static string TruncateWithEllipsis(string value, int maxLength)
+    {
+        if (value.Length <= maxLength) return value;
+        if (maxLength <= 0) return string.Empty;
+        if (maxLength == 1) return "…";
+        return value[..(maxLength - 1)] + "…";
     }
 }

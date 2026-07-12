@@ -15,6 +15,9 @@ namespace Earworm.Discord.Commands;
 [OwnerOnly]
 public sealed class AdminCommands : ApplicationCommandModule
 {
+    private const int MaxEmbedDescriptionLength = 4096;
+    private const string TenantListTruncatedNotice = "*Additional tenant servers were omitted to fit Discord's message limit.*";
+
     private readonly ITenantService _tenantService;
     private readonly TenantLifecycleListener _lifecycle;
 
@@ -35,7 +38,7 @@ public sealed class AdminCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(
             InteractionResponseType.DeferredChannelMessageWithSource,
             new DiscordInteractionResponseBuilder { IsEphemeral = true });
-        if (!ulong.TryParse(guildId, out _))
+        if (!DiscordGuildId.TryNormalize(guildId, out var canonicalGuildId))
         {
             await ctx.EditResponseAsync(Text($"Invalid guild ID `{guildId}` — must be a numeric Discord snowflake."));
             return;
@@ -43,9 +46,8 @@ public sealed class AdminCommands : ApplicationCommandModule
 
         try
         {
-            await _tenantService.AddTenantAsync(guildId, ctx.User.Id.ToString());
-            await _lifecycle.RegisterForGuildAsync(guildId);
-            await ctx.EditResponseAsync(Text($"Server `{guildId}` has been added as a tenant. Slash commands are being registered for it now."));
+            await _lifecycle.AdmitGuildAsync(canonicalGuildId, ctx.User.Id.ToString());
+            await ctx.EditResponseAsync(Text($"Server `{canonicalGuildId}` has been added as a tenant. Slash commands are being registered for it now."));
         }
         catch (Exception ex)
         {
@@ -69,10 +71,31 @@ public sealed class AdminCommands : ApplicationCommandModule
             }
 
             var sb = new StringBuilder();
-            foreach (var t in tenants)
+            for (int i = 0; i < tenants.Count; i++)
             {
-                sb.AppendLine($"• `{t.GuildId}` — plan: **{t.Plan}**, status: **{t.Status}**" +
-                    (t.OwnerUserId is not null ? $", owner: `{t.OwnerUserId}`" : string.Empty));
+                var t = tenants[i];
+                string line = $"• `{t.GuildId}` — plan: **{t.Plan}**, status: **{t.Status}**" +
+                    (t.OwnerUserId is not null ? $", owner: `{t.OwnerUserId}`" : string.Empty);
+                bool hasMore = i < tenants.Count - 1;
+                int noticeReserve = hasMore
+                    ? TenantListTruncatedNotice.Length + Environment.NewLine.Length
+                    : 0;
+                int availableForLine = MaxEmbedDescriptionLength
+                    - sb.Length
+                    - Environment.NewLine.Length
+                    - noticeReserve;
+                if (availableForLine <= 0)
+                {
+                    sb.Append(TenantListTruncatedNotice);
+                    break;
+                }
+                if (line.Length > availableForLine)
+                {
+                    sb.AppendLine(TruncateWithEllipsis(line, availableForLine));
+                    if (hasMore) sb.Append(TenantListTruncatedNotice);
+                    break;
+                }
+                sb.AppendLine(line);
             }
 
             var embed = new DiscordEmbedBuilder()
@@ -97,7 +120,7 @@ public sealed class AdminCommands : ApplicationCommandModule
         await ctx.CreateResponseAsync(
             InteractionResponseType.DeferredChannelMessageWithSource,
             new DiscordInteractionResponseBuilder { IsEphemeral = true });
-        if (!ulong.TryParse(guildId, out _))
+        if (!DiscordGuildId.TryNormalize(guildId, out var canonicalGuildId))
         {
             await ctx.EditResponseAsync(Text($"Invalid guild ID `{guildId}` — must be a numeric Discord snowflake."));
             return;
@@ -105,13 +128,20 @@ public sealed class AdminCommands : ApplicationCommandModule
 
         try
         {
-            await _tenantService.RemoveTenantAsync(guildId);
-            await _lifecycle.DeregisterGuildAsync(guildId);
-            await ctx.EditResponseAsync(Text($"Server `{guildId}` has been suspended and will no longer have access to bot commands."));
+            await _lifecycle.SuspendGuildAsync(canonicalGuildId);
+            await ctx.EditResponseAsync(Text($"Server `{canonicalGuildId}` has been suspended and will no longer have access to bot commands. Its data has been retained for a future re-admit."));
         }
         catch (Exception ex)
         {
             await ctx.EditResponseAsync(Text($"Failed to remove server: {ex.Message}"));
         }
+    }
+
+    private static string TruncateWithEllipsis(string value, int maxLength)
+    {
+        if (value.Length <= maxLength) return value;
+        if (maxLength <= 0) return string.Empty;
+        if (maxLength == 1) return "…";
+        return value[..(maxLength - 1)] + "…";
     }
 }

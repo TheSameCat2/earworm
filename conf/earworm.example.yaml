@@ -9,6 +9,12 @@
 # do nothing and the defaults will apply.
 # ============================================================
 
+Bot:
+  # Discord user IDs allowed to manage the multi-tenant whitelist with
+  # /admin commands. Single-tenant playback works with an empty list, but
+  # add at least one owner before attempting to admit another server.
+  OwnerUserIds: []
+
 Discord:
   # The Discord guild (server) ID earworm runs in. Slash
   # commands register here at startup for instant updates.
@@ -132,11 +138,21 @@ AutoBehavior:
   IdleDisconnectSeconds: 120
 
 Ops:
-  # HTTP port for /health, /metrics, /tts/{id}.
+  # HTTP port for /live, /health, /metrics, /tts/{id}.
   HttpPort: 8080
 
   # Reserved — unused after Lavalink pivot.
   MaxConcurrentDownloads: 2
+
+  # Maximum pending SQLite writes held in memory. When full, callers wait
+  # for the writer to catch up, preventing one tenant from exhausting RAM.
+  WriteQueueCapacity: 1024
+
+  # Active lookups above the concurrency limits wait for capacity. The
+  # pending bound then rejects excess work instead of growing without limit.
+  MaxConcurrentTrackResolutions: 8
+  MaxConcurrentTrackResolutionsPerGuild: 2
+  MaxPendingTrackResolutionsPerGuild: 16
 
 Lavalink:
   # In docker-compose this is "lavalink" (the service name on

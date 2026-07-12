@@ -17,8 +17,17 @@ public sealed class StateStore : IDisposable
     private readonly Task _writeWorkerTask;
     private readonly CancellationTokenSource _cts = new();
     private IWriteJob? _currentJob;
+    private int _pendingWriteCount;
+    private volatile bool _writerHealthy = true;
+    private int _disposed;
 
     public string ConnectionString => _connectionString;
+
+    /// <summary>True while the single-writer worker can service write jobs.</summary>
+    public bool IsWriterHealthy => _writerHealthy && !_writeWorkerTask.IsCompleted;
+
+    /// <summary>Writes waiting for capacity, queued, or currently executing.</summary>
+    public int PendingWriteCount => Interlocked.CompareExchange(ref _pendingWriteCount, 0, 0);
 
     public StateStore(EarwormConfig config, ILogger<StateStore> logger)
     {
@@ -38,12 +47,15 @@ public sealed class StateStore : IDisposable
 
         ApplyDbScopedPragmas();
 
-        // Single-writer write job channel
-        _writeChannel = Channel.CreateUnbounded<IWriteJob>(new UnboundedChannelOptions
+        // Bound the shared writer queue so a burst from one tenant applies
+        // backpressure instead of consuming memory without limit.
+        int capacity = Math.Max(1, _config.Ops.WriteQueueCapacity);
+        _writeChannel = Channel.CreateBounded<IWriteJob>(new BoundedChannelOptions(capacity)
         {
             SingleReader = true,
             SingleWriter = false,
-            AllowSynchronousContinuations = false
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait
         });
 
         // Spin up background single-writer task
@@ -100,14 +112,32 @@ public sealed class StateStore : IDisposable
     public async Task<T> SubmitWriteAsync<T>(Func<SqliteConnection, Task<T>> writeFunc)
     {
         var job = new WriteJob<T>(writeFunc);
-        await _writeChannel.Writer.WriteAsync(job);
+        Interlocked.Increment(ref _pendingWriteCount);
+        try
+        {
+            await _writeChannel.Writer.WriteAsync(job);
+        }
+        catch
+        {
+            Interlocked.Decrement(ref _pendingWriteCount);
+            throw;
+        }
         return await job.Task;
     }
 
     public async Task SubmitWriteAsync(Func<SqliteConnection, Task> writeAction)
     {
         var job = new VoidWriteJob(writeAction);
-        await _writeChannel.Writer.WriteAsync(job);
+        Interlocked.Increment(ref _pendingWriteCount);
+        try
+        {
+            await _writeChannel.Writer.WriteAsync(job);
+        }
+        catch
+        {
+            Interlocked.Decrement(ref _pendingWriteCount);
+            throw;
+        }
         await job.Task;
     }
 
@@ -151,6 +181,7 @@ public sealed class StateStore : IDisposable
                 finally
                 {
                     _currentJob = null;
+                    Interlocked.Decrement(ref _pendingWriteCount);
                 }
 
                 if (++writesSinceVacuum >= writesPerVacuum)
@@ -182,6 +213,7 @@ public sealed class StateStore : IDisposable
         }
         finally
         {
+            _writerHealthy = false;
             _logger.LogInformation("StateStore single-writer worker shutting down.");
         }
     }
@@ -191,35 +223,58 @@ public sealed class StateStore : IDisposable
         _writeChannel.Writer.TryComplete(ex);
 
         var inFlight = System.Threading.Interlocked.Exchange(ref _currentJob, null);
-        inFlight?.Fault(ex);
+        if (inFlight != null)
+        {
+            inFlight.Fault(ex);
+            Interlocked.Decrement(ref _pendingWriteCount);
+        }
 
         while (_writeChannel.Reader.TryRead(out var pending))
         {
             pending.Fault(ex);
+            Interlocked.Decrement(ref _pendingWriteCount);
         }
     }
 
-    private bool _disposed;
-
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
-        // Signal the worker to stop accepting new jobs.
+        // Stop accepting new jobs, then let ReadAllAsync drain every accepted
+        // write. Cancellation is only the bounded-time fallback; cancelling at
+        // the same time as TryComplete discards the very queue we want to save.
         _writeChannel.Writer.TryComplete();
-        _cts.Cancel();
+
+        bool workerStopped = false;
 
         try
         {
-            // Give the worker up to 5s to drain in-flight writes and exit.
+            // Give the worker up to 5s to drain accepted writes and exit.
             // Docker sends SIGTERM with a 10s grace, so 5s leaves headroom
             // for the outer shutdown sequence (Lavalink disconnect, etc.).
-            _writeWorkerTask.Wait(TimeSpan.FromSeconds(5));
+            workerStopped = _writeWorkerTask.Wait(TimeSpan.FromSeconds(5));
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore worker termination exceptions.
+            _logger.LogWarning(ex, "StateStore writer faulted while draining during shutdown.");
+            workerStopped = true;
+        }
+
+        if (!workerStopped)
+        {
+            _logger.LogWarning(
+                "StateStore writer did not drain within 5s; cancelling with {PendingWrites} write(s) pending.",
+                PendingWriteCount);
+            _cts.Cancel();
+            try
+            {
+                workerStopped = _writeWorkerTask.Wait(TimeSpan.FromSeconds(1));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "StateStore writer faulted after shutdown cancellation.");
+                workerStopped = true;
+            }
         }
 
         // WAL checkpoint: flush the write-ahead log into the main database
@@ -227,6 +282,12 @@ public sealed class StateStore : IDisposable
         // TRUNCATE mode to shrink the WAL file to zero.
         try
         {
+            if (!workerStopped)
+            {
+                _logger.LogWarning("Skipping WAL checkpoint because the writer is still executing.");
+                return;
+            }
+
             using var conn = new SqliteConnection(_connectionString);
             conn.Open();
             // Set per-connection pragmas so busy_timeout applies and we don't
@@ -242,8 +303,13 @@ public sealed class StateStore : IDisposable
         {
             _logger.LogWarning(ex, "WAL checkpoint on dispose failed; WAL will be replayed on next open.");
         }
-
-        _cts.Dispose();
+        finally
+        {
+            if (workerStopped)
+            {
+                _cts.Dispose();
+            }
+        }
     }
 
     private interface IWriteJob

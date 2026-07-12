@@ -98,7 +98,7 @@ You can tune the cadence, the persona prompt, the TTS voice and model, all in `c
 
 ## Architecture, in one paragraph
 
-The bot is a .NET 10 program that handles Discord interactions (slash commands, messages, voice-state events) via **DSharpPlus 4.5.1**. The voice/audio half is delegated to a **Lavalink** Java service running in a sibling container — the bot tells Lavalink "play this URL," Lavalink streams Opus to Discord. SQLite holds the queue, history, snapshots, settings, and metrics. ASP.NET Core minimal API serves `/health`, `/metrics`, and `/tts/{id}.mp3` (for the DJ TTS files Lavalink fetches). Gemini and ElevenLabs are reached over HTTPS from inside the bot process.
+The bot is a .NET 10 program that handles Discord interactions (slash commands, messages, voice-state events) via **DSharpPlus 4.5.1**. The voice/audio half is delegated to a **Lavalink** Java service running in a sibling container — the bot tells Lavalink "play this URL," Lavalink streams Opus to Discord. SQLite holds the queue, history, snapshots, settings, and metrics. ASP.NET Core minimal API serves `/live`, `/health`, `/metrics`, and `/tts/{id}.mp3` (for the DJ TTS files Lavalink fetches). Gemini and ElevenLabs are reached over HTTPS from inside the bot process.
 
 Full architecture write-up with a diagram: **[docs/architecture.md](docs/architecture.md)**.
 
@@ -146,7 +146,7 @@ Issues and PRs welcome. The codebase is small (~5,000 lines) and follows fairly 
 - `Domain/Queue/` — queue state + persistence
 - `Domain/DJ/` — Gemini + ElevenLabs + cadence logic
 - `Persistence/` — SQLite schema and repositories
-- `Health/` — the ASP.NET endpoint hosting `/health`, `/tts/{id}`, `/metrics`
+- `Health/` — the ASP.NET endpoint hosting `/live`, `/health`, `/tts/{id}`, `/metrics`
 
 Run `dotnet test` before opening a PR. The CompositionRootTests catch DI wiring bugs that would otherwise blow up at startup.
 

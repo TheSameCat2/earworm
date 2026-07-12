@@ -14,6 +14,7 @@ using Lavalink4NET;
 using Earworm.Config;
 using Earworm.Discord;
 using Earworm.Domain.Tenants;
+using Earworm.Persistence;
 
 namespace Earworm.Health;
 
@@ -21,16 +22,19 @@ namespace Earworm.Health;
 /// In-process ASP.NET Core minimal-API host providing the ops endpoints required
 /// by PRD §11:
 ///
-///   GET /health   → 200 OK when the Discord gateway WebSocket AND the Lavalink
-///                   audio service are ready, else 503. Wired into the Dockerfile
-///                   HEALTHCHECK.
+///   GET /live     → 200 OK while this process can serve HTTP. Used by the
+///                   Docker HEALTHCHECK so an upstream outage does not cause a
+///                   restart loop.
+///   GET /health   → 200 OK when Discord, Lavalink, SQLite's writer, and the
+///                   tenant store are ready, else 503. Existing response fields
+///                   remain stable; additional dependency details are additive.
 ///   GET /metrics  → Prometheus exposition (currently a scaffold — returns 503 or a
 ///                   "metrics disabled" body unless EARWORM_METRICS_ENABLED=true and
 ///                   the exporter is wired up).
 ///
-/// Liveness depth is set deliberately at "gateway connected AND lavalink ready":
-/// shallower checks (process alive) miss zombie states; deeper (voice pipeline
-/// functional) flap during normal voice reconnects.
+/// Readiness is deliberately deeper than liveness: dependency failures are
+/// visible to monitoring without turning a recoverable outage into a restart
+/// loop. Discord zombie/close events clear the gateway readiness bit.
 /// </summary>
 public sealed partial class HealthEndpoint : IAsyncDisposable
 {
@@ -38,6 +42,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
     private readonly DiscordGateway _gateway;
     private readonly IAudioService _audioService;
     private readonly ITenantService _tenants;
+    private readonly StateStore _stateStore;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<HealthEndpoint> _logger;
     private WebApplication? _app;
@@ -47,6 +52,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
         DiscordGateway gateway,
         IAudioService audioService,
         ITenantService tenants,
+        StateStore stateStore,
         ILoggerFactory loggerFactory,
         ILogger<HealthEndpoint> logger)
     {
@@ -54,6 +60,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
         _gateway = gateway;
         _audioService = audioService;
         _tenants = tenants;
+        _stateStore = stateStore;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -64,7 +71,7 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
     public async Task StartAsync()
     {
         int port = _config.Ops.HttpPort;
-        _logger.LogInformation("Starting in-process HTTP host on port {Port} for /health (+ scaffolded /metrics).", port);
+        _logger.LogInformation("Starting in-process HTTP host on port {Port} for /live, /health, and /metrics.", port);
 
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -77,6 +84,11 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
 
         var app = builder.Build();
 
+        // Liveness is deliberately shallow: if the HTTP loop can answer, the
+        // process is alive. Readiness belongs on /health so Discord/Lavalink or
+        // SQLite outages do not make Docker repeatedly restart a healthy process.
+        app.MapGet("/live", () => Results.Ok(new { status = "ok" }));
+
         app.MapGet("/health", async () =>
         {
             bool discordReady = _gateway.IsReady;
@@ -87,31 +99,57 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
 
             string discordStatus = discordReady ? "ok" : "starting";
             string lavalinkStatus = lavalinkReady ? "ok" : "down";
+            bool writerReady = _stateStore.IsWriterHealthy;
+            string writerStatus = writerReady ? "ok" : "down";
+            int pendingWrites = _stateStore.PendingWriteCount;
 
             // Admitted tenants per the whitelist table (status 'active') — the
-            // authoritative count. Best-effort: a transient DB error must NOT flip
-            // liveness, so fall back to -1 and keep status driven purely by the
-            // gateway + lavalink readiness.
+            // authoritative count. A query failure now flips readiness (but not
+            // /live), because serving tenants without access to the whitelist is
+            // not a healthy service state.
             int activeTenants;
+            bool tenantStoreReady;
             try
             {
                 var tenants = await _tenants.GetAllTenantsAsync();
                 activeTenants = tenants.Count(t => string.Equals(t.Status, "active", StringComparison.OrdinalIgnoreCase));
+                tenantStoreReady = true;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to read tenant count for /health.");
                 activeTenants = -1;
+                tenantStoreReady = false;
             }
 
-            if (discordReady && lavalinkReady)
+            string tenantStoreStatus = tenantStoreReady ? "ok" : "down";
+
+            if (discordReady && lavalinkReady && writerReady && tenantStoreReady)
             {
-                return Results.Ok(new { status = "ok", discord = discordStatus, lavalink = lavalinkStatus, tenants = activeTenants });
+                return Results.Ok(new
+                {
+                    status = "ok",
+                    discord = discordStatus,
+                    lavalink = lavalinkStatus,
+                    tenants = activeTenants,
+                    tenantStore = tenantStoreStatus,
+                    writer = writerStatus,
+                    pendingWrites
+                });
             }
 
             string overall = discordReady ? "degraded" : "starting";
             return Results.Json(
-                new { status = overall, discord = discordStatus, lavalink = lavalinkStatus, tenants = activeTenants },
+                new
+                {
+                    status = overall,
+                    discord = discordStatus,
+                    lavalink = lavalinkStatus,
+                    tenants = activeTenants,
+                    tenantStore = tenantStoreStatus,
+                    writer = writerStatus,
+                    pendingWrites
+                },
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         });
 
@@ -173,10 +211,11 @@ public sealed partial class HealthEndpoint : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_app != null)
+        var app = Interlocked.Exchange(ref _app, null);
+        if (app != null)
         {
-            await _app.StopAsync();
-            await _app.DisposeAsync();
+            await app.StopAsync();
+            await app.DisposeAsync();
         }
     }
 }

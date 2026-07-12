@@ -232,15 +232,25 @@ public sealed class PersistenceTests
             // Two guilds can both hold a track at position 0 — UNIQUE is per-guild.
             await repo.AddTrackAsync(new QueueItem
             {
-                SourceType = "youtube", SourceId = "a", Title = "A", Artist = "x",
-                RequestedByUserId = "u", RequestedByDisplayName = "U",
-                QueuedAt = DateTimeOffset.UtcNow, GuildId = "gA"
+                SourceType = "youtube",
+                SourceId = "a",
+                Title = "A",
+                Artist = "x",
+                RequestedByUserId = "u",
+                RequestedByDisplayName = "U",
+                QueuedAt = DateTimeOffset.UtcNow,
+                GuildId = "gA"
             });
             await repo.AddTrackAsync(new QueueItem
             {
-                SourceType = "youtube", SourceId = "b", Title = "B", Artist = "x",
-                RequestedByUserId = "u", RequestedByDisplayName = "U",
-                QueuedAt = DateTimeOffset.UtcNow, GuildId = "gB"
+                SourceType = "youtube",
+                SourceId = "b",
+                Title = "B",
+                Artist = "x",
+                RequestedByUserId = "u",
+                RequestedByDisplayName = "U",
+                QueuedAt = DateTimeOffset.UtcNow,
+                GuildId = "gB"
             });
 
             (await repo.GetQueueAsync("gA")).Should().ContainSingle().Which.SourceId.Should().Be("a");
@@ -254,7 +264,10 @@ public sealed class PersistenceTests
             // Playback state is keyed per guild.
             await repo.UpdatePlaybackStateAsync("gB", new PlaybackState
             {
-                IsPlaying = true, CurrentSourceId = "b", VoiceGuildId = "gB", UpdatedAt = DateTimeOffset.UtcNow
+                IsPlaying = true,
+                CurrentSourceId = "b",
+                VoiceGuildId = "gB",
+                UpdatedAt = DateTimeOffset.UtcNow
             });
             (await repo.GetPlaybackStateAsync("gA")).IsPlaying.Should().BeFalse();
             (await repo.GetPlaybackStateAsync("gB")).IsPlaying.Should().BeTrue();
@@ -330,20 +343,30 @@ public sealed class PersistenceTests
             var restoredQueue = restored.Value.QueueItems;
 
             // Assert restorations
-            restoredPlay.IsPlaying.Should().BeTrue();
-            restoredPlay.CurrentSourceId.Should().Be("playing_in_snapshot");
-            restoredPlay.CurrentPositionMs.Should().Be(45000);
+            restoredPlay.IsPlaying.Should().BeFalse();
+            restoredPlay.CurrentSourceId.Should().BeNull();
+            restoredPlay.CurrentPositionMs.Should().Be(0);
 
-            restoredQueue.Should().HaveCount(1);
-            restoredQueue[0].SourceId.Should().Be("queued_in_snapshot");
+            restoredQueue.Should().HaveCount(2);
+            restoredQueue[0].SourceId.Should().Be("playing_in_snapshot");
             restoredQueue[0].Position.Should().Be(0);
+            restoredQueue[1].SourceId.Should().Be("queued_in_snapshot");
+            restoredQueue[1].Position.Should().Be(1);
 
             // Check db active states are updated
             var dbPlay = await queueRepo.GetPlaybackStateAsync(G);
-            dbPlay.CurrentSourceId.Should().Be("playing_in_snapshot");
+            dbPlay.CurrentSourceId.Should().BeNull("the saved current track is queued until playback really starts");
 
             var dbQueue = await queueRepo.GetQueueAsync(G);
-            dbQueue.Should().HaveCount(1);
+            dbQueue.Select(q => q.SourceId).Should().Equal("playing_in_snapshot", "queued_in_snapshot");
+
+            // Saving before voice playback starts must not capture position 0
+            // as both playback_state.current_* and snapshot_queue.
+            await snapshotRepo.SaveSnapshotAsync(G, "admin2");
+            await queueRepo.ClearQueueAsync(G);
+            var secondRestore = await snapshotRepo.RestoreSnapshotAsync(G);
+            secondRestore!.Value.QueueItems.Select(q => q.SourceId)
+                .Should().Equal("playing_in_snapshot", "queued_in_snapshot");
 
             // Act: Clear snapshot
             await snapshotRepo.ClearSnapshotAsync(G);
@@ -352,7 +375,7 @@ public sealed class PersistenceTests
     }
 
     [Fact]
-    public async Task SnapshotRepository_RestoreIsFieldIdenticalToSavedState()
+    public async Task SnapshotRepository_RestoreRequeuesCurrentAndPersistsIdlePlaybackState()
     {
         await RunTestWithDbAsync(async stateStore =>
         {
@@ -434,47 +457,149 @@ public sealed class PersistenceTests
             restored.Should().NotBeNull();
 
             var ps = restored!.Value.PlaybackState;
-            ps.IsPlaying.Should().Be(originalState.IsPlaying);
-            ps.IsPaused.Should().Be(originalState.IsPaused);
-            ps.CurrentSourceType.Should().Be(originalState.CurrentSourceType);
-            ps.CurrentSourceId.Should().Be(originalState.CurrentSourceId);
-            ps.CurrentTitle.Should().Be(originalState.CurrentTitle);
-            ps.CurrentArtist.Should().Be(originalState.CurrentArtist);
-            ps.CurrentDurationSeconds.Should().Be(originalState.CurrentDurationSeconds);
-            ps.CurrentRequestedByUserId.Should().Be(originalState.CurrentRequestedByUserId);
-            ps.CurrentRequestedByDisplayName.Should().Be(originalState.CurrentRequestedByDisplayName);
-            ps.CurrentPositionMs.Should().Be(originalState.CurrentPositionMs);
+            ps.IsPlaying.Should().BeFalse();
+            ps.IsPaused.Should().BeFalse();
+            ps.CurrentSourceType.Should().BeNull();
+            ps.CurrentSourceId.Should().BeNull();
+            ps.CurrentTitle.Should().BeNull();
+            ps.CurrentArtist.Should().BeNull();
+            ps.CurrentDurationSeconds.Should().BeNull();
+            ps.CurrentRequestedByUserId.Should().BeNull();
+            ps.CurrentRequestedByDisplayName.Should().BeNull();
+            ps.CurrentPositionMs.Should().Be(0);
             ps.VoiceChannelId.Should().Be(originalState.VoiceChannelId);
             ps.VoiceGuildId.Should().Be(originalState.VoiceGuildId);
 
             var qi = restored.Value.QueueItems;
-            qi.Should().HaveCount(2);
-            qi[0].SourceType.Should().Be(item1.SourceType);
-            qi[0].SourceId.Should().Be(item1.SourceId);
-            qi[0].Title.Should().Be(item1.Title);
-            qi[0].Artist.Should().Be(item1.Artist);
-            qi[0].DurationSeconds.Should().Be(item1.DurationSeconds);
-            qi[0].RequestedByUserId.Should().Be(item1.RequestedByUserId);
-            qi[0].RequestedByDisplayName.Should().Be(item1.RequestedByDisplayName);
-            qi[0].QueuedAt.ToUnixTimeMilliseconds().Should().Be(item1.QueuedAt.ToUnixTimeMilliseconds());
-            qi[0].GuildId.Should().Be(item1.GuildId);
+            qi.Should().HaveCount(3);
+            qi[0].SourceType.Should().Be(originalState.CurrentSourceType);
+            qi[0].SourceId.Should().Be(originalState.CurrentSourceId);
+            qi[0].Title.Should().Be(originalState.CurrentTitle);
+            qi[0].Artist.Should().Be(originalState.CurrentArtist);
+            qi[0].DurationSeconds.Should().Be(originalState.CurrentDurationSeconds);
+            qi[0].RequestedByUserId.Should().Be(originalState.CurrentRequestedByUserId);
+            qi[0].RequestedByDisplayName.Should().Be(originalState.CurrentRequestedByDisplayName);
             qi[0].Position.Should().Be(0);
 
-            qi[1].SourceType.Should().Be(item2.SourceType);
-            qi[1].SourceId.Should().Be(item2.SourceId);
-            qi[1].Title.Should().BeNull();
-            qi[1].Artist.Should().BeNull();
-            qi[1].DurationSeconds.Should().BeNull();
-            qi[1].RequestedByUserId.Should().Be(item2.RequestedByUserId);
-            qi[1].RequestedByDisplayName.Should().Be(item2.RequestedByDisplayName);
-            qi[1].QueuedAt.ToUnixTimeMilliseconds().Should().Be(item2.QueuedAt.ToUnixTimeMilliseconds());
-            qi[1].GuildId.Should().Be(item2.GuildId);
+            qi[1].SourceType.Should().Be(item1.SourceType);
+            qi[1].SourceId.Should().Be(item1.SourceId);
+            qi[1].Title.Should().Be(item1.Title);
+            qi[1].Artist.Should().Be(item1.Artist);
+            qi[1].DurationSeconds.Should().Be(item1.DurationSeconds);
+            qi[1].RequestedByUserId.Should().Be(item1.RequestedByUserId);
+            qi[1].RequestedByDisplayName.Should().Be(item1.RequestedByDisplayName);
+            qi[1].QueuedAt.ToUnixTimeMilliseconds().Should().Be(item1.QueuedAt.ToUnixTimeMilliseconds());
+            qi[1].GuildId.Should().Be(item1.GuildId);
             qi[1].Position.Should().Be(1);
+
+            qi[2].SourceType.Should().Be(item2.SourceType);
+            qi[2].SourceId.Should().Be(item2.SourceId);
+            qi[2].Title.Should().BeNull();
+            qi[2].Artist.Should().BeNull();
+            qi[2].DurationSeconds.Should().BeNull();
+            qi[2].RequestedByUserId.Should().Be(item2.RequestedByUserId);
+            qi[2].RequestedByDisplayName.Should().Be(item2.RequestedByDisplayName);
+            qi[2].QueuedAt.ToUnixTimeMilliseconds().Should().Be(item2.QueuedAt.ToUnixTimeMilliseconds());
+            qi[2].GuildId.Should().Be(item2.GuildId);
+            qi[2].Position.Should().Be(2);
 
             // Also verify no-snapshot case returns null without side effects
             await snapshotRepo.ClearSnapshotAsync(G);
             var noRestore = await snapshotRepo.RestoreSnapshotAsync(G);
             noRestore.Should().BeNull();
+        });
+    }
+
+    [Fact]
+    public async Task SnapshotRepository_DensifiesGappedQueuePositions_WhilePreservingOrder()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            const string G = "gapped_snapshot";
+            var queueRepo = new QueueRepository(stateStore);
+            var snapshotRepo = new SnapshotRepository(stateStore);
+
+            var ids = new List<long>();
+            for (int i = 0; i < 4; i++)
+            {
+                ids.Add(await queueRepo.AddTrackAsync(new QueueItem
+                {
+                    SourceType = "youtube",
+                    SourceId = $"queued_{i}",
+                    Title = $"Queued {i}",
+                    RequestedByUserId = "user",
+                    RequestedByDisplayName = "User",
+                    QueuedAt = DateTimeOffset.UtcNow.AddSeconds(i),
+                    GuildId = G
+                }));
+            }
+
+            // Normal dequeues/removes intentionally leave persisted gaps. The
+            // remaining live queue is ordered queued_2, queued_3 at positions 2, 3.
+            await queueRepo.RemoveTrackAsync(ids[0]);
+            await queueRepo.RemoveTrackAsync(ids[1]);
+            (await queueRepo.GetQueueAsync(G)).Select(item => item.Position).Should().Equal(2, 3);
+
+            await queueRepo.UpdatePlaybackStateAsync(G, new PlaybackState
+            {
+                IsPlaying = true,
+                CurrentSourceType = "youtube",
+                CurrentSourceId = "playing",
+                CurrentTitle = "Playing",
+                CurrentRequestedByUserId = "user",
+                CurrentRequestedByDisplayName = "User",
+                VoiceGuildId = G,
+                UpdatedAt = DateTimeOffset.UtcNow
+            });
+
+            await snapshotRepo.SaveSnapshotAsync(G, "admin");
+
+            // New snapshots are stored densely even when the live queue is not.
+            using (var read = stateStore.CreateConnection())
+            {
+                await read.OpenAsync();
+                using var cmd = read.CreateCommand();
+                cmd.CommandText = @"
+                    SELECT position FROM snapshot_queue
+                    WHERE snapshot_guild_id = $guildId
+                    ORDER BY position;
+                ";
+                cmd.Parameters.AddWithValue("$guildId", G);
+                using var reader = await cmd.ExecuteReaderAsync();
+                var savedPositions = new List<int>();
+                while (await reader.ReadAsync()) savedPositions.Add(reader.GetInt32(0));
+                savedPositions.Should().Equal(0, 1);
+            }
+
+            // Simulate a snapshot written by an older release, which copied the
+            // live queue's gapped positions verbatim. Restore must repair those
+            // persisted snapshots too, not only snapshots saved after upgrade.
+            await stateStore.SubmitWriteAsync(async connection =>
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = @"
+                    UPDATE snapshot_queue
+                    SET position = (position * 3) + 5
+                    WHERE snapshot_guild_id = $guildId;
+                ";
+                cmd.Parameters.AddWithValue("$guildId", G);
+                await cmd.ExecuteNonQueryAsync();
+            });
+
+            await queueRepo.ClearQueueAsync(G);
+            var restored = await snapshotRepo.RestoreSnapshotAsync(G);
+
+            restored.Should().NotBeNull();
+            restored!.Value.QueueItems.Select(item => item.SourceId)
+                .Should().Equal("playing", "queued_2", "queued_3");
+            restored.Value.QueueItems.Select(item => item.Position)
+                .Should().Equal(0, 1, 2);
+
+            var persisted = await queueRepo.GetQueueAsync(G);
+            persisted.Select(item => item.SourceId)
+                .Should().Equal("playing", "queued_2", "queued_3");
+            persisted.Select(item => item.Position)
+                .Should().Equal(0, 1, 2);
         });
     }
 
@@ -589,15 +714,23 @@ public sealed class PersistenceTests
                 await repo.AddHistoryEntryAsync(new PlayHistoryEntry
                 {
                     PlayedAt = DateTimeOffset.UtcNow.AddSeconds(i),
-                    SourceType = "youtube", SourceId = $"a{i}", Title = $"A{i}",
-                    RequestedByUserId = "u", RequestedByDisplayName = "U", GuildId = "gA"
+                    SourceType = "youtube",
+                    SourceId = $"a{i}",
+                    Title = $"A{i}",
+                    RequestedByUserId = "u",
+                    RequestedByDisplayName = "U",
+                    GuildId = "gA"
                 }, retentionCount: 2);
             }
             await repo.AddHistoryEntryAsync(new PlayHistoryEntry
             {
                 PlayedAt = DateTimeOffset.UtcNow,
-                SourceType = "youtube", SourceId = "b0", Title = "B0",
-                RequestedByUserId = "u", RequestedByDisplayName = "U", GuildId = "gB"
+                SourceType = "youtube",
+                SourceId = "b0",
+                Title = "B0",
+                RequestedByUserId = "u",
+                RequestedByDisplayName = "U",
+                GuildId = "gB"
             }, retentionCount: 2);
 
             // guildA pruned to 2; guildB's single entry untouched by guildA's prune.
@@ -956,17 +1089,13 @@ public sealed class PersistenceTests
     }
 
     [Fact]
-    public async Task TenantRepository_RemoveTenantAsync_PurgesHistoryAndSoftDeletes_WithoutRollingBack()
+    public async Task TenantRepository_RemoveTenantAsync_SuspendsAndRetainsHistory_ForReadmission()
     {
-        // Regression for the wrong table name in RemoveTenantAsync: the migration
-        // schema creates the play-history table as `history`, but the purge loop
-        // referenced `play_history`. That made the whole soft-delete transaction
-        // roll back, so /admin remove-server failed and the tenant was never
-        // suspended. This test seeds a tenant + history row and asserts the
-        // removal commits (history purged, tenant suspended) rather than throwing.
+        // Suspending access must not delete user data; a later add-server should
+        // reactivate the same tenant state.
         await RunTestWithDbAsync(async stateStore =>
         {
-            const string G = "guild-tenant-1";
+            const string G = "123456789";
 
             var tenants = new TenantRepository(stateStore);
             var history = new HistoryRepository(stateStore);
@@ -993,15 +1122,141 @@ public sealed class PersistenceTests
             // the transaction with a SQLite "no such table" error).
             await tenants.RemoveTenantAsync(G);
 
-            // Assert: the soft-delete committed.
+            // Assert: suspension committed without purging history.
             (await tenants.IsAdmittedAsync(G)).Should().BeFalse("tenant is suspended after removal");
             var all = await tenants.GetAllTenantsAsync();
             var row = all.Should().ContainSingle(t => t.GuildId == G).Which;
             row.Status.Should().Be("suspended");
 
-            // And the per-guild history was purged from the correctly-named table.
+            // Re-admission returns the retained state to service.
             var remaining = await history.GetRecentHistoryAsync(G, 10);
-            remaining.Should().BeEmpty("RemoveTenantAsync must purge the `history` table");
+            remaining.Should().ContainSingle("suspension must retain tenant data for a lossless re-admit");
+
+            await tenants.AddTenantAsync(G, ownerUserId: "owner-2");
+            (await tenants.IsAdmittedAsync(G)).Should().BeTrue();
+            (await history.GetRecentHistoryAsync(G, 10)).Should().ContainSingle();
+        });
+    }
+
+    [Fact]
+    public async Task QueueRepository_MoveTrack_RewritesSafelyWhenPersistedPositionsHaveFrontGaps()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            const string G = "gapped";
+            var repo = new QueueRepository(stateStore);
+            var ids = new List<long>();
+            for (int i = 0; i < 5; i++)
+            {
+                ids.Add(await repo.AddTrackAsync(new QueueItem
+                {
+                    SourceType = "youtube",
+                    SourceId = $"track_{i}",
+                    RequestedByUserId = "u",
+                    RequestedByDisplayName = "User",
+                    QueuedAt = DateTimeOffset.UtcNow,
+                    GuildId = G
+                }));
+            }
+
+            await repo.RemoveTrackAsync(ids[0]);
+            await repo.RemoveTrackAsync(ids[1]);
+
+            // Persisted positions are [2,3,4]. The old partial rewrite tried
+            // to assign dense position 2 while the unaffected first row still
+            // occupied it, violating UNIQUE(guild_id, position).
+            await repo.MoveTrackAsync(G, ids[3], 2);
+
+            var moved = await repo.GetQueueAsync(G);
+            moved.Select(item => item.SourceId).Should().Equal("track_2", "track_4", "track_3");
+            moved.Select(item => item.Position).Should().Equal(0, 1, 2);
+        });
+    }
+
+    [Fact]
+    public async Task TenantRepository_NormalizeLegacyGuildIdsAsync_MovesTenantAndPerGuildDataAtomically()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            const string Alias = "0012345";
+            const string Canonical = "12345";
+            var tenants = new TenantRepository(stateStore);
+            var history = new HistoryRepository(stateStore);
+
+            await stateStore.SubmitWriteAsync(async connection =>
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = @"
+                    INSERT INTO tenants (guild_id, owner_user_id, plan, status, created_at)
+                    VALUES ($guild, 'owner', 'free', 'active', 1);
+                    INSERT INTO settings (guild_id, key, value, updated_at)
+                    VALUES ($guild, 'dj_enabled', 'true', 1);
+                    INSERT INTO snapshot (guild_id, saved_at) VALUES ($guild, 1);
+                    INSERT INTO snapshot_queue (
+                        snapshot_guild_id, position, source_type, source_id,
+                        requested_by_user_id, requested_by_display_name, queued_at)
+                    VALUES ($guild, 0, 'youtube', 'saved', 'user', 'User', 1);
+                ";
+                cmd.Parameters.AddWithValue("$guild", Alias);
+                await cmd.ExecuteNonQueryAsync();
+            });
+            await history.AddHistoryEntryAsync(new PlayHistoryEntry
+            {
+                PlayedAt = DateTimeOffset.UtcNow,
+                SourceType = "youtube",
+                SourceId = "legacy",
+                RequestedByUserId = "user",
+                RequestedByDisplayName = "User",
+                GuildId = Alias,
+            }, retentionCount: 10);
+
+            (await tenants.NormalizeLegacyGuildIdsAsync()).Should().Be(1);
+            (await tenants.GetAllTenantsAsync()).Should().ContainSingle()
+                .Which.GuildId.Should().Be(Canonical);
+            (await history.GetRecentHistoryAsync(Canonical, 10)).Should().ContainSingle();
+
+            using var read = stateStore.CreateConnection();
+            await read.OpenAsync();
+            using var settings = read.CreateCommand();
+            settings.CommandText = "SELECT COUNT(*) FROM settings WHERE guild_id = $guild;";
+            settings.Parameters.AddWithValue("$guild", Canonical);
+            Convert.ToInt64(await settings.ExecuteScalarAsync()).Should().Be(1);
+
+            using var snapshot = read.CreateCommand();
+            snapshot.CommandText = @"
+                SELECT COUNT(*) FROM snapshot_queue
+                WHERE snapshot_guild_id = $guild;
+            ";
+            snapshot.Parameters.AddWithValue("$guild", Canonical);
+            Convert.ToInt64(await snapshot.ExecuteScalarAsync()).Should().Be(1,
+                "the deferred snapshot foreign key must move with its tenant");
+
+            (await tenants.NormalizeLegacyGuildIdsAsync()).Should().Be(0, "canonical databases are a no-op");
+        });
+    }
+
+    [Fact]
+    public async Task TenantRepository_NormalizeLegacyGuildIdsAsync_FailsClosedOnAliasCollision()
+    {
+        await RunTestWithDbAsync(async stateStore =>
+        {
+            var tenants = new TenantRepository(stateStore);
+            await stateStore.SubmitWriteAsync(async connection =>
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = @"
+                    INSERT INTO tenants (guild_id, plan, status, created_at) VALUES ('00123', 'free', 'active', 1);
+                    INSERT INTO tenants (guild_id, plan, status, created_at) VALUES ('123', 'free', 'suspended', 2);
+                ";
+                await cmd.ExecuteNonQueryAsync();
+            });
+
+            Func<Task> normalize = () => tenants.NormalizeLegacyGuildIdsAsync();
+            await normalize.Should().ThrowAsync<TenantIdentityNormalizationException>();
+
+            (await tenants.GetAllTenantsAsync())
+                .Select(tenant => tenant.GuildId)
+                .Should().BeEquivalentTo(new[] { "00123", "123" }, "a collision must not partially merge identities");
         });
     }
 }

@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
+using NSubstitute;
 using Xunit;
 using Earworm.Config;
 using Earworm.Domain.Queue;
@@ -216,7 +217,7 @@ public sealed class QueueManagerTests
     [Fact]
     public async Task RequeueFrontAsync_TrackQueuedEvent_PayloadAtPositionZero_AndQueueContainsItemAtIndexZero()
     {
-        await RunWithQueueManagerAsync(async (manager, _) =>
+        await RunWithQueueManagerAsync(async (manager, queueRepo) =>
         {
             // Seed the queue with 3 other tracks so position 0 is non-trivial.
             for (int i = 0; i < 3; i++)
@@ -251,7 +252,87 @@ public sealed class QueueManagerTests
             queue[0].SourceId.Should().Be("rewind_payload");
             queue[0].Position.Should().Be(0);
             queue[0].QueueItemId.Should().Be(observed.QueueItemId);
+
+            var persisted = await queueRepo.GetQueueAsync("g1");
+            persisted.Select(q => q.SourceId).Should().Equal(queue.Select(q => q.SourceId));
+            persisted.Select(q => q.Position).Should().Equal(Enumerable.Range(0, persisted.Count));
         });
+    }
+
+    [Fact]
+    public async Task Mutations_WhenPersistenceFails_LeaveInMemoryQueueUnchanged()
+    {
+        static QueueItem Seed(long id, int position, string sourceId) => new()
+        {
+            QueueItemId = id,
+            Position = position,
+            SourceType = "youtube",
+            SourceId = sourceId,
+            Title = sourceId,
+            Artist = "Artist",
+            DurationSeconds = 60,
+            RequestedByUserId = "u",
+            RequestedByDisplayName = "U",
+            QueuedAt = DateTimeOffset.UtcNow,
+            GuildId = "g1"
+        };
+
+        static QueueManager CreateManager(IQueueRepository repository, IReadOnlyCollection<QueueItem> seed)
+        {
+            repository.GetQueueAsync("g1").Returns(Task.FromResult(seed.ToList()));
+            return new QueueManager(
+                repository,
+                Substitute.For<ISnapshotRepository>(),
+                BuildConfig(),
+                NullLogger<QueueManager>.Instance,
+                "g1");
+        }
+
+        var expected = new[] { Seed(1, 0, "a"), Seed(2, 1, "b"), Seed(3, 2, "c") };
+        var failure = new IOException("simulated persistence failure");
+
+        async Task VerifyAsync(
+            Action<IQueueRepository> arrangeFailure,
+            Func<QueueManager, Task> mutation,
+            IReadOnlyCollection<QueueItem>? initial = null)
+        {
+            var repo = Substitute.For<IQueueRepository>();
+            var seeded = initial ?? expected;
+            arrangeFailure(repo);
+            using var manager = CreateManager(repo, seeded);
+            await manager.EnsureInitializedAsync();
+            var before = manager.GetQueue();
+
+            Func<Task> act = () => mutation(manager);
+            await act.Should().ThrowAsync<IOException>();
+
+            manager.GetQueue().Should().BeEquivalentTo(before, options => options.WithStrictOrdering());
+        }
+
+        await VerifyAsync(
+            repo => repo.AddTrackAsync(Arg.Any<QueueItem>()).Returns(Task.FromException<long>(failure)),
+            manager => manager.AddTrackAsync("youtube", "new", "New", "Artist", 60, "u", "U", "g1"),
+            Array.Empty<QueueItem>());
+
+        await VerifyAsync(
+            repo => repo.RemoveTrackAsync(2).Returns(Task.FromException(failure)),
+            manager => manager.RemoveTrackAsync(1, "u", isDj: true));
+
+        await VerifyAsync(
+            repo => repo.MoveTrackAsync("g1", 1, 2).Returns(Task.FromException(failure)),
+            manager => manager.MoveTrackAsync(0, 2));
+
+        await VerifyAsync(
+            repo => repo.ClearQueueAsync("g1").Returns(Task.FromException(failure)),
+            manager => manager.ClearQueueAsync());
+
+        await VerifyAsync(
+            repo => repo.RemoveTrackAsync(1).Returns(Task.FromException(failure)),
+            async manager => { await manager.DequeueAsync(); });
+
+        await VerifyAsync(
+            repo => repo.AddTrackAtFrontAsync(Arg.Any<QueueItem>()).Returns(Task.FromException<long>(failure)),
+            manager => manager.RequeueFrontAsync(expected[0]));
     }
 
     [Fact]
@@ -416,5 +497,46 @@ public sealed class QueueManagerTests
             initField.Should().NotBeNull();
             ((bool)initField!.GetValue(manager)!).Should().BeTrue("RestoreSnapshotAsync must mark the manager initialized");
         });
+    }
+
+    [Fact]
+    public async Task RetireAsync_DrainsAcceptedMutation_ThenRejectsDelayedOldReferences()
+    {
+        var repository = Substitute.For<IQueueRepository>();
+        repository.GetQueueAsync("g1").Returns(new List<QueueItem>());
+        var writeStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWrite = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+        repository.AddTrackAsync(Arg.Any<QueueItem>()).Returns(_ =>
+        {
+            writeStarted.TrySetResult();
+            return releaseWrite.Task;
+        });
+        var manager = new QueueManager(
+            repository,
+            Substitute.For<ISnapshotRepository>(),
+            BuildConfig(),
+            NullLogger<QueueManager>.Instance,
+            "g1");
+
+        var add = manager.AddTrackAsync("youtube", "a", "A", "Artist", 60, "u", "User", "g1");
+        await writeStarted.Task;
+        var retire = manager.RetireAsync();
+        retire.IsCompleted.Should().BeFalse("retirement must wait for an accepted persistence mutation");
+
+        releaseWrite.SetResult(1);
+        await add;
+        await retire;
+
+        Func<Task> lateAdd = () => manager.AddTrackAsync("youtube", "b", "B", "Artist", 60, "u", "User", "g1");
+        await lateAdd.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*retired*");
+
+        Action lateQueueRead = () => manager.GetQueue();
+        lateQueueRead.Should().Throw<InvalidOperationException>()
+            .WithMessage("*retired*");
+
+        Action lateCountRead = () => _ = manager.Count;
+        lateCountRead.Should().Throw<InvalidOperationException>()
+            .WithMessage("*retired*");
     }
 }

@@ -43,6 +43,10 @@ Bot:
 |---|:-:|---|---|
 | `OwnerUserIds` | for multi-tenant | `[]` | Discord user IDs allowed to run `/admin …` (whitelist management). Without at least one, no one can admit new tenant guilds. |
 
+Single-tenant playback remains valid with the default empty list. Before adding
+a second guild, configure at least one owner ID and restart Earworm so someone
+can run `/admin add-server` and recover from tenant-management mistakes.
+
 ### `Discord`
 
 ```yaml
@@ -165,6 +169,13 @@ Persistence:
 | `BackupIntervalHours` | `24` | Reserved for SQLite backup automation (not yet implemented). |
 | `BackupRetentionCount` | `7` | Reserved (not yet implemented). |
 
+The reference compose files override the three `./data` paths to absolute
+`/data/...` paths that match their volume mount. An existing deployment that
+mounts state at `/app/data` should keep its relative YAML paths; it does not
+need a migration. Because SQLite runs in WAL mode, never take a live backup by
+copying only `earworm.db`; follow the quiesced-directory procedure in
+[Deployment](deployment.md#backups).
+
 ### `AutoBehavior`
 
 ```yaml
@@ -186,12 +197,20 @@ Set either to a very large number to effectively disable that behavior.
 Ops:
   HttpPort: 8080
   MaxConcurrentDownloads: 2
+  WriteQueueCapacity: 1024
+  MaxConcurrentTrackResolutions: 8
+  MaxConcurrentTrackResolutionsPerGuild: 2
+  MaxPendingTrackResolutionsPerGuild: 16
 ```
 
 | Key | Default | Description |
 |---|---|---|
-| `HttpPort` | `8080` | Port the in-process HTTP host listens on for `/health`, `/metrics`, `/tts/{id}.mp3` |
+| `HttpPort` | `8080` | Port the in-process HTTP host listens on for `/live`, `/health`, `/metrics`, `/tts/{id}.mp3` |
 | `MaxConcurrentDownloads` | `2` | Reserved (no longer used after Lavalink pivot — Lavalink manages its own concurrency). |
+| `WriteQueueCapacity` | `1024` | Maximum pending SQLite write jobs held in memory. When full, callers wait for the writer to catch up. Values below `1` are clamped to `1`. |
+| `MaxConcurrentTrackResolutions` | `8` | Process-wide limit for concurrent Lavalink track lookups. Additional requests wait; they are not rejected. |
+| `MaxConcurrentTrackResolutionsPerGuild` | `2` | Per-guild track-lookup limit. When the global limit is above one, values at or above it are clamped to one below the global limit so one tenant cannot reserve every slot. |
+| `MaxPendingTrackResolutionsPerGuild` | `16` | Additional lookups allowed to wait behind a guild's active limit. Requests above this bound fail fast instead of accumulating unbounded work. Negative values are treated as `0`. |
 
 ---
 

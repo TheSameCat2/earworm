@@ -26,7 +26,10 @@
     <PackageReference Include="Lavalink4NET" Version="4.2.1" />
     <PackageReference Include="Lavalink4NET.DSharpPlus" Version="4.2.1" />
     <PackageReference Include="Lavalink4NET.InactivityTracking" Version="4.2.1" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <!-- Override the transitive native SQLite bundle to a build containing the
+         upstream fix for GHSA-2m69-gcr7-jv3q. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
     <PackageReference Include="NetEscapades.Configuration.Yaml" Version="3.1.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.0" />

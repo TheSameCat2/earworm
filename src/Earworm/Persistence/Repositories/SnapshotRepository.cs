@@ -90,7 +90,9 @@ public sealed class SnapshotRepository : ISnapshotRepository
                     copyQueueCmd.CommandText = @"
                         INSERT INTO snapshot_queue (snapshot_guild_id, position, source_type, source_id, title, artist,
                                                    duration_seconds, requested_by_user_id, requested_by_display_name, queued_at)
-                        SELECT $guildId, position, source_type, source_id, title, artist,
+                        SELECT $guildId,
+                               ROW_NUMBER() OVER (ORDER BY position ASC) - 1,
+                               source_type, source_id, title, artist,
                                duration_seconds, requested_by_user_id, requested_by_display_name, queued_at
                         FROM queue
                         WHERE guild_id = $guildId;
@@ -144,13 +146,45 @@ public sealed class SnapshotRepository : ISnapshotRepository
                     await clearQueueCmd.ExecuteNonQueryAsync();
                 }
 
+                // The actively playing track is not present in snapshot_queue.
+                // Replay it from the beginning at position zero, ahead of the
+                // saved upcoming list.
+                using (var restoreCurrentCmd = connection.CreateCommand())
+                {
+                    restoreCurrentCmd.Transaction = transaction;
+                    restoreCurrentCmd.CommandText = @"
+                        INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
+                                           requested_by_user_id, requested_by_display_name, queued_at, guild_id)
+                        SELECT 0,
+                               COALESCE(current_source_type, 'unknown'),
+                               current_source_id,
+                               current_title,
+                               current_artist,
+                               current_duration_seconds,
+                               COALESCE(current_requested_by_user_id, ''),
+                               COALESCE(current_requested_by_display_name, 'Snapshot'),
+                               $queuedAt,
+                               $guildId
+                        FROM snapshot
+                        WHERE guild_id = $guildId
+                          AND current_source_id IS NOT NULL;
+                    ";
+                    restoreCurrentCmd.Parameters.AddWithValue("$guildId", guildId);
+                    restoreCurrentCmd.Parameters.AddWithValue("$queuedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    await restoreCurrentCmd.ExecuteNonQueryAsync();
+                }
+
                 using (var copyQueueCmd = connection.CreateCommand())
                 {
                     copyQueueCmd.Transaction = transaction;
                     copyQueueCmd.CommandText = @"
                         INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
                                            requested_by_user_id, requested_by_display_name, queued_at, guild_id)
-                        SELECT position, source_type, source_id, title, artist, duration_seconds,
+                        SELECT ROW_NUMBER() OVER (ORDER BY position ASC) - 1 + CASE WHEN EXISTS (
+                                   SELECT 1 FROM snapshot
+                                   WHERE guild_id = $guildId AND current_source_id IS NOT NULL
+                               ) THEN 1 ELSE 0 END,
+                               source_type, source_id, title, artist, duration_seconds,
                                requested_by_user_id, requested_by_display_name, queued_at, $guildId
                         FROM snapshot_queue
                         WHERE snapshot_guild_id = $guildId;
@@ -159,7 +193,9 @@ public sealed class SnapshotRepository : ISnapshotRepository
                     await copyQueueCmd.ExecuteNonQueryAsync();
                 }
 
-                // Ensure a playback_state row exists for the guild, then copy from the snapshot.
+                // The saved current track was reinserted at queue position zero.
+                // Persist playback as idle until PlayerEngine actually starts it;
+                // otherwise a save-before-join duplicates it as both current and queued.
                 using (var ensureCmd = connection.CreateCommand())
                 {
                     ensureCmd.Transaction = transaction;
@@ -174,16 +210,16 @@ public sealed class SnapshotRepository : ISnapshotRepository
                     copyPlayCmd.Transaction = transaction;
                     copyPlayCmd.CommandText = @"
                         UPDATE playback_state
-                        SET is_playing = CASE WHEN sn.current_source_id IS NOT NULL THEN 1 ELSE 0 END,
+                        SET is_playing = 0,
                             is_paused = 0,
-                            current_source_type = sn.current_source_type,
-                            current_source_id = sn.current_source_id,
-                            current_title = sn.current_title,
-                            current_artist = sn.current_artist,
-                            current_duration_seconds = sn.current_duration_seconds,
-                            current_requested_by_user_id = sn.current_requested_by_user_id,
-                            current_requested_by_display_name = sn.current_requested_by_display_name,
-                            current_position_ms = COALESCE(sn.current_position_ms, 0),
+                            current_source_type = NULL,
+                            current_source_id = NULL,
+                            current_title = NULL,
+                            current_artist = NULL,
+                            current_duration_seconds = NULL,
+                            current_requested_by_user_id = NULL,
+                            current_requested_by_display_name = NULL,
+                            current_position_ms = 0,
                             voice_channel_id = sn.voice_channel_id,
                             voice_guild_id = sn.voice_guild_id,
                             updated_at = $updatedAt

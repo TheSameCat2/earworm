@@ -73,6 +73,7 @@ Look at the reply message — it'll tell you why. Common ones:
 
 - "You must be in a voice channel to queue music." → join voice first.
 - "Playlist queuing is restricted to DJs" → use a single-track URL or get DJ.
+- "Private or local track URLs are not allowed" → Earworm intentionally blocks direct internal-network audio URLs. Use a publicly reachable source; the bot-generated DJ TTS route is handled separately and is unaffected.
 - "Couldn't queue that: ..." → Lavalink couldn't resolve the URL. See "Music doesn't play" below.
 
 ---

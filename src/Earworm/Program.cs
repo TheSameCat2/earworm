@@ -66,14 +66,15 @@ public static class Program
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($"Configuration error: {ex.Message}");
             Console.ResetColor();
-            Environment.Exit(1);
+            Environment.ExitCode = 1;
+            return;
         }
 
         Console.ForegroundColor = ConsoleColor.Green;
         Console.WriteLine("Configuration loaded and verified successfully.");
         Console.ResetColor();
 
-        // ValidateConfig above already exits the process if the token is missing,
+        // ValidateConfig above already rejects startup if the token is missing,
         // so the environment variable is guaranteed non-null here. Reading it
         // again (rather than carrying a value through ValidateConfig) keeps the
         // two code paths independent and avoids a dead "PLACEHOLDER" fallback.
@@ -88,6 +89,25 @@ public static class Program
         await using var serviceProvider = services.BuildServiceProvider();
         var logger = serviceProvider.GetRequiredService<ILogger<object>>();
         var shutdownLifetime = serviceProvider.GetRequiredService<ShutdownLifetime>();
+
+        // Install signal handlers before any startup operation that can block or
+        // retry. Lavalink retry is intentionally unbounded, so SIGTERM/SIGINT
+        // must be able to cancel it even before startup completes.
+        var shutdownRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            logger.LogInformation("Shutdown requested (SIGINT).");
+            shutdownLifetime.Cancel();
+            shutdownRequested.TrySetResult();
+        };
+        using var sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+        {
+            ctx.Cancel = true;
+            logger.LogInformation("Shutdown requested (SIGTERM).");
+            shutdownLifetime.Cancel();
+            shutdownRequested.TrySetResult();
+        });
 
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
@@ -111,7 +131,7 @@ public static class Program
             var migrationLogger = serviceProvider.GetRequiredService<ILogger<SchemaMigrator>>();
             new SchemaMigrator(stateStore.ConnectionString, migrationLogger).Migrate();
 
-            if (ulong.TryParse(earwormConfig.Discord.GuildId, out _))
+            if (DiscordGuildId.TryNormalize(earwormConfig.Discord.GuildId, out _))
             {
                 await BackfillLegacyTenantAsync(stateStore.ConnectionString, earwormConfig);
             }
@@ -119,12 +139,22 @@ public static class Program
             {
                 logger.LogWarning("Skipped tenant backfill: Discord.GuildId '{GuildId}' is not a valid numeric snowflake.", earwormConfig.Discord.GuildId);
             }
+
+            var tenantService = serviceProvider.GetRequiredService<ITenantService>();
+            int normalizedTenants = await tenantService.NormalizeLegacyGuildIdsAsync();
+            if (normalizedTenants > 0)
+            {
+                logger.LogInformation("Canonicalized {Count} legacy tenant guild ID(s).", normalizedTenants);
+            }
         }
         catch (Exception ex)
         {
             logger.LogCritical(ex, "Database migration failed. Shutting down.");
-            Environment.Exit(1);
+            Environment.ExitCode = 1;
+            return;
         }
+
+        if (shutdownLifetime.IsShuttingDown) return;
 
         // Slash commands. UseSlashCommands accepts a ServiceProvider; command
         // classes are resolved from it per-invocation. Registration is per active
@@ -132,8 +162,19 @@ public static class Program
         var slash = client.UseSlashCommands(new SlashCommandsConfiguration { Services = serviceProvider });
 
         var lifecycle = serviceProvider.GetRequiredService<TenantLifecycleListener>();
-        lifecycle.Attach(slash);
-        await lifecycle.RegisterStartupCommandsAsync();
+        try
+        {
+            lifecycle.Attach(slash);
+            await lifecycle.RegisterStartupCommandsAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(ex, "Slash command registration failed. Shutting down.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        if (shutdownLifetime.IsShuttingDown) return;
 
         // Convert failed command checks (not-whitelisted, not-DJ, …) into an
         // ephemeral reply instead of a silent no-op.
@@ -200,8 +241,11 @@ public static class Program
         catch (Exception ex)
         {
             logger.LogCritical(ex, "Failed to start in-process HTTP host. Shutting down.");
-            Environment.Exit(1);
+            Environment.ExitCode = 1;
+            return;
         }
+
+        if (shutdownLifetime.IsShuttingDown) return;
 
         // TTS scratch directory: sweep orphans from any previous crash, then
         // start the periodic retention loop.
@@ -244,19 +288,29 @@ public static class Program
         catch (Exception ex)
         {
             logger.LogCritical(ex, "Per-guild engine initialization failed. Shutting down.");
-            Environment.Exit(1);
+            Environment.ExitCode = 1;
+            return;
         }
+
+        if (shutdownLifetime.IsShuttingDown) return;
 
         // Discord gateway connect.
         var gateway = serviceProvider.GetRequiredService<DiscordGateway>();
         try
         {
-            await gateway.StartAsync();
+            await gateway.StartAsync(shutdownLifetime.Token);
+            await lifecycle.ClearSuspendedGuildCommandsAsync();
+        }
+        catch (OperationCanceledException) when (shutdownLifetime.IsShuttingDown)
+        {
+            logger.LogWarning("Discord Gateway startup cancelled because shutdown was requested.");
+            return;
         }
         catch (Exception ex)
         {
             logger.LogCritical(ex, "Failed to start Discord Gateway. Shutting down.");
-            Environment.Exit(1);
+            Environment.ExitCode = 1;
+            return;
         }
 
         // Lavalink connect. Must come AFTER Discord client is connected so
@@ -277,34 +331,17 @@ public static class Program
         catch (Exception ex)
         {
             logger.LogCritical(ex, "Failed to start Lavalink audio service after retries. Is the Lavalink server running and reachable?");
-            Environment.Exit(1);
+            Environment.ExitCode = 1;
+            return;
         }
 
-        logger.LogInformation("earworm services started. Press Ctrl+C to shut down.");
-
-        var tcs = new TaskCompletionSource();
-        Console.CancelKeyPress += (sender, e) =>
+        if (!shutdownLifetime.IsShuttingDown)
         {
-            e.Cancel = true;
-            logger.LogInformation("Shutdown requested (SIGINT).");
-            shutdownLifetime.Cancel();
-            tcs.TrySetResult();
-        };
-        // Docker `stop` sends SIGTERM, not SIGINT. Without this handler the
-        // runtime exits immediately, skipping the shutdown block below — which
-        // leaves SQLite WAL un-checkpointed and the Discord/Lavalink sessions
-        // dangling until container kill.
-        using var sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
-        {
-            ctx.Cancel = true;
-            logger.LogInformation("Shutdown requested (SIGTERM).");
-            shutdownLifetime.Cancel();
-            tcs.TrySetResult();
-        });
-
-        await tcs.Task;
-
+            logger.LogInformation("earworm services started. Press Ctrl+C to shut down.");
+            await shutdownRequested.Task;
+        }
         logger.LogInformation("Shutting down...");
+        shutdownLifetime.Cancel();
 
         try { await audioService.StopAsync(); }
         catch (Exception ex) { logger.LogError(ex, "Error stopping Lavalink audio service."); }
@@ -462,7 +499,16 @@ public static class Program
             try
             {
                 logger.LogInformation("Connecting to Lavalink (attempt {Attempt})...", attempt);
-                await audioService.StartAsync();
+                var startTask = audioService.StartAsync().AsTask();
+                try
+                {
+                    await startTask.WaitAsync(shutdownLifetime.Token);
+                }
+                catch (OperationCanceledException) when (shutdownLifetime.Token.IsCancellationRequested)
+                {
+                    _ = ObserveCancelledLavalinkStartAsync(startTask, audioService, logger);
+                    throw;
+                }
                 logger.LogInformation("Lavalink audio service started.");
                 return;
             }
@@ -493,6 +539,22 @@ public static class Program
         }
     }
 
+    private static async Task ObserveCancelledLavalinkStartAsync(
+        Task startTask,
+        IAudioService audioService,
+        ILogger logger)
+    {
+        try
+        {
+            await startTask;
+            await audioService.StopAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Canceled Lavalink startup completed with an expected late failure.");
+        }
+    }
+
     /// <summary>
     /// One-time multi-tenant backfill run after migration 004: rewrites the
     /// sentinel '' guild_id rows the migration left behind to the configured
@@ -501,11 +563,34 @@ public static class Program
     /// </summary>
     private static async Task BackfillLegacyTenantAsync(string connectionString, EarwormConfig config)
     {
-        var guildId = config.Discord.GuildId;
+        var guildId = DiscordGuildId.Normalize(config.Discord.GuildId, nameof(config.Discord.GuildId));
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection(connectionString);
         await conn.OpenAsync();
+
+        // This is a migration bridge, not a permanent admission mechanism. Seed
+        // only a database that still contains the sentinel rows created by
+        // migration 004 (fresh databases contain them too). Once the sentinel
+        // is gone, even an empty tenants table must not cause YAML to silently
+        // re-admit a guild.
+        bool hasLegacySentinel;
+        using (var sentinelCmd = conn.CreateCommand())
+        {
+            sentinelCmd.CommandText = @"
+                SELECT EXISTS(SELECT 1 FROM playback_state   WHERE guild_id = '') OR
+                       EXISTS(SELECT 1 FROM snapshot         WHERE guild_id = '') OR
+                       EXISTS(SELECT 1 FROM settings         WHERE guild_id = '') OR
+                       EXISTS(SELECT 1 FROM metrics_global   WHERE guild_id = '') OR
+                       EXISTS(SELECT 1 FROM metrics_per_user WHERE guild_id = '');
+            ";
+            hasLegacySentinel = Convert.ToInt64(await sentinelCmd.ExecuteScalarAsync()) != 0;
+        }
+
+        if (!hasLegacySentinel)
+        {
+            return;
+        }
 
         // All three steps run as one atomic unit. Each is individually idempotent
         // (so a re-run after a crash still converges), but the transaction means no
@@ -581,8 +666,14 @@ public static class Program
         // then fails ulong.TryParse downstream, which silently skips the tenant
         // backfill AND registers commands for zero guilds — the bot comes up but
         // admits and serves nobody. Fail fast instead.
-        if (!ulong.TryParse(config.Discord.GuildId, out _))
+        if (!DiscordGuildId.TryNormalize(config.Discord.GuildId, out _))
             throw new InvalidOperationException($"discord.guild_id must be a numeric Discord snowflake; got '{config.Discord.GuildId}'.");
+
+        foreach (var ownerUserId in config.Bot.OwnerUserIds)
+        {
+            if (!ulong.TryParse(ownerUserId?.Trim(), out var parsedOwnerId) || parsedOwnerId == 0)
+                throw new InvalidOperationException($"Bot.OwnerUserIds contains an invalid Discord user ID: '{ownerUserId}'.");
+        }
 
         if (string.IsNullOrWhiteSpace(config.Dj.Tts.VoiceId) || config.Dj.Tts.VoiceId.Contains("REQUIRED"))
             throw new InvalidOperationException("dj.tts.voice_id is required in conf/earworm.yaml.");

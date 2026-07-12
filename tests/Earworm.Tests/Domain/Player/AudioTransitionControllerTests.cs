@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
@@ -80,5 +82,89 @@ public sealed class AudioTransitionControllerTests
         // the controller's internal logic: no volume calls are made when disabled.
         // The actual player interaction is tested via integration tests.
         controller.Cancel();
+    }
+
+    [Fact]
+    public async Task NonFadedTrack_RestoresFullVolume_WhenPriorTrackOwnedAFade()
+    {
+        var controller = BuildController(BuildConfig(crossfadeSeconds: 5, minTrackSeconds: 15));
+        var volumeCalls = new List<float>();
+        Func<float, CancellationToken, ValueTask> setVolume = (volume, _) =>
+        {
+            volumeCalls.Add(volume);
+            return ValueTask.CompletedTask;
+        };
+
+        var prepare = typeof(AudioTransitionController).GetMethod(
+            "PrepareMusicVolumeAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        prepare.Should().NotBeNull();
+
+        // The first (long) track gives the controller ownership and mutes for
+        // its head fade. A short/unknown next track must undo the tail fade.
+        await (Task)prepare!.Invoke(
+            controller,
+            new object[] { true, setVolume, CancellationToken.None })!;
+        await (Task)prepare.Invoke(
+            controller,
+            new object[] { false, setVolume, CancellationToken.None })!;
+
+        // Once restored, another non-faded track must remain untouched so a
+        // future user-controlled volume setting is not overwritten.
+        await (Task)prepare.Invoke(
+            controller,
+            new object[] { false, setVolume, CancellationToken.None })!;
+
+        volumeCalls.Should().Equal(0f, 1f);
+    }
+
+    [Fact]
+    public async Task NewTrackVolumeHandoff_WaitsForPriorInFlightWrite()
+    {
+        var controller = BuildController(BuildConfig(crossfadeSeconds: 5, minTrackSeconds: 15));
+        var volumeCalls = new List<float>();
+        var oldWriteEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOldWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newWriteEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Func<float, CancellationToken, ValueTask> oldSetVolume = async (volume, _) =>
+        {
+            volumeCalls.Add(volume);
+            oldWriteEntered.TrySetResult();
+            await releaseOldWrite.Task;
+        };
+        Func<float, CancellationToken, ValueTask> newSetVolume = (volume, _) =>
+        {
+            volumeCalls.Add(volume);
+            newWriteEntered.TrySetResult();
+            return ValueTask.CompletedTask;
+        };
+
+        var prepare = typeof(AudioTransitionController).GetMethod(
+            "PrepareMusicVolumeAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        prepare.Should().NotBeNull();
+
+        // Simulate the old monitor's REST response remaining in flight while a
+        // short next track tries to restore full volume. The new value must not
+        // be sent until the stale request finishes, which guarantees it remains
+        // Lavalink's final volume even if the old response is delayed.
+        var oldWrite = (Task)prepare!.Invoke(
+            controller,
+            new object[] { true, oldSetVolume, CancellationToken.None })!;
+        await oldWriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var newWrite = (Task)prepare.Invoke(
+            controller,
+            new object[] { false, newSetVolume, CancellationToken.None })!;
+
+        await Task.Delay(50);
+        newWriteEntered.Task.IsCompleted.Should().BeFalse(
+            "the next track must wait for a stale in-flight volume request");
+
+        releaseOldWrite.TrySetResult();
+        await Task.WhenAll(oldWrite, newWrite).WaitAsync(TimeSpan.FromSeconds(2));
+
+        volumeCalls.Should().Equal(0f, 1f);
     }
 }

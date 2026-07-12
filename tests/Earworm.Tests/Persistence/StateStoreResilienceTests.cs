@@ -58,6 +58,7 @@ public sealed class StateStoreResilienceTests
             var workerTaskField = typeof(StateStore).GetField("_writeWorkerTask", BindingFlags.Instance | BindingFlags.NonPublic);
             var workerTask = (Task)workerTaskField!.GetValue(store)!;
             (await Task.WhenAny(workerTask, Task.Delay(TimeSpan.FromSeconds(2)))).Should().Be(workerTask, "worker should exit after cancel");
+            store.IsWriterHealthy.Should().BeFalse();
 
             // After worker death the channel must be completed; the next submission
             // must fault quickly (not hang forever waiting on a dead TCS).
@@ -110,6 +111,50 @@ public sealed class StateStoreResilienceTests
             var done = await Task.WhenAny(good, Task.Delay(TimeSpan.FromSeconds(2)));
             done.Should().Be(good, "worker must survive a single bad job");
             (await good).Should().Be(42);
+            store.IsWriterHealthy.Should().BeTrue();
+            store.PendingWriteCount.Should().Be(0);
+        }
+        finally
+        {
+            Cleanup(store, dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task Dispose_DrainsAllAcceptedWrites_BeforeStoppingWorker()
+    {
+        var (store, dbPath) = BuildStore();
+        try
+        {
+            var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            int executed = 0;
+
+            var writes = Enumerable.Range(0, 20)
+                .Select(i => store.SubmitWriteAsync(async _ =>
+                {
+                    if (i == 0)
+                    {
+                        firstStarted.TrySetResult();
+                        await releaseFirst.Task;
+                    }
+                    Interlocked.Increment(ref executed);
+                }))
+                .ToArray();
+
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            store.PendingWriteCount.Should().Be(20);
+
+            var disposeTask = Task.Run(store.Dispose);
+            disposeTask.IsCompleted.Should().BeFalse("the first accepted write is still running");
+
+            releaseFirst.TrySetResult();
+            await disposeTask.WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.WhenAll(writes);
+
+            executed.Should().Be(20);
+            store.PendingWriteCount.Should().Be(0);
+            store.IsWriterHealthy.Should().BeFalse();
         }
         finally
         {

@@ -74,7 +74,7 @@ Persistence/
     SchemaMigrator.cs      # idempotent migration runner
     Migrations/*.sql       # versioned schema changes
 Health/
-  HealthEndpoint.cs        # ASP.NET minimal API — /health, /metrics, /tts/{id}
+  HealthEndpoint.cs        # ASP.NET minimal API — /live, /health, /metrics, /tts/{id}
 ```
 
 ### The core flow: "play this track"
@@ -137,7 +137,7 @@ We use the plain `LavalinkPlayer` (no queue) and drive it one track at a time fr
 5. **Run SQLite migrations** — idempotent; new schemas get applied, existing DBs are unchanged.
 6. **Hydrate QueueManager** from SQLite — any tracks that were pending when the bot last shut down come back.
 7. **Wire the DJ pre-track hook** into `PlayerEngine`.
-8. **Start the ASP.NET HTTP host** (`/health`, `/metrics`, `/tts/{id}`).
+8. **Start the ASP.NET HTTP host** (`/live`, `/health`, `/metrics`, `/tts/{id}`).
 9. **Eager-resolve event-handler singletons** (`MessageListener`, `NowPlayingPoster`, `VoiceManager`, `TrackFailureHandler`) so their ctor-time event subscriptions are wired before Discord events fire.
 10. **Connect Discord gateway**.
 11. **Start Lavalink connection** — must come after step 10 because Lavalink4NET needs the bot's user ID for its handshake.
@@ -173,12 +173,20 @@ The `cache_index` table is a leftover from the pre-Lavalink era and isn't used b
 
 Migrations live in `Persistence/Schema/Migrations/*.sql`, applied in filename-sorted order by `SchemaMigrator`. Each is wrapped in a transaction and recorded in a `schema_versions` table; re-runs are no-ops.
 
+Writes flow through one bounded process-wide channel
+(`Ops.WriteQueueCapacity`, default 1024). The single reader preserves SQLite's
+one-writer discipline; the bound applies backpressure during tenant bursts
+instead of allowing pending work to consume memory without limit. `/health`
+reports writer state and the pending-write count. Filesystem backups must
+quiesce the process and copy the complete state directory because the database
+runs in WAL mode; a live copy of `earworm.db` alone is not a valid snapshot.
+
 ## Multi-tenancy
 
 earworm serves a whitelist of Discord guilds simultaneously. Each admitted guild ("tenant") gets its own queue, playback state, snapshot, settings, history, and metrics — fully isolated.
 
 - **Admission**: the `tenants` table (status `active` | `suspended`) is the whitelist. Bot owners (`Bot.OwnerUserIds`) manage it via `/admin add-server | list-servers | remove-server`. `ITenantService.IsAdmittedAsync` is the gate; the `[WhitelistedGuild]` class attribute enforces it on every user-facing command module, and `MessageListener` checks it before serving an @mention.
-- **Per-guild engines**: `PerGuildRegistry<T>` (`Infrastructure/PerGuildRegistry.cs`) lazily constructs and caches one instance per guild of each stateful engine — `QueueManager`, `PlayerEngine`, `DJEngine`, `AudioTransitionController`. It wraps each value in `Lazy<T>` with `ExecutionAndPublication` so a concurrent first-access race can't build two `PlayerEngine`s and leak a Lavalink subscription.
+- **Per-guild engines**: `PerGuildRegistry<T>` (`Infrastructure/PerGuildRegistry.cs`) lazily constructs and caches one instance per guild of each stateful engine — `QueueManager`, `PlayerEngine`, `DJEngine`, `AudioTransitionController`. A lock serializes construction, initialization, suspension blocking, and eviction so concurrent first access cannot build duplicate engines or leak Lavalink subscriptions.
 - **The single shared `IAudioService`**: Lavalink4NET's audio service is one process-wide singleton, so every per-guild `PlayerEngine` subscribes to the same global `TrackEnded`. Each engine filters by `e.Player.GuildId != _guildId` — that filter is the event-routing mechanism, not dead defensiveness.
 - **Global event bridges**: `VoiceManager`, `NowPlayingPoster`, and `TrackFailureHandler` stay process-wide singletons but subscribe to *every* per-guild engine via `PerGuildRegistry<PlayerEngine>.AddInitializer`, which runs the subscription callback against existing instances and all future ones, exactly once each.
 - **Persistence**: every table carries `guild_id`; composite primary keys and `UNIQUE(guild_id, …)` constraints scope rows per guild (migration `004_multi_tenant.sql`). The legacy single-guild `Discord.GuildId` is a one-time seed only — a post-migrate backfill in `Program.cs` rewrites the pre-migration rows to it and seeds its `tenants` row.
@@ -227,7 +235,9 @@ The `TtsServeBaseUrl` config key handles the routing weirdness:
 
 A few "could be better" things that are deliberately not:
 
-- **No connection pooling for SQLite**. We use a single connection guarded by a single-writer channel. The bot's load is tiny.
+- **No custom connection pool for SQLite writes**. We use one persistent writer
+  connection behind a bounded single-writer channel. Read operations still use
+  short-lived `Microsoft.Data.Sqlite` connections.
 - **The `cleanup` callback in `TtsPreroll` is fire-and-forget on completion**. A crash between Lavalink finishing and cleanup running leaks a file. `TtsScratchJanitor` sweeps orphans on startup and on a periodic timer (`Dj.TtsScratchMaxAgeMinutes` / `Dj.TtsScratchMaxFiles`), so leaks are bounded regardless of restart frequency.
 - **Health endpoint has no auth**. It's only bound to `127.0.0.1` on the host via the compose `ports:` config, so external traffic can't reach it.
 

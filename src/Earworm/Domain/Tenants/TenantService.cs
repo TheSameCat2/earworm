@@ -14,14 +14,22 @@ public sealed class TenantService : ITenantService
     }
 
     public Task<bool> IsAdmittedAsync(string guildId) =>
-        _repository.IsAdmittedAsync(guildId);
+        DiscordGuildId.TryNormalize(guildId, out var canonicalGuildId)
+            ? _repository.IsAdmittedAsync(canonicalGuildId)
+            : Task.FromResult(false);
 
     public Task AddTenantAsync(string guildId, string? ownerUserId) =>
-        _repository.AddTenantAsync(guildId, ownerUserId);
+        _repository.AddTenantAsync(
+            DiscordGuildId.Normalize(guildId, nameof(guildId)),
+            ownerUserId);
 
     public Task RemoveTenantAsync(string guildId) =>
-        _repository.RemoveTenantAsync(guildId);
+        _repository.RemoveTenantAsync(
+            DiscordGuildId.Normalize(guildId, nameof(guildId)));
 
     public Task<IReadOnlyList<TenantRow>> GetAllTenantsAsync() =>
         _repository.GetAllTenantsAsync();
+
+    public Task<int> NormalizeLegacyGuildIdsAsync() =>
+        _repository.NormalizeLegacyGuildIdsAsync();
 }

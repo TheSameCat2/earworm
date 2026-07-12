@@ -147,4 +147,23 @@ public sealed record OpsConfig
 {
     public int HttpPort { get; init; } = 8080;
     public int MaxConcurrentDownloads { get; init; } = 2;
+
+    /// <summary>
+    /// Maximum number of SQLite write jobs that may wait in memory. Producers
+    /// apply backpressure when this bound is reached instead of allowing one
+    /// noisy tenant to grow the process without limit.
+    /// </summary>
+    public int WriteQueueCapacity { get; init; } = 1024;
+
+    /// <summary>Process-wide limit for concurrent Lavalink track resolutions.</summary>
+    public int MaxConcurrentTrackResolutions { get; init; } = 8;
+
+    /// <summary>Per-guild limit for concurrent Lavalink track resolutions.</summary>
+    public int MaxConcurrentTrackResolutionsPerGuild { get; init; } = 2;
+
+    /// <summary>
+    /// Maximum additional per-guild track-resolution requests allowed to wait
+    /// behind the active per-guild limit before overload is rejected.
+    /// </summary>
+    public int MaxPendingTrackResolutionsPerGuild { get; init; } = 16;
 }

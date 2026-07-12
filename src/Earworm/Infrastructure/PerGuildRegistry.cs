@@ -1,38 +1,40 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Threading;
+using System.Globalization;
+using System.Linq;
 
 namespace Earworm.Infrastructure;
 
 /// <summary>
-/// Lazily creates and caches one <typeparamref name="T"/> instance per guild.
-/// This is the single abstraction the multi-tenant model leans on: every
-/// stateful per-guild engine (PlayerEngine, QueueManager, DJEngine, ...) is
-/// resolved through a registry keyed by Discord guild id.
-///
-/// Two correctness properties matter here:
-///   1. <b>Exactly-once construction.</b> The value is wrapped in
-///      <see cref="Lazy{T}"/> with <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/>
-///      so a concurrent <see cref="GetOrCreate"/> race can't construct two
-///      instances and discard one. That would be catastrophic for engines that
-///      subscribe to Lavalink events in their constructor - the discarded
-///      instance's subscription would leak and double-handle events.
-///   2. <b>Initializer exactly-once.</b> Global singletons (VoiceManager,
-///      TrackFailureHandler, NowPlayingPoster) need to attach to every per-guild
-///      engine's events, including engines created before AND after they
-///      register. <see cref="AddInitializer"/> runs the callback against all
-///      existing instances and every future one, exactly once each, by holding
-///      a single lock across both the create path and the register path.
+/// Thrown when code attempts to resolve per-guild state after that guild has
+/// been suspended. Callers must explicitly unblock a guild when it is
+/// re-admitted.
 /// </summary>
-public sealed class PerGuildRegistry<T> where T : class
+public sealed class GuildAccessBlockedException : InvalidOperationException
+{
+    public GuildAccessBlockedException(string guildId)
+        : base($"Guild '{guildId}' is suspended; per-guild services cannot be created.")
+    {
+        GuildId = guildId;
+    }
+
+    public string GuildId { get; }
+}
+
+/// <summary>
+/// Lazily creates and caches one <typeparamref name="T"/> instance per guild.
+/// Construction, initialization, blocking, and eviction are serialized so a
+/// suspension cannot race a factory and leave an orphaned subscribed engine.
+/// </summary>
+public sealed class PerGuildRegistry<T> : IDisposable where T : class
 {
     private readonly Func<string, T> _factory;
-    private readonly ConcurrentDictionary<string, Lazy<T>> _instances = new();
+    private readonly Dictionary<string, T> _instances = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _blockedGuilds = new(StringComparer.Ordinal);
     private readonly List<Action<T>> _initializers = new();
     private readonly List<T> _created = new();
-    private readonly object _initLock = new();
-    private int _createReentrantGuard;
+    private readonly object _lock = new();
+    private bool _disposed;
 
     public PerGuildRegistry(Func<string, T> factory)
     {
@@ -40,158 +42,232 @@ public sealed class PerGuildRegistry<T> where T : class
     }
 
     /// <summary>
-    /// Returns the guild's instance, constructing it on first access.
+    /// Returns the guild's instance, constructing and initializing it exactly
+    /// once. Numeric aliases are canonicalized before lookup.
     /// </summary>
     public T GetOrCreate(string guildId)
     {
-        var lazy = _instances.GetOrAdd(
-            guildId,
-            gid => new Lazy<T>(() => Create(gid), LazyThreadSafetyMode.ExecutionAndPublication));
-        return lazy.Value;
+        var key = NormalizeKey(guildId);
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfBlocked(key);
+            if (_instances.TryGetValue(key, out var existing))
+            {
+                return existing;
+            }
+
+            var instance = _factory(key);
+            _instances.Add(key, instance);
+            _created.Add(instance);
+
+            try
+            {
+                foreach (var initializer in _initializers)
+                {
+                    initializer(instance);
+                }
+            }
+            catch
+            {
+                RemoveAndDispose(key, instance);
+                throw;
+            }
+
+            // Initializers are allowed to perform registry lifecycle work. If
+            // one blocked or evicted this guild re-entrantly, never hand the
+            // caller an already-retired instance.
+            if (_blockedGuilds.Contains(key))
+            {
+                RemoveAndDispose(key, instance);
+                throw new GuildAccessBlockedException(key);
+            }
+
+            if (!_instances.TryGetValue(key, out var published) || !ReferenceEquals(published, instance))
+            {
+                RemoveAndDispose(key, instance);
+                throw new InvalidOperationException($"Guild '{key}' was evicted while its services were being initialized.");
+            }
+
+            return instance;
+        }
     }
 
     /// <summary>
     /// Returns the guild's instance only if it has already been constructed,
-    /// without triggering construction.
+    /// without triggering construction. This remains available while blocked
+    /// so lifecycle code can stop the existing engine before evicting it.
     /// </summary>
     public bool TryGet(string guildId, out T instance)
     {
-        if (_instances.TryGetValue(guildId, out var lazy) && lazy.IsValueCreated)
+        var key = NormalizeKey(guildId);
+        lock (_lock)
         {
-            instance = lazy.Value;
-            return true;
+            if (_disposed)
+            {
+                instance = null!;
+                return false;
+            }
+
+            if (_instances.TryGetValue(key, out var existing))
+            {
+                instance = existing;
+                return true;
+            }
+
+            instance = null!;
+            return false;
         }
-        instance = null!;
-        return false;
     }
 
-    /// <summary>
-    /// Snapshot of all instances constructed so far.
-    /// </summary>
     public IReadOnlyList<T> CreatedInstances()
     {
-        lock (_initLock)
+        lock (_lock)
         {
+            if (_disposed) return Array.Empty<T>();
             return _created.ToArray();
         }
     }
 
     /// <summary>
-    /// Registers a callback run exactly once against every instance - those
-    /// already created and all future ones. The factory itself runs outside the
-    /// lock; only the cheap bookkeeping and initializer invocation are guarded,
-    /// which is safe because initializers only do non-reentrant work like
-    /// <c>engine.TrackStarted += handler</c>.
+    /// Registers a callback run exactly once against every existing instance
+    /// and once for each future instance.
     /// </summary>
     public void AddInitializer(Action<T> initializer)
     {
         if (initializer is null) throw new ArgumentNullException(nameof(initializer));
-        lock (_initLock)
+        lock (_lock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             _initializers.Add(initializer);
-            foreach (var inst in _created)
+            foreach (var instance in _created.ToArray())
             {
-                initializer(inst);
+                initializer(instance);
             }
         }
     }
 
     /// <summary>
-    /// Removes a guild's instance and disposes it if it is <see cref="IDisposable"/>. 
-    /// Called when a tenant is removed so per-guild engines — and their
-    /// subscriptions to shared singletons like the audio service — don't linger
-    /// for the process lifetime. Returns true if a constructed instance was
-    /// dropped (and disposed).
+    /// Prevents future <see cref="GetOrCreate"/> calls for a guild. Existing
+    /// instances remain reachable through <see cref="TryGet"/> until lifecycle
+    /// teardown calls <see cref="Evict"/>.
     /// </summary>
-    /// <remarks>
-    /// <para>SAFETY: Initializers registered via <see cref="AddInitializer"/> must
-    /// NOT call Evict on the same guild being constructed — doing so would cause
-    /// infinite recursion (lazy.Value → Create → Evict → lazy.Value → …).
-    /// Evict on a different guild is safe because it blocks on <c>_initLock</c>
-    /// until the outer Create finishes its initializer loop.</para>
-    /// <para>If called re-entrantly from an initializer (detected via
-    /// <c>_createReentrantGuard</c>), the instance is removed from
-    /// <c>_instances</c> but NOT resolved from the Lazy (to avoid recursion)
-    /// and NOT disposed here. The outer Create owns disposal and cleanup.
-    /// The re-created instance from a later GetOrCreate will function correctly.</para>
-    /// </remarks>
+    public bool Block(string guildId)
+    {
+        var key = NormalizeKey(guildId);
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _blockedGuilds.Add(key);
+        }
+    }
+
+    /// <summary>Allows a deliberately re-admitted guild to create services again.</summary>
+    public bool Unblock(string guildId)
+    {
+        var key = NormalizeKey(guildId);
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _blockedGuilds.Remove(key);
+        }
+    }
+
+    public bool IsBlocked(string guildId)
+    {
+        var key = NormalizeKey(guildId);
+        lock (_lock)
+        {
+            if (_disposed) return true;
+            return _blockedGuilds.Contains(key);
+        }
+    }
+
+    /// <summary>
+    /// Removes and disposes a guild's constructed instance. Eviction does not
+    /// alter its blocked state: suspension uses Block + Evict, while ordinary
+    /// cache replacement may evict without preventing a later recreation.
+    /// </summary>
     public bool Evict(string guildId)
     {
-        if (!_instances.TryRemove(guildId, out var lazy)) return false;
-
-        bool isReentrant;
-        lock (_initLock)
+        var key = NormalizeKey(guildId);
+        lock (_lock)
         {
-            isReentrant = _createReentrantGuard > 0;
-        }
-
-        if (isReentrant)
-        {
-            // Don't touch the Lazy — resolving it would re-enter Create and
-            // cause infinite recursion on this thread. The instance has already
-            // been or is about to be added to _created by the outer Create.
-            // It was removed from _instances above, so GetOrCreate will make
-            // a fresh instance next time.
-            return true;
-        }
-
-        // Hold the initializer lock across resolve + remove-from-_created + dispose
-        // so the operation is atomic with respect to Create. If a concurrent
-        // GetOrCreate is still inside Create (it holds _initLock), we block here
-        // until it publishes the instance into _created, then we resolve the
-        // already-constructed value (no second factory run), remove it, and
-        // dispose it under the same lock — so no other thread can observe the
-        // instance half-removed or publish a fresh Lazy's instance in between.
-        // Lazy<T> is ExecutionAndPublication, so .Value never runs the factory
-        // twice; if construction hasn't started, .Value runs Create re-entrantly
-        // on this thread (Monitor allows re-entrancy), which is guarded by
-        // _createReentrantGuard for nested Evict/GetOrCreate calls.
-        lock (_initLock)
-        {
-            // Re-check reentrancy under the lock: a re-entrant Evict from an
-            // initializer that ran between the first check and here must still
-            // skip resolution/disposal to avoid recursion.
-            if (_createReentrantGuard > 0)
+            if (_disposed) return false;
+            if (!_instances.Remove(key, out var instance))
             {
-                return true;
+                return false;
             }
 
-            var instance = lazy.Value;
             _created.Remove(instance);
+            if (instance is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
 
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Retires and disposes every constructed per-guild service. The DI
+    /// container owns each registry rather than the values created by its
+    /// factory, so without this hook PlayerEngine event subscriptions and
+    /// background work would otherwise survive until process termination.
+    /// </summary>
+    public void Dispose()
+    {
+        T[] instances;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            instances = new HashSet<T>(_created, ReferenceEqualityComparer.Instance).ToArray();
+            _instances.Clear();
+            _created.Clear();
+            _initializers.Clear();
+            _blockedGuilds.Clear();
+        }
+
+        foreach (var instance in instances)
+        {
             if (instance is IDisposable disposable)
             {
                 disposable.Dispose();
             }
         }
-        return true;
     }
 
-    private T Create(string guildId)
+    private void ThrowIfBlocked(string key)
     {
-        var instance = _factory(guildId);
-        lock (_initLock)
+        if (_blockedGuilds.Contains(key))
         {
-            // Re-entrancy guard: if an initializer calls Evict() on another
-            // guild, that eviction will try to acquire _initLock. Because
-            // Monitor allows re-entrancy on the same thread, the eviction
-            // succeeds — but it must NOT call initializers on the instance
-            // being created here (that would cause infinite recursion or
-            // a double-subscription). The guard is checked in Evict().
-            _createReentrantGuard++;
-            try
-            {
-                _created.Add(instance);
-                foreach (var init in _initializers)
-                {
-                    init(instance);
-                }
-            }
-            finally
-            {
-                _createReentrantGuard--;
-            }
+            throw new GuildAccessBlockedException(key);
         }
-        return instance;
+    }
+
+    private void RemoveAndDispose(string key, T instance)
+    {
+        var owned = false;
+        if (_instances.TryGetValue(key, out var current) && ReferenceEquals(current, instance))
+        {
+            _instances.Remove(key);
+            owned = true;
+        }
+
+        owned |= _created.Remove(instance);
+        if (owned && instance is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+    }
+
+    private static string NormalizeKey(string guildId)
+    {
+        if (guildId is null) throw new ArgumentNullException(nameof(guildId));
+
+        return ulong.TryParse(guildId, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : guildId;
     }
 }

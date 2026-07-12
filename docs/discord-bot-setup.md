@@ -213,10 +213,11 @@ ship yt-dlp/ffmpeg itself; voice transmission is delegated to Lavalink.
 ## Troubleshooting
 
 ### "Unknown interaction" or commands don't appear
-Slash commands register on the **Ready** event, scoped to the guild ID in
-`Discord.GuildId`. They appear instantly for that guild. Globally-registered
-commands take up to an hour to propagate, but earworm doesn't register
-globally — if your guild ID is wrong, commands won't appear at all.
+Slash commands register on the **Ready** event for each admitted guild and
+normally appear there immediately. If the database has zero active tenants,
+only the owner recovery `/admin` group is registered globally and can take up
+to an hour to propagate. If your initial guild ID is wrong, playback commands
+will not appear.
 
 ### Mentions queue nothing, no errors in logs
 You forgot to enable **Message Content Intent** in the developer portal
@@ -224,7 +225,7 @@ You forgot to enable **Message Content Intent** in the developer portal
 empty so the URL regex finds nothing.
 
 ### Docker container restart loop
-The container HEALTHCHECK probes `http://localhost:8080/health`. If you've
+The container HEALTHCHECK probes `http://localhost:8080/live`. If you've
 changed `ops.http_port` in `conf/earworm.yaml`, update the `HEALTHCHECK`
 line in `Dockerfile` to match, or remove the port mapping line in
 `docker-compose.yml` and let Docker resolve via localhost inside the

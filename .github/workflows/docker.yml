@@ -3,7 +3,7 @@
 #
 # Triggers:
 #   - push to main → publish :latest + :main-<sha>
-#   - push of a vX.Y.Z tag → publish :X.Y.Z, :X.Y, :latest
+#   - push of a vX.Y.Z tag → publish immutable :X.Y.Z + floating :X.Y
 #   - pull_request → build only (don't push) as a smoke check
 #   - workflow_dispatch → manual rebuild
 #
@@ -26,8 +26,18 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Cancel an older build for the same branch before it can overwrite a newer
+# branch tag. Release tags use distinct refs; the full X.Y.Z tag is immutable.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  tests:
+    uses: ./.github/workflows/test.yml
+
   build-and-push:
+    needs: tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,6 +67,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Do not let semver-tag builds also update :latest. Only a tested,
+          # non-stale main-branch build may move that floating tag.
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch
             type=ref,event=pr

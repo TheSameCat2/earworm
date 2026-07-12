@@ -24,8 +24,10 @@ namespace Earworm.Domain.Player;
 ///
 /// When crossfade is disabled (<see cref="AudioConfig.CrossfadeSeconds"/> ≤ 0)
 /// or the track is shorter than <see cref="AudioConfig.CrossfadeMinTrackSeconds"/>,
-/// the controller leaves player volume untouched so disabling crossfade truly
-/// means "don't touch volume" (forward-compatible with a future /volume).
+/// the controller leaves player volume untouched unless it must undo a fade it
+/// previously owned. Thus disabling crossfade still means "don't touch volume"
+/// (forward-compatible with a future /volume), while a short track after a
+/// faded track cannot inherit silence.
 /// </summary>
 public sealed class AudioTransitionController
 {
@@ -38,7 +40,17 @@ public sealed class AudioTransitionController
     private readonly ILogger<AudioTransitionController> _logger;
 
     private readonly object _lock = new();
+    // Lavalink volume updates are independent REST requests. A monitor can be
+    // canceled while one request is already in flight; without serialization,
+    // that stale response may arrive after the next track's mute/full-volume
+    // handoff and overwrite it. New-track writes wait for the prior request and
+    // are therefore always the final authoritative update.
+    private readonly SemaphoreSlim _volumeWriteGate = new(1, 1);
     private CancellationTokenSource? _currentLoopCts;
+    // True after this controller has changed the player's volume for a fade.
+    // The flag survives cancellation of the monitor because cancellation does
+    // not restore the volume that Lavalink last received.
+    private bool _ownsVolume;
 
     public AudioTransitionController(EarwormConfig config, ILogger<AudioTransitionController> logger)
     {
@@ -75,7 +87,11 @@ public sealed class AudioTransitionController
         if (!IsEnabled) return;
         try
         {
-            await player.SetVolumeAsync(FullVolume, cancellationToken: ct);
+            await SetVolumeOrderedAsync(
+                (volume, cancellationToken) => player.SetVolumeAsync(volume, cancellationToken: cancellationToken),
+                FullVolume,
+                ct);
+            lock (_lock) _ownsVolume = false;
         }
         catch (Exception ex)
         {
@@ -87,7 +103,9 @@ public sealed class AudioTransitionController
     /// Plays a music track with volume transitions around it. When fades apply
     /// (enabled + duration known + long enough), the order is mute → play →
     /// spawn ramp monitor, all owned by the controller so the mute can't race
-    /// the play. Otherwise just invokes <paramref name="playAction"/>.
+    /// the play. A non-faded track normally leaves volume untouched, except when
+    /// the prior track was faded by this controller; in that case it restores
+    /// full volume before playback so the prior tail fade cannot mute the track.
     /// </summary>
     public async Task PlayMusicAsync(LavalinkPlayer player, TimeSpan? trackDuration, Func<ValueTask> playAction, CancellationToken ct = default)
     {
@@ -97,11 +115,10 @@ public sealed class AudioTransitionController
             && trackDuration is not null
             && trackDuration.Value.TotalSeconds >= MinTrackSeconds;
 
-        if (willFade)
-        {
-            try { await player.SetVolumeAsync(Silent, cancellationToken: ct); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to mute volume before fade-in; track starts loud."); }
-        }
+        await PrepareMusicVolumeAsync(
+            willFade,
+            (volume, cancellationToken) => player.SetVolumeAsync(volume, cancellationToken: cancellationToken),
+            ct);
 
         await playAction();
 
@@ -113,6 +130,43 @@ public sealed class AudioTransitionController
                 cts = _currentLoopCts = new CancellationTokenSource();
             }
             _ = Task.Run(() => MonitorAsync(player, trackDuration!.Value, cts.Token));
+        }
+    }
+
+    /// <summary>
+    /// Applies the pre-play volume handoff. Kept separate from player playback
+    /// so the ownership state machine can be regression-tested without a live
+    /// Lavalink connection.
+    /// </summary>
+    private async Task PrepareMusicVolumeAsync(
+        bool willFade,
+        Func<float, CancellationToken, ValueTask> setVolumeAsync,
+        CancellationToken ct)
+    {
+        if (willFade)
+        {
+            // Treat the volume as controller-owned even if this first request
+            // fails: the monitor will continue attempting ramp updates, and a
+            // later non-faded track should still make a best-effort reset.
+            lock (_lock) _ownsVolume = true;
+            try { await SetVolumeOrderedAsync(setVolumeAsync, Silent, ct); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to mute volume before fade-in; track starts loud."); }
+            return;
+        }
+
+        bool restoreFull;
+        lock (_lock) restoreFull = _ownsVolume;
+        if (!restoreFull) return;
+
+        try
+        {
+            await SetVolumeOrderedAsync(setVolumeAsync, FullVolume, ct);
+            lock (_lock) _ownsVolume = false;
+        }
+        catch (Exception ex)
+        {
+            // Retain ownership so a later track can retry the reset.
+            _logger.LogWarning(ex, "Failed to restore volume after the prior fade; track may start quiet.");
         }
     }
 
@@ -157,7 +211,7 @@ public sealed class AudioTransitionController
 
                 if (volumeChanged && rateLimitPassed)
                 {
-                    await SafeSetVolumeAsync(player, target);
+                    await SafeSetVolumeAsync(player, target, ct);
                     lastSent = target;
                     lastVolumeCall = now;
                 }
@@ -171,20 +225,58 @@ public sealed class AudioTransitionController
         }
         catch (Exception ex)
         {
+            if (ct.IsCancellationRequested) return;
             _logger.LogWarning(ex, "Audio transition monitor crashed; resetting volume to full.");
-            try { await player.SetVolumeAsync(FullVolume); } catch { /* best-effort */ }
+            try
+            {
+                await SetVolumeOrderedAsync(
+                    (volume, cancellationToken) => player.SetVolumeAsync(volume, cancellationToken: cancellationToken),
+                    FullVolume,
+                    ct);
+                lock (_lock) _ownsVolume = false;
+            }
+            catch { /* best-effort */ }
         }
     }
 
-    private async Task SafeSetVolumeAsync(LavalinkPlayer player, float volume)
+    private async Task SafeSetVolumeAsync(LavalinkPlayer player, float volume, CancellationToken ct)
     {
         try
         {
-            await player.SetVolumeAsync(volume);
+            await SetVolumeOrderedAsync(
+                (target, cancellationToken) => player.SetVolumeAsync(target, cancellationToken: cancellationToken),
+                volume,
+                ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // The monitor was superseded before it could publish this update.
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "SetVolumeAsync ({Vol:0.00}) failed; continuing.", volume);
+        }
+    }
+
+    private async Task SetVolumeOrderedAsync(
+        Func<float, CancellationToken, ValueTask> setVolumeAsync,
+        float volume,
+        CancellationToken ct)
+    {
+        await _volumeWriteGate.WaitAsync(ct);
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Once issued, let this small REST request finish rather than
+            // canceling its client-side wait. The next generation is queued on
+            // _volumeWriteGate and will publish its value afterward, so an old
+            // server response cannot become the final volume state.
+            await setVolumeAsync(volume, CancellationToken.None);
+        }
+        finally
+        {
+            _volumeWriteGate.Release();
         }
     }
 }

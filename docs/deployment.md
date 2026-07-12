@@ -11,7 +11,11 @@ Running earworm in production. The reference deployment is **Docker Compose** wi
 
 Both paths produce a working bot — the pull-from-GHCR path is faster (no .NET SDK needed on the host) and what most self-hosters want.
 
-GitHub Actions publishes the image to `ghcr.io/<owner>/earworm:latest` on every push to `main`, and to `:vX.Y.Z` for tagged releases. Pin to a version tag for production; use `:latest` if you don't mind the occasional surprise.
+GitHub Actions publishes a tested image to `ghcr.io/<owner>/earworm:latest`
+from `main`, an immutable `:X.Y.Z` tag for each release, and a floating `:X.Y`
+minor-series tag. Release-tag builds do not move `:latest`. Pin the full
+version tag for predictable production rollouts; use `:latest` only if you
+intentionally want mainline updates.
 
 ## Prerequisites
 
@@ -43,12 +47,26 @@ The reference compose stack:
 
 The bot talks to Lavalink as `http://lavalink:2333` (service name on the bridge). Lavalink fetches TTS audio from the bot as `http://earworm:8080/tts/<id>.mp3`. Neither port is published to the host LAN; only the bot's health port is exposed, and only on `127.0.0.1`.
 
+The reference compose files explicitly set the database, TTS scratch, and
+legacy cache paths beneath `/data`, matching their `/data` volume. Existing
+deployments that instead mount their host directory at `/app/data` and retain
+the YAML's relative `./data/...` paths remain supported and need no migration.
+Do not add the `/data` environment overrides to such a deployment unless you
+also intentionally move its state.
+
+They also give Earworm a 30-second stop grace period so external connections
+can close and the bounded SQLite writer can drain/checkpoint. Existing stacks
+continue to work with Docker's default; adding `stop_grace_period: 30s` under
+the `earworm` service is recommended for the strongest graceful-shutdown
+guarantee and does not require a data migration.
+
 ## 1. Host setup
 
 ```bash
 # Create state directories. Adjust paths to your host.
 sudo mkdir -p /mnt/user/appdata/earworm/{data,conf}
-sudo chown -R $USER:$USER /mnt/user/appdata/earworm
+# The container runs as UID 1000. Bind-mounted state must be writable by it.
+sudo chown -R 1000:1000 /mnt/user/appdata/earworm
 
 # Clone the repo somewhere convenient (not necessarily the mount path).
 git clone https://github.com/TheSameCat2/earworm.git
@@ -70,15 +88,22 @@ Fill in:
 - `EARWORM_GEMINI_API_KEY`
 - `EARWORM_ELEVENLABS_API_KEY`
 - `LAVALINK_PASSWORD` — **change this from the default for production.** A long random string is fine; both the Lavalink container and the bot need the same value (compose wires them up from the single env var).
+- `LAVALINK_IMAGE` (optional) — an immutable Lavalink tag or digest. It
+  defaults to `fredboat/lavalink:dev` for compatibility, but production stacks
+  should pin the exact image they tested.
 
 Copy and edit runtime config:
 
 ```bash
-cp conf/earworm.yaml /mnt/user/appdata/earworm/conf/earworm.yaml
+cp conf/earworm.example.yaml /mnt/user/appdata/earworm/conf/earworm.yaml
 $EDITOR /mnt/user/appdata/earworm/conf/earworm.yaml
 ```
 
 Fill in `Discord.GuildId` and `Dj.Tts.VoiceId`. See [configuration.md](configuration.md) for the rest of the keys.
+
+Single-tenant operation does not require `Bot.OwnerUserIds`. Before testing a
+second guild, add your Discord user ID there so `/admin add-server`,
+`list-servers`, and `remove-server` remain available.
 
 The Lavalink plugin config (`conf/lavalink/application.yml`) is **mounted directly from the repo**, not the appdata dir. If you want to customize it (e.g. bump the YouTube plugin version), edit it in the repo. The compose file picks it up automatically.
 
@@ -87,7 +112,7 @@ The Lavalink plugin config (`conf/lavalink/application.yml`) is **mounted direct
 If you're using the **pull-from-GHCR** path with the upstream image:
 
 ```bash
-docker compose pull            # pulls the latest published image
+docker compose pull earworm    # does not unexpectedly update Lavalink
 docker compose up -d
 ```
 
@@ -116,9 +141,13 @@ earworm           | earworm services started. Press Ctrl+C to shut down.
 ## 4. Verify
 
 ```bash
-# Bot health check responds 200
-curl -s http://127.0.0.1:8080/health
+# Shallow process liveness (also used by Docker HEALTHCHECK)
+curl -s http://127.0.0.1:8080/live
 # → {"status":"ok"}
+
+# Dependency readiness: Discord, Lavalink, SQLite writer, tenant store
+curl -s http://127.0.0.1:8080/health
+# → {"status":"ok","discord":"ok","lavalink":"ok",...}
 
 # Lavalink can fetch from the bot (sanity check for the network)
 docker exec earworm-lavalink wget -qO- --timeout=5 http://earworm:8080/health
@@ -138,6 +167,22 @@ The DJ role and logging channel live in the bot's database (not in YAML) so they
 ```
 
 ## Day-2 operations
+
+### Pinning Lavalink
+
+The compose files accept `LAVALINK_IMAGE` and retain
+`fredboat/lavalink:dev` only as a compatibility default. Because `:dev` moves
+independently of Earworm, record the digest of a working installation:
+
+```bash
+docker image inspect fredboat/lavalink:dev --format '{{index .RepoDigests 0}}'
+# Example shape only: fredboat/lavalink@sha256:<digest>
+```
+
+Put that full output in `.env` as `LAVALINK_IMAGE=...`, then run
+`docker compose up -d lavalink`. Future Earworm-only upgrades should continue
+to use `docker compose pull earworm`; change the Lavalink digest separately
+after testing it with your `application.yml` and plugins.
 
 ### Upgrading the bot
 
@@ -189,7 +234,26 @@ docker compose up -d                  # restarts both containers with the new va
 
 ### Backups
 
-The bot's state lives in `/mnt/user/appdata/earworm/data/earworm.db`. SQLite — back it up however you back up files. A nightly `cp` to a backup directory plus log rotation is fine; the bot already keeps schema migrations idempotent so restoring from a snapshot is "stop bot → replace .db → start bot."
+The bot uses SQLite in WAL mode. **Do not copy only `earworm.db` while the bot
+is running**: committed data may still be in `earworm.db-wal`, and a mismatched
+database/WAL pair is not a valid snapshot. The safest filesystem backup is a
+brief quiesced copy of the entire state directory:
+
+```bash
+docker compose stop earworm
+sudo tar -C /mnt/user/appdata/earworm \
+  -czf "/path/to/backups/earworm-data-$(date +%Y%m%d-%H%M%S).tgz" data
+docker compose start earworm
+```
+
+Adjust the source path for non-Unraid deployments. If downtime is not
+acceptable, use SQLite's online backup API rather than a live filesystem copy.
+`Persistence.BackupIntervalHours` and `BackupRetentionCount` are reserved
+configuration keys; Earworm does not currently schedule backups itself.
+
+To restore, stop Earworm, replace the whole `data` directory from one snapshot,
+restore ownership with `chown -R 1000:1000`, and start Earworm. Keep the replaced
+directory until `/health` reports `status: ok` so rollback remains available.
 
 The Lavalink plugin volume (`earworm-lavalink-plugins`) is regenerable — Lavalink redownloads jars if it's empty.
 
@@ -205,7 +269,10 @@ Use **[`docs/examples/docker-compose.unraid.yml`](examples/docker-compose.unraid
 
 - **Where to put `docker-compose.yml`**: stash the repo somewhere on the array (e.g. `/mnt/user/appdata/_compose/earworm/`) and add it as a stack in Compose Manager.
 - **Logging chattiness**: the json-file driver with `max-size: 10m, max-file: 3` (already in the compose) caps total log usage at ~60 MB across both containers. Adequate for most users.
-- **Health monitoring**: the bot's `/health` endpoint is wired to the Dockerfile HEALTHCHECK and reflected in `docker ps`. Unraid's container UI shows healthy/unhealthy based on that.
+- **Health monitoring**: the shallow `/live` endpoint is wired to the
+  Dockerfile HEALTHCHECK and reflected in `docker ps`, so a Discord or Lavalink
+  outage does not cause a restart loop. Monitor `/health` separately for full
+  dependency readiness.
 - **Restart behavior**: `restart: unless-stopped` survives reboots. Don't use `restart: always` — it'll endlessly restart a container that crashes on config errors, masking the real problem.
 
 ## Non-Compose deployments
@@ -214,6 +281,10 @@ For Kubernetes, Nomad, or systemd you'll need to recreate three pieces:
 
 1. **Two containers** with shared networking — bot needs to reach `lavalink:2333`, Lavalink needs to reach the bot's HTTP host (port 8080 by default).
 2. **Environment variables** as listed in `docker-compose.yml`. The bot honors `EARWORM_Section__Key` for nested config (e.g. `EARWORM_Dj__TtsServeBaseUrl`).
-3. **Persistent volumes** for `/data` (bot's SQLite) and `/opt/Lavalink/plugins` (Lavalink's downloaded jars).
+3. **Persistent volumes** for `/data` (bot state) and
+   `/opt/Lavalink/plugins` (Lavalink's downloaded jars), plus explicit
+   `EARWORM_Persistence__SqlitePath=/data/earworm.db` and
+   `EARWORM_Dj__TtsScratchDirectory=/data/tts` overrides. The Earworm volume
+   must be writable by UID 1000.
 
 The bot is a regular .NET 10 self-contained binary inside the Docker image — you can also publish it as native binaries (`dotnet publish -c Release -r linux-x64 --self-contained`) if you want to run it outside containers.

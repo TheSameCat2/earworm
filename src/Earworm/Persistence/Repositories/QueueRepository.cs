@@ -92,6 +92,76 @@ public sealed class QueueRepository : IQueueRepository
         });
     }
 
+    /// <summary>
+    /// Inserts a track at the front and shifts the existing rows in the same
+    /// transaction. A failed operation therefore cannot leave /previous's track
+    /// appended at the back of the persisted queue.
+    /// </summary>
+    public async Task<long> AddTrackAtFrontAsync(QueueItem item)
+    {
+        return await _stateStore.SubmitWriteAsync(async connection =>
+        {
+            using var transaction = connection.BeginTransaction();
+            try
+            {
+                // SQLite checks UNIQUE constraints row-by-row. Stage positions
+                // as negative values before shifting them all forward by one.
+                using (var stageCmd = connection.CreateCommand())
+                {
+                    stageCmd.Transaction = transaction;
+                    stageCmd.CommandText = "UPDATE queue SET position = -(position + 1) WHERE guild_id = $guildId;";
+                    stageCmd.Parameters.AddWithValue("$guildId", item.GuildId);
+                    await stageCmd.ExecuteNonQueryAsync();
+                }
+
+                using (var shiftCmd = connection.CreateCommand())
+                {
+                    shiftCmd.Transaction = transaction;
+                    shiftCmd.CommandText = "UPDATE queue SET position = -position WHERE guild_id = $guildId;";
+                    shiftCmd.Parameters.AddWithValue("$guildId", item.GuildId);
+                    await shiftCmd.ExecuteNonQueryAsync();
+                }
+
+                long id;
+                using (var insertCmd = connection.CreateCommand())
+                {
+                    insertCmd.Transaction = transaction;
+                    insertCmd.CommandText = @"
+                        INSERT INTO queue (position, source_type, source_id, title, artist, duration_seconds,
+                                           requested_by_user_id, requested_by_display_name, queued_at, guild_id)
+                        VALUES (0, $sourceType, $sourceId, $title, $artist, $duration,
+                                $userId, $displayName, $queuedAt, $guildId)
+                        RETURNING queue_item_id;
+                    ";
+                    insertCmd.Parameters.AddWithValue("$sourceType", item.SourceType);
+                    insertCmd.Parameters.AddWithValue("$sourceId", item.SourceId);
+                    insertCmd.Parameters.AddWithValue("$title", (object?)item.Title ?? DBNull.Value);
+                    insertCmd.Parameters.AddWithValue("$artist", (object?)item.Artist ?? DBNull.Value);
+                    insertCmd.Parameters.AddWithValue("$duration", (object?)item.DurationSeconds ?? DBNull.Value);
+                    insertCmd.Parameters.AddWithValue("$userId", item.RequestedByUserId);
+                    insertCmd.Parameters.AddWithValue("$displayName", item.RequestedByDisplayName);
+                    insertCmd.Parameters.AddWithValue("$queuedAt", item.QueuedAt.ToUnixTimeMilliseconds());
+                    insertCmd.Parameters.AddWithValue("$guildId", item.GuildId);
+
+                    var idObj = await insertCmd.ExecuteScalarAsync();
+                    if (idObj == null || idObj == DBNull.Value)
+                    {
+                        throw new InvalidOperationException("INSERT ... RETURNING queue_item_id returned no rows.");
+                    }
+                    id = Convert.ToInt64(idObj);
+                }
+
+                transaction.Commit();
+                return id;
+            }
+            catch
+            {
+                transaction.Rollback();
+                throw;
+            }
+        });
+    }
+
     public async Task RemoveTrackAsync(long queueItemId)
     {
         await _stateStore.SubmitWriteAsync(async connection =>
@@ -205,15 +275,16 @@ public sealed class QueueRepository : IQueueRepository
                     return;
                 }
 
-                // Only rows in the affected range need position updates
-                int lo = Math.Min(targetItemIndex, clampedTo);
-                int hi = Math.Max(targetItemIndex, clampedTo);
+                // Deletes intentionally leave gaps in persisted positions. Rewrite
+                // every row for this guild, not only the moved range: assigning a
+                // dense index to a subset can collide with an unaffected row that
+                // still occupies that number (for example persisted [2,3,4]).
+                int lo = 0;
+                int hi = items.Count - 1;
 
-                // Build a two-statement batched update covering only the affected range.
-                // Phase 1: move all affected rows to large negative sentinel positions to
-                //          clear the UNIQUE(guild_id, position) slots (SQLite checks per-row).
-                // Phase 2: set the final positions via a single CASE statement.
-                // Together this is O(1) round-trips regardless of queue size.
+                // Build a two-statement batched update. Phase 1 moves all guild
+                // rows to negative sentinels; phase 2 assigns the reordered dense
+                // positions. The transaction keeps readers from seeing staging.
                 var idList = new StringBuilder();
                 for (int i = lo; i <= hi; i++)
                 {

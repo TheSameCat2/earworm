@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -41,7 +43,7 @@ public sealed class TrackQueuingServiceTests
         metrics = Substitute.For<IMetricsRepository>();
 
         return new TrackQueuingService(
-            audioService, queueRegistry, metrics,
+            audioService, queueRegistry, metrics, config,
             NullLogger<TrackQueuingService>.Instance);
     }
 
@@ -175,5 +177,107 @@ public sealed class TrackQueuingServiceTests
 
         result.Should().NotBeNull();
         result.SourceType.Should().Be("mp3_upload");
+    }
+
+    [Fact]
+    public async Task ResolveAndQueueAsync_GuildWaiters_DoNotConsumeOtherGuildsGlobalCapacity()
+    {
+        var config = BuildConfig() with
+        {
+            Ops = new OpsConfig
+            {
+                MaxConcurrentTrackResolutions = 2,
+                MaxConcurrentTrackResolutionsPerGuild = 2,
+                MaxPendingTrackResolutionsPerGuild = 1,
+            },
+        };
+        var trackManager = Substitute.For<ITrackManager>();
+        var audioService = Substitute.For<IAudioService>();
+        audioService.Tracks.Returns(trackManager);
+
+        var queueRepository = Substitute.For<IQueueRepository>();
+        queueRepository.GetQueueAsync(Arg.Any<string>()).Returns(new List<QueueItem>());
+        long nextQueueItemId = 0;
+        queueRepository.AddTrackAsync(Arg.Any<QueueItem>())
+            .Returns(_ => Task.FromResult(Interlocked.Increment(ref nextQueueItemId)));
+        var snapshotRepository = Substitute.For<ISnapshotRepository>();
+        using var queueRegistry = new PerGuildRegistry<QueueManager>(guildId =>
+            new QueueManager(
+                queueRepository,
+                snapshotRepository,
+                config,
+                NullLogger<QueueManager>.Instance,
+                guildId));
+        var metrics = Substitute.For<IMetricsRepository>();
+        metrics.IncrementBatchAsync(Arg.Any<string>(), Arg.Any<IReadOnlyCollection<MetricIncrement>>())
+            .Returns(Task.CompletedTask);
+        var service = new TrackQueuingService(
+            audioService,
+            queueRegistry,
+            metrics,
+            config,
+            NullLogger<TrackQueuingService>.Instance);
+
+        var firstGuildEnteredResolver = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondGuildEnteredResolver = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseResolvers = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async Task<LavalinkTrack?> ResolveAsync(string query)
+        {
+            if (query == "guild-a-1") firstGuildEnteredResolver.TrySetResult();
+            if (query == "guild-b-1") secondGuildEnteredResolver.TrySetResult();
+            await releaseResolvers.Task;
+            return new LavalinkTrack
+            {
+                Title = query,
+                Author = "Artist",
+                Duration = TimeSpan.FromSeconds(60),
+                Identifier = query,
+                SourceName = "youtube",
+            };
+        }
+
+        trackManager.LoadTrackAsync(Arg.Any<string>(), Arg.Any<TrackSearchMode>(), default, default)
+            .Returns(call => new ValueTask<LavalinkTrack?>(ResolveAsync(call.ArgAt<string>(0))));
+
+        var guildAFirst = service.ResolveAndQueueAsync("guild-a-1", "u1", "A", "1");
+        await firstGuildEnteredResolver.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var guildAWaiter = service.ResolveAndQueueAsync("guild-a-2", "u2", "A", "1");
+        Func<Task> overflow = async () => await service
+            .ResolveAndQueueAsync("guild-a-3", "u4", "A", "1")
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        await overflow.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*pending*");
+        var guildB = service.ResolveAndQueueAsync("guild-b-1", "u3", "B", "2");
+
+        var observed = await Task.WhenAny(
+            secondGuildEnteredResolver.Task,
+            Task.Delay(TimeSpan.FromSeconds(2)));
+        releaseResolvers.TrySetResult();
+        await Task.WhenAll(guildAFirst, guildAWaiter, guildB);
+
+        observed.Should().BeSameAs(
+            secondGuildEnteredResolver.Task,
+            "requests waiting on guild A's local limit must not reserve every global slot");
+    }
+
+    [Theory]
+    [InlineData("http://127.0.0.1/private.mp3")]
+    [InlineData("http://169.254.169.254/latest/meta-data")]
+    [InlineData("http://10.0.0.5/audio.mp3")]
+    [InlineData("http://100.64.0.1/audio.mp3")]
+    [InlineData("http://[::]/audio.mp3")]
+    [InlineData("http://earworm/tts/file.mp3")]
+    [InlineData("http://service.internal/audio.mp3")]
+    [InlineData("http://user:password@example.com/audio.mp3")]
+    public async Task ResolveAndQueueAsync_RejectsPrivateOrCredentialedUrls(string url)
+    {
+        var svc = BuildService(out var audio, out _, out _);
+
+        var act = () => svc.ResolveAndQueueAsync(url, "u1", "User", "1");
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        await audio.Tracks.DidNotReceiveWithAnyArgs()
+            .LoadTrackAsync(default!, default(TrackSearchMode), default, default);
     }
 }

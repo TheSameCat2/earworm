@@ -9,7 +9,7 @@
 # Setup steps for Unraid:
 #   1. SSH or open a terminal on the Unraid host:
 #        mkdir -p /mnt/user/appdata/earworm/{data,conf}
-#        chown -R nobody:users /mnt/user/appdata/earworm
+#        chown -R 1000:1000 /mnt/user/appdata/earworm
 #   2. Copy conf/earworm.example.yaml and conf/lavalink/application.yml from
 #      the GitHub repo into /mnt/user/appdata/earworm/conf/
 #   3. Rename earworm.example.yaml → earworm.yaml and fill in Discord.GuildId
@@ -21,6 +21,7 @@
 #        EARWORM_GEMINI_API_KEY=...
 #        EARWORM_ELEVENLABS_API_KEY=...
 #        LAVALINK_PASSWORD=<a long random string>
+#        LAVALINK_IMAGE=fredboat/lavalink@sha256:<tested digest>  # recommended
 #   6. Install the Compose Manager plugin if you haven't already, add this
 #      file as a new stack, and start it.
 #
@@ -30,14 +31,16 @@
 #   - The lavalink plugin jar persists in a docker-managed volume
 #     (earworm-lavalink-plugins). It's regenerable if you nuke it — Lavalink
 #     re-downloads on startup.
-#   - The bot's /health endpoint is published to 127.0.0.1:8080 on the host.
+#   - The bot's /live and /health endpoints are published to 127.0.0.1:8080.
 #     If you want to monitor from another machine on the LAN, change to
 #     "0.0.0.0:8080:8080" — but consider whether you actually want that
 #     exposed first.
 
 services:
   lavalink:
-    image: fredboat/lavalink:dev
+    # Set LAVALINK_IMAGE in .env to an immutable tag or digest for predictable
+    # upgrades. The floating dev tag remains the compatibility default.
+    image: "${LAVALINK_IMAGE:-fredboat/lavalink:dev}"
     container_name: earworm-lavalink
     restart: unless-stopped
     environment:
@@ -65,9 +68,10 @@ services:
       start_period: 30s
 
   earworm:
-    image: ghcr.io/TheSameCat2/earworm:latest
+    image: ghcr.io/thesamecat2/earworm:latest
     container_name: earworm
     restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       lavalink:
         condition: service_healthy
@@ -82,6 +86,11 @@ services:
       EARWORM_Lavalink__Port:       "2333"
       EARWORM_Lavalink__Password:   "${LAVALINK_PASSWORD:?required}"
       EARWORM_Dj__TtsServeBaseUrl:  "http://earworm:8080"
+      # Pin runtime state to the mounted /data volume even when the YAML keeps
+      # its local-development ./data defaults.
+      EARWORM_Persistence__SqlitePath: "/data/earworm.db"
+      EARWORM_Dj__TtsScratchDirectory: "/data/tts"
+      EARWORM_Cache__Directory:         "/data/cache"
       TZ:                           "${TZ:-America/Los_Angeles}"
       DOTNET_RUNNING_IN_CONTAINER:  "true"
 

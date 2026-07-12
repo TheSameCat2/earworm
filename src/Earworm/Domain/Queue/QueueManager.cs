@@ -27,7 +27,12 @@ public class QueueManager : IDisposable
     // mutating op funnels through EnsureInitializedAsync first so the in-memory
     // queue always reflects the persisted rows before positions are computed.
     private readonly SemaphoreSlim _initGate = new(1, 1);
+    // Keeps the persisted and in-memory queue as one ordered state machine.
+    // Mutations commit to SQLite first, then update memory while this gate still
+    // excludes every other mutation.
+    private readonly SemaphoreSlim _mutationGate = new(1, 1);
     private volatile bool _initialized;
+    private volatile bool _retired;
 
     // Event definitions. Virtual so tests using NSubstitute can Raise.Event them
     // — see PlayerEngine_WakesUp_WhenTrackQueuedAfterEmptyQueue.
@@ -60,10 +65,20 @@ public class QueueManager : IDisposable
     /// </summary>
     public async Task InitializeAsync()
     {
+        ThrowIfRetired();
         await _initGate.WaitAsync();
         try
         {
-            await LoadFromDatabaseLockedAsync();
+            ThrowIfRetired();
+            await EnterMutationAsync();
+            try
+            {
+                await LoadFromDatabaseLockedAsync();
+            }
+            finally
+            {
+                _mutationGate.Release();
+            }
         }
         finally
         {
@@ -81,12 +96,22 @@ public class QueueManager : IDisposable
     /// </summary>
     public async Task EnsureInitializedAsync()
     {
+        ThrowIfRetired();
         if (_initialized) return;
         await _initGate.WaitAsync();
         try
         {
+            ThrowIfRetired();
             if (_initialized) return; // another caller hydrated while we waited
-            await LoadFromDatabaseLockedAsync();
+            await EnterMutationAsync();
+            try
+            {
+                await LoadFromDatabaseLockedAsync();
+            }
+            finally
+            {
+                _mutationGate.Release();
+            }
         }
         finally
         {
@@ -107,11 +132,30 @@ public class QueueManager : IDisposable
         _logger.LogInformation("QueueManager[{GuildId}] loaded {Count} tracks from database.", _guildId, _queue.Count);
     }
 
+    private async Task EnterMutationAsync()
+    {
+        await _mutationGate.WaitAsync();
+        if (_retired)
+        {
+            _mutationGate.Release();
+            ThrowIfRetired();
+        }
+    }
+
+    private void ThrowIfRetired()
+    {
+        if (_retired)
+        {
+            throw new InvalidOperationException($"Queue services for guild '{_guildId}' have been retired.");
+        }
+    }
+
     /// <summary>
     /// Gets a read-only list of the current queue.
     /// </summary>
     public virtual List<QueueItem> GetQueue()
     {
+        ThrowIfRetired();
         lock (_lock)
         {
             return _queue.ToList();
@@ -125,6 +169,7 @@ public class QueueManager : IDisposable
     {
         get
         {
+            ThrowIfRetired();
             lock (_lock)
             {
                 return _queue.Count;
@@ -175,88 +220,35 @@ public class QueueManager : IDisposable
             CorrelationId = correlationId
         };
 
-        Task<long> writeTask;
         QueueItem finalItem;
         Action<QueueItem>? handler;
-        int pos;
-
-        lock (_lock)
-        {
-            EnforceQueueCapsLocked(durationSeconds, requestedByUserId);
-
-            pos = _queue.Count;
-            // SubmitWriteAsync only enqueues to an unbounded channel (no I/O),
-            // so we can safely call it under the lock and capture the Task. The DB
-            // assigns its own gap-free position; pos here is the dense in-memory one.
-            writeTask = _queueRepository.AddTrackAsync(item);
-
-            finalItem = item with { Position = pos };
-            _queue.Add(finalItem);
-
-            handler = TrackQueued;
-        }
-
-        long newId;
+        await EnterMutationAsync();
         try
         {
-            newId = await writeTask;
-        }
-        catch
-        {
-            // Best-effort rollback if persistence fails after in-memory append.
-            // Uses CorrelationId (a Guid) instead of SourceId + QueuedAt so two
-            // identical tracks queued in the same tick don't match each other.
+            int pos;
             lock (_lock)
             {
-                int idx = _queue.FindIndex(q => q.QueueItemId == 0 && q.CorrelationId == correlationId);
-                if (idx >= 0)
-                {
-                    _queue.RemoveAt(idx);
-                    for (int i = idx; i < _queue.Count; i++)
-                    {
-                        _queue[i] = _queue[i] with { Position = i };
-                    }
-                }
+                EnforceQueueCapsLocked(durationSeconds, requestedByUserId);
+                pos = _queue.Count;
             }
-            throw;
-        }
 
-        QueueItem itemForEvent;
-        bool orphaned;
-        lock (_lock)
+            // Commit first. A persistence failure leaves memory untouched.
+            long newId = await _queueRepository.AddTrackAsync(item);
+            finalItem = item with { QueueItemId = newId, Position = pos };
+            lock (_lock)
+            {
+                _queue.Add(finalItem);
+                handler = TrackQueued;
+            }
+        }
+        finally
         {
-            int idx = _queue.FindIndex(q => q.QueueItemId == 0 && q.CorrelationId == correlationId);
-            if (idx >= 0)
-            {
-                _queue[idx] = _queue[idx] with { QueueItemId = newId };
-                itemForEvent = _queue[idx];
-                orphaned = false;
-            }
-            else
-            {
-                // In-memory item was removed (e.g. Dequeue/Clear) before we could
-                // backfill the row id; the row in the DB is now an orphan.
-                itemForEvent = finalItem with { QueueItemId = newId };
-                orphaned = true;
-            }
+            _mutationGate.Release();
         }
 
-        if (orphaned)
-        {
-            try
-            {
-                await _queueRepository.RemoveTrackAsync(newId);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to clean up orphaned queue row {Id} after in-memory removal.", newId);
-            }
-            return itemForEvent;
-        }
-
-        _logger.LogInformation("Queued track: {Title} by {Artist} at position {Pos}", title, artist, pos);
-        handler?.Invoke(itemForEvent);
-        return itemForEvent;
+        _logger.LogInformation("Queued track: {Title} by {Artist} at position {Pos}", title, artist, finalItem.Position);
+        handler?.Invoke(finalItem);
+        return finalItem;
     }
 
     /// <summary>
@@ -309,36 +301,36 @@ public class QueueManager : IDisposable
         await EnsureInitializedAsync();
 
         QueueItem itemToRemove;
-        Task writeTask;
         Action<QueueItem>? handler;
-
-        lock (_lock)
+        await EnterMutationAsync();
+        try
         {
-            if (position < 0 || position >= _queue.Count)
+            lock (_lock)
             {
-                throw new ArgumentOutOfRangeException(nameof(position), "Queue position is out of bounds.");
+                if (position < 0 || position >= _queue.Count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(position), "Queue position is out of bounds.");
+                }
+
+                itemToRemove = _queue[position];
+                if (!isDj && itemToRemove.RequestedByUserId != userId)
+                {
+                    throw new InvalidOperationException("You can only remove tracks that you queued yourself. (Requires DJ role to remove others' tracks).");
+                }
             }
 
-            itemToRemove = _queue[position];
-
-            // Enforce permission checks: DJ or the original requester
-            if (!isDj && itemToRemove.RequestedByUserId != userId)
+            await _queueRepository.RemoveTrackAsync(itemToRemove.QueueItemId);
+            lock (_lock)
             {
-                throw new InvalidOperationException("You can only remove tracks that you queued yourself. (Requires DJ role to remove others' tracks).");
+                _queue.RemoveAt(position);
+                ReindexLocked(position);
+                handler = TrackRemoved;
             }
-
-            writeTask = _queueRepository.RemoveTrackAsync(itemToRemove.QueueItemId);
-
-            _queue.RemoveAt(position);
-            for (int i = position; i < _queue.Count; i++)
-            {
-                _queue[i] = _queue[i] with { Position = i };
-            }
-
-            handler = TrackRemoved;
         }
-
-        await writeTask;
+        finally
+        {
+            _mutationGate.Release();
+        }
 
         _logger.LogInformation("Removed track at position {Pos}: {Title}", position, itemToRemove.Title);
         handler?.Invoke(itemToRemove);
@@ -353,35 +345,35 @@ public class QueueManager : IDisposable
     {
         await EnsureInitializedAsync();
 
-        Task writeTask;
-        lock (_lock)
+        await EnterMutationAsync();
+        try
         {
-            if (fromPosition < 0 || fromPosition >= _queue.Count || toPosition < 0 || toPosition >= _queue.Count)
+            QueueItem item;
+            lock (_lock)
             {
-                throw new ArgumentOutOfRangeException("Queue position is out of bounds.");
+                if (fromPosition < 0 || fromPosition >= _queue.Count || toPosition < 0 || toPosition >= _queue.Count)
+                {
+                    throw new ArgumentOutOfRangeException("Queue position is out of bounds.");
+                }
+
+                if (fromPosition == toPosition) return;
+                item = _queue[fromPosition];
             }
 
-            if (fromPosition == toPosition)
+            await _queueRepository.MoveTrackAsync(_guildId, item.QueueItemId, toPosition);
+            lock (_lock)
             {
-                return;
-            }
-
-            var item = _queue[fromPosition];
-            writeTask = _queueRepository.MoveTrackAsync(_guildId, item.QueueItemId, toPosition);
-
-            _queue.RemoveAt(fromPosition);
-            _queue.Insert(toPosition, item);
-
-            // Re-index all positions
-            for (int i = 0; i < _queue.Count; i++)
-            {
-                _queue[i] = _queue[i] with { Position = i };
+                _queue.RemoveAt(fromPosition);
+                _queue.Insert(toPosition, item);
+                ReindexLocked(0);
             }
 
             _logger.LogInformation("Moved track from {FromPos} to {ToPos}: {Title}", fromPosition, toPosition, item.Title);
         }
-
-        await writeTask;
+        finally
+        {
+            _mutationGate.Release();
+        }
     }
 
     /// <summary>
@@ -389,16 +381,23 @@ public class QueueManager : IDisposable
     /// </summary>
     public async Task ClearQueueAsync()
     {
-        Task writeTask;
-        Action? handler;
-        lock (_lock)
-        {
-            writeTask = _queueRepository.ClearQueueAsync(_guildId);
-            _queue.Clear();
-            handler = QueueCleared;
-        }
+        await EnsureInitializedAsync();
 
-        await writeTask;
+        Action? handler;
+        await EnterMutationAsync();
+        try
+        {
+            await _queueRepository.ClearQueueAsync(_guildId);
+            lock (_lock)
+            {
+                _queue.Clear();
+                handler = QueueCleared;
+            }
+        }
+        finally
+        {
+            _mutationGate.Release();
+        }
 
         _logger.LogInformation("Queue cleared.");
         handler?.Invoke();
@@ -412,29 +411,28 @@ public class QueueManager : IDisposable
         await EnsureInitializedAsync();
 
         QueueItem head;
-        Task writeTask;
         Action<QueueItem>? handler;
-
-        lock (_lock)
+        await EnterMutationAsync();
+        try
         {
-            if (_queue.Count == 0)
+            lock (_lock)
             {
-                return null;
+                if (_queue.Count == 0) return null;
+                head = _queue[0];
             }
 
-            head = _queue[0];
-            writeTask = _queueRepository.RemoveTrackAsync(head.QueueItemId);
-
-            _queue.RemoveAt(0);
-            for (int i = 0; i < _queue.Count; i++)
+            await _queueRepository.RemoveTrackAsync(head.QueueItemId);
+            lock (_lock)
             {
-                _queue[i] = _queue[i] with { Position = i };
+                _queue.RemoveAt(0);
+                ReindexLocked(0);
+                handler = TrackRemoved;
             }
-
-            handler = TrackRemoved;
         }
-
-        await writeTask;
+        finally
+        {
+            _mutationGate.Release();
+        }
 
         _logger.LogInformation("Dequeued track: {Title}", head.Title);
         handler?.Invoke(head);
@@ -447,7 +445,7 @@ public class QueueManager : IDisposable
     /// queue caps — PRD §7 frames /previous as an unconditional DJ rewind,
     /// so it shouldn't be rejected just because the queue happens to be full.
     /// </summary>
-    public virtual async Task RequeueFrontAsync(QueueItem item)
+    public virtual async Task RequeueFrontAsync(QueueItem item, bool notify = true)
     {
         await EnsureInitializedAsync();
 
@@ -466,56 +464,35 @@ public class QueueManager : IDisposable
             CorrelationId = correlationId
         };
 
-        Task<long> addTask;
-        int lastPos;
-        lock (_lock)
-        {
-            lastPos = _queue.Count;
-            addTask = _queueRepository.AddTrackAsync(fresh);
-            _queue.Add(fresh with { Position = lastPos });
-        }
-
-        long newId = await addTask;
-
-        // Backfill the row id and move it to the front atomically under one lock.
-        // The position captured before the await (lastPos) can be stale — a
-        // concurrent Dequeue/Remove may have shifted the queue while addTask was in
-        // flight — so locate the row by id now and move by id, never by the stale
-        // position (which could be out of bounds or point at a different track).
-        Task moveTask = Task.CompletedTask;
         QueueItem finalItem;
         Action<QueueItem>? handler;
-        lock (_lock)
+        await EnterMutationAsync();
+        try
         {
-            int idx = _queue.FindIndex(q => q.QueueItemId == 0 && q.CorrelationId == correlationId);
-            if (idx >= 0)
+            long newId = await _queueRepository.AddTrackAtFrontAsync(fresh);
+            finalItem = fresh with { QueueItemId = newId, Position = 0 };
+            lock (_lock)
             {
-                _queue[idx] = _queue[idx] with { QueueItemId = newId };
+                _queue.Insert(0, finalItem);
+                ReindexLocked(1);
+                handler = TrackQueued;
             }
-
-            if (idx > 0)
-            {
-                var moving = _queue[idx];
-                _queue.RemoveAt(idx);
-                _queue.Insert(0, moving);
-                for (int i = 0; i < _queue.Count; i++)
-                {
-                    _queue[i] = _queue[i] with { Position = i };
-                }
-                // Repo write only enqueues to the channel, safe under the lock.
-                moveTask = _queueRepository.MoveTrackAsync(_guildId, newId, 0);
-            }
-
-            int finalIdx = _queue.FindIndex(q => q.QueueItemId == newId);
-            finalItem = finalIdx >= 0
-                ? _queue[finalIdx]
-                : fresh with { QueueItemId = newId, Position = 0 };
-            handler = TrackQueued;
+        }
+        finally
+        {
+            _mutationGate.Release();
         }
 
-        await moveTask;
+        if (notify) handler?.Invoke(finalItem);
+    }
 
-        handler?.Invoke(finalItem);
+    /// <summary>Reassigns dense in-memory positions. Caller holds <see cref="_lock"/>.</summary>
+    private void ReindexLocked(int startIndex)
+    {
+        for (int i = startIndex; i < _queue.Count; i++)
+        {
+            _queue[i] = _queue[i] with { Position = i };
+        }
     }
 
     /// <summary>
@@ -523,7 +500,16 @@ public class QueueManager : IDisposable
     /// </summary>
     public async Task SaveSnapshotAsync(string savedByUserId)
     {
-        await _snapshotRepository.SaveSnapshotAsync(_guildId, savedByUserId);
+        await EnsureInitializedAsync();
+        await EnterMutationAsync();
+        try
+        {
+            await _snapshotRepository.SaveSnapshotAsync(_guildId, savedByUserId);
+        }
+        finally
+        {
+            _mutationGate.Release();
+        }
         _logger.LogInformation("Saved snapshot of queue for user {UserId}.", savedByUserId);
         SnapshotSaved?.Invoke();
     }
@@ -532,34 +518,78 @@ public class QueueManager : IDisposable
     /// Restores a previously saved snapshot.
     /// Returns the restored playback state.
     /// </summary>
+    public async Task<bool> HasSnapshotAsync()
+    {
+        ThrowIfRetired();
+        return await _snapshotRepository.HasSnapshotAsync(_guildId);
+    }
+
     public async Task<PlaybackState?> RestoreSnapshotAsync()
     {
-        var restored = await _snapshotRepository.RestoreSnapshotAsync(_guildId);
-        if (restored == null)
-        {
-            return null;
-        }
-
+        await EnsureInitializedAsync();
+        (PlaybackState PlaybackState, List<QueueItem> QueueItems)? restored;
         Action? handler;
         int restoredCount;
-        lock (_lock)
+        await EnterMutationAsync();
+        try
         {
-            _queue.Clear();
-            _queue.AddRange(restored.Value.QueueItems);
-            restoredCount = _queue.Count;
-            handler = SnapshotRestored;
+            restored = await _snapshotRepository.RestoreSnapshotAsync(_guildId);
+            if (restored == null) return null;
+
+            lock (_lock)
+            {
+                _queue.Clear();
+                _queue.AddRange(restored.Value.QueueItems);
+                restoredCount = _queue.Count;
+                handler = SnapshotRestored;
+            }
+            _initialized = true;
+        }
+        finally
+        {
+            _mutationGate.Release();
         }
 
-        _initialized = true;
         _logger.LogInformation("Restored snapshot with {Count} tracks.", restoredCount);
         handler?.Invoke();
 
         return restored.Value.PlaybackState;
     }
 
-    /// <summary>Disposes the hydration gate. Called when the guild is evicted.</summary>
+    /// <summary>
+    /// Waits for any accepted mutation to finish, then rejects all future work
+    /// through this manager. Tenant suspension calls this before eviction so a
+    /// rapid re-admit cannot overlap an old manager's delayed write.
+    /// </summary>
+    public async Task RetireAsync()
+    {
+        await _initGate.WaitAsync();
+        try
+        {
+            await _mutationGate.WaitAsync();
+            try
+            {
+                _retired = true;
+            }
+            finally
+            {
+                _mutationGate.Release();
+            }
+        }
+        finally
+        {
+            _initGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Eviction drops the registry's ownership of this manager. The coordination
+    /// semaphores are intentionally left for GC: a command that resolved the
+    /// manager immediately before suspension may still be unwinding and must be
+    /// able to release its gate without an ObjectDisposedException.
+    /// </summary>
     public void Dispose()
     {
-        _initGate.Dispose();
+        _retired = true;
     }
 }

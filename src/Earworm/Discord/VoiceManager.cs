@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -28,8 +30,61 @@ public sealed class VoiceManager : IDisposable
     private readonly ILogger<VoiceManager> _logger;
     private readonly ShutdownLifetime _shutdown;
 
-    private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _emptyChannelTimers = new();
-    private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _idleTimers = new();
+    private readonly ConcurrentDictionary<ulong, TimerRegistration> _emptyChannelTimers = new();
+    private readonly ConcurrentDictionary<ulong, TimerRegistration> _idleTimers = new();
+    private readonly ConcurrentDictionary<ulong, byte> _blockedTimerGuilds = new();
+    private readonly object _joinTimerBlocksLock = new();
+    private readonly Dictionary<ulong, int> _joinTimerBlocks = new();
+
+    private sealed class TimerRegistration
+    {
+        private const int Pending = 0;
+        private const int Expiring = 1;
+        private const int Cancelled = 2;
+
+        private readonly CancellationTokenSource _cancellation;
+        private readonly TaskCompletionSource _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _state;
+        private int _completed;
+
+        public TimerRegistration(CancellationToken shutdownToken)
+        {
+            _cancellation = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+        }
+
+        public CancellationToken Token => _cancellation.Token;
+        public Task Completion => _completion.Task;
+        public bool IsCancelled => Volatile.Read(ref _state) == Cancelled;
+
+        public bool TryClaimExpiry() =>
+            Interlocked.CompareExchange(ref _state, Expiring, Pending) == Pending;
+
+        /// <summary>
+        /// Cancels a timer that has not started its expiry action. If expiry
+        /// already won the race, the caller must await <see cref="Completion"/>
+        /// before allowing a replacement guild generation to start.
+        /// </summary>
+        public bool Cancel()
+        {
+            int previous = Interlocked.CompareExchange(ref _state, Cancelled, Pending);
+            if (previous == Pending || previous == Cancelled)
+            {
+                try { _cancellation.Cancel(); }
+                catch (ObjectDisposedException) { }
+                return true;
+            }
+
+            return false;
+        }
+
+        public void Complete()
+        {
+            if (Interlocked.Exchange(ref _completed, 1) != 0) return;
+            _completion.TrySetResult();
+            _cancellation.Dispose();
+        }
+    }
 
     public VoiceManager(
         DiscordClient discordClient,
@@ -56,7 +111,7 @@ public sealed class VoiceManager : IDisposable
         _playerEngines.AddInitializer(engine =>
         {
             engine.TrackStarted += OnTrackStarted;
-            engine.TrackEnded += OnTrackEnded;
+            engine.PlaybackBecameIdle += OnPlaybackBecameIdle;
         });
         _discordClient.VoiceStateUpdated += OnVoiceStateUpdatedAsync;
     }
@@ -74,26 +129,76 @@ public sealed class VoiceManager : IDisposable
         _logger.LogInformation("Joining voice channel {ChannelName} ({ChannelId}) in guild {GuildId} via Lavalink.",
             channel.Name, channel.Id, channel.Guild.Id);
 
-        var retrieveOptions = new PlayerRetrieveOptions(ChannelBehavior: PlayerChannelBehavior.Join);
-        var playerOptions = new LavalinkPlayerOptions();
+        var guildId = channel.Guild.Id.ToString();
+        // Resolve the tenant-owned engine before creating a Lavalink player so
+        // a guild already blocked by suspension cannot reconnect to voice.
+        var engine = _playerEngines.GetOrCreate(guildId);
 
-        var result = await _audioService.Players.RetrieveAsync<LavalinkPlayer, LavalinkPlayerOptions>(
-            channel.Guild.Id,
-            channel.Id,
-            playerFactory: PlayerFactory.Default,
-            options: Options.Create(playerOptions),
-            retrieveOptions: retrieveOptions);
-
-        if (!result.IsSuccess)
+        // Prevent timer publication and expiry across the whole replacement
+        // window. A timer that already claimed expiry is drained before the
+        // Lavalink player is retrieved, so it cannot disconnect the new player.
+        // This is a separate, reference-counted block from tenant suspension;
+        // releasing it can never accidentally re-enable a suspended tenant.
+        BeginJoinTimerBlock(channel.Guild.Id);
+        try
         {
-            var msg = result.Status switch
+            await DrainGuildTimersForJoinAsync(channel.Guild.Id);
+
+            var retrieveOptions = new PlayerRetrieveOptions(ChannelBehavior: PlayerChannelBehavior.Join);
+            var playerOptions = new LavalinkPlayerOptions();
+
+            var result = await _audioService.Players.RetrieveAsync<LavalinkPlayer, LavalinkPlayerOptions>(
+                channel.Guild.Id,
+                channel.Id,
+                playerFactory: PlayerFactory.Default,
+                options: Options.Create(playerOptions),
+                retrieveOptions: retrieveOptions);
+
+            if (!result.IsSuccess)
             {
-                PlayerRetrieveStatus.UserNotInVoiceChannel => "User isn't in a voice channel.",
-                PlayerRetrieveStatus.BotNotConnected => "Bot isn't connected.",
-                PlayerRetrieveStatus.VoiceChannelMismatch => "Bot is in a different voice channel.",
-                _ => $"Could not retrieve player: {result.Status}"
-            };
-            throw new InvalidOperationException(msg);
+                var msg = result.Status switch
+                {
+                    PlayerRetrieveStatus.UserNotInVoiceChannel => "User isn't in a voice channel.",
+                    PlayerRetrieveStatus.BotNotConnected => "Bot isn't connected.",
+                    PlayerRetrieveStatus.VoiceChannelMismatch => "Bot is in a different voice channel.",
+                    _ => $"Could not retrieve player: {result.Status}"
+                };
+                throw new InvalidOperationException(msg);
+            }
+
+            // Suspension can race a join that passed the whitelist check just
+            // before access was revoked. Re-check after the network await and tear
+            // down the newly created player instead of leaving a suspended guild
+            // connected after lifecycle cleanup has already run.
+            if (_playerEngines.IsBlocked(guildId))
+            {
+                var blockedPlayer = await _audioService.Players.GetPlayerAsync<LavalinkPlayer>(channel.Guild.Id);
+                if (blockedPlayer != null) await blockedPlayer.DisconnectAsync();
+                throw new GuildAccessBlockedException(guildId);
+            }
+
+            // A suspend followed by a quick re-admit can replace the engine while
+            // RetrieveAsync is pending. Always continue through the registry's
+            // current generation rather than a canceled/evicted instance captured
+            // before the await.
+            try
+            {
+                engine = _playerEngines.GetOrCreate(guildId);
+            }
+            catch (GuildAccessBlockedException)
+            {
+                var blockedPlayer = await _audioService.Players.GetPlayerAsync<LavalinkPlayer>(channel.Guild.Id);
+                if (blockedPlayer != null) await blockedPlayer.DisconnectAsync();
+                throw;
+            }
+
+            // Catch a timer that was published just before the temporary block
+            // became visible. No replacement can appear while this drain runs.
+            await DrainGuildTimersForJoinAsync(channel.Guild.Id);
+        }
+        finally
+        {
+            EndJoinTimerBlock(channel.Guild.Id);
         }
 
         _logger.LogInformation("Lavalink player ready for guild {GuildId}.", channel.Guild.Id);
@@ -102,7 +207,7 @@ public sealed class VoiceManager : IDisposable
         CancelIdleTimer(channel.Guild.Id);
         CheckChannelEmptyState(channel);
 
-        await _playerEngines.GetOrCreate(channel.Guild.Id.ToString()).MaybeStartAsync();
+        await engine.MaybeStartAsync();
     }
 
     public async Task LeaveChannelAsync(ulong guildId)
@@ -112,17 +217,55 @@ public sealed class VoiceManager : IDisposable
         CancelEmptyChannelTimer(guildId);
         CancelIdleTimer(guildId);
 
+        Exception? stopFailure = null;
+
         // Only stop an engine that actually exists — don't construct one just to
-        // leave a channel.
+        // leave a channel. A stop failure must not prevent the independent voice
+        // disconnect attempt below.
         if (_playerEngines.TryGet(guildId.ToString(), out var engine))
         {
-            await engine.StopAsync();
+            try
+            {
+                await engine.StopAsync();
+            }
+            catch (Exception ex)
+            {
+                stopFailure = ex;
+                _logger.LogWarning(
+                    ex,
+                    "Failed to stop playback while leaving guild {GuildId}; continuing with voice disconnect.",
+                    guildId);
+            }
         }
 
-        var player = await _audioService.Players.GetPlayerAsync<LavalinkPlayer>(guildId);
-        if (player != null)
+        try
         {
-            await player.DisconnectAsync();
+            var player = await _audioService.Players.GetPlayerAsync<LavalinkPlayer>(guildId);
+            if (player != null)
+            {
+                await player.DisconnectAsync();
+            }
+        }
+        catch (Exception disconnectFailure)
+        {
+            _logger.LogWarning(
+                disconnectFailure,
+                "Failed to disconnect voice while leaving guild {GuildId}.",
+                guildId);
+            if (stopFailure is not null)
+            {
+                throw new AggregateException(
+                    "Playback stop and voice disconnect both failed.",
+                    stopFailure,
+                    disconnectFailure);
+            }
+
+            ExceptionDispatchInfo.Capture(disconnectFailure).Throw();
+        }
+
+        if (stopFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(stopFailure).Throw();
         }
     }
 
@@ -193,36 +336,16 @@ public sealed class VoiceManager : IDisposable
         if (!hasNonBot)
         {
             int graceSeconds = _config.AutoBehavior.EmptyChannelGraceSeconds;
-
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
-            var stored = _emptyChannelTimers.GetOrAdd(guildId, cts);
-            if (!ReferenceEquals(stored, cts))
-            {
-                cts.Dispose();
-                return;
-            }
-
-            _logger.LogInformation("Voice channel empty; starting grace timer of {Seconds}s.", graceSeconds);
-
-            _ = Task.Run(async () =>
-            {
-                try
+            StartTimer(
+                _emptyChannelTimers,
+                guildId,
+                TimeSpan.FromSeconds(graceSeconds),
+                "empty-channel",
+                async () =>
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(graceSeconds), cts.Token);
-                    if (_shutdown.IsShuttingDown) return;
                     _logger.LogInformation("Empty-channel grace expired; auto-disconnecting.");
                     await LeaveChannelAsync(guildId);
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogInformation("Empty-channel timer cancelled for guild {GuildId}.", guildId);
-                }
-                finally
-                {
-                    _emptyChannelTimers.TryRemove(guildId, out _);
-                    cts.Dispose();
-                }
-            }, _shutdown.Token);
+                });
         }
         else
         {
@@ -238,93 +361,222 @@ public sealed class VoiceManager : IDisposable
         }
     }
 
-    private void OnTrackEnded(QueueItem track, bool skipped, string? failureReason)
+    private void OnPlaybackBecameIdle(string guildId)
     {
-        var ct = _shutdown.Token;
-        _ = Task.Run(() =>
+        if (ulong.TryParse(guildId, out ulong numericGuildId))
         {
-            try
-            {
-                ct.ThrowIfCancellationRequested();
-                if (ulong.TryParse(track.GuildId, out ulong guildId))
-                {
-                    if (_queueManagers.GetOrCreate(track.GuildId).Count == 0) StartIdleTimer(guildId);
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                // Shutdown: swallow.
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error checking queue state on TrackEnded.");
-            }
-        }, ct);
+            StartIdleTimer(numericGuildId);
+        }
     }
 
     private void StartIdleTimer(ulong guildId)
     {
         int idleSeconds = _config.AutoBehavior.IdleDisconnectSeconds;
+        StartTimer(
+            _idleTimers,
+            guildId,
+            TimeSpan.FromSeconds(idleSeconds),
+            "idle",
+            async () =>
+            {
+                _logger.LogInformation("Idle timer expired; auto-disconnecting.");
+                await LeaveChannelAsync(guildId);
+            });
+    }
 
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
-        var stored = _idleTimers.GetOrAdd(guildId, cts);
-        if (!ReferenceEquals(stored, cts))
+    private void StartTimer(
+        ConcurrentDictionary<ulong, TimerRegistration> timers,
+        ulong guildId,
+        TimeSpan delay,
+        string timerKind,
+        Func<Task> onExpired)
+    {
+        if (IsTimerBlocked(guildId)) return;
+
+        var registration = new TimerRegistration(_shutdown.Token);
+        while (true)
         {
-            cts.Dispose();
+            if (timers.TryAdd(guildId, registration)) break;
+
+            if (!timers.TryGetValue(guildId, out var existing)) continue;
+            if (existing.IsCancelled)
+            {
+                TryRemoveTimer(timers, guildId, existing);
+                continue;
+            }
+
+            registration.Cancel();
+            registration.Complete();
             return;
         }
 
-        _logger.LogInformation("Queue empty; starting idle disconnect timer of {Seconds}s.", idleSeconds);
-
-        _ = Task.Run(async () =>
+        // Suspension may have begun after the optimistic check above. Do not
+        // publish a worker into a blocked guild generation.
+        if (IsTimerBlocked(guildId))
         {
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(idleSeconds), cts.Token);
-                if (_shutdown.IsShuttingDown) return;
-                _logger.LogInformation("Idle timer expired; auto-disconnecting.");
-                await LeaveChannelAsync(guildId);
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogInformation("Idle timer cancelled for guild {GuildId}.", guildId);
-            }
-            finally
-            {
-                _idleTimers.TryRemove(guildId, out _);
-                cts.Dispose();
-            }
-        }, _shutdown.Token);
+            TryRemoveTimer(timers, guildId, registration);
+            registration.Cancel();
+            registration.Complete();
+            return;
+        }
+
+        _logger.LogInformation(
+            "Starting {TimerKind} disconnect timer of {Seconds}s for guild {GuildId}.",
+            timerKind,
+            delay.TotalSeconds,
+            guildId);
+
+        try
+        {
+            _ = Task.Run(
+                () => RunTimerAsync(timers, guildId, registration, timerKind, delay, onExpired),
+                CancellationToken.None);
+        }
+        catch
+        {
+            TryRemoveTimer(timers, guildId, registration);
+            registration.Cancel();
+            registration.Complete();
+            throw;
+        }
+    }
+
+    private async Task RunTimerAsync(
+        ConcurrentDictionary<ulong, TimerRegistration> timers,
+        ulong guildId,
+        TimerRegistration registration,
+        string timerKind,
+        TimeSpan delay,
+        Func<Task> onExpired)
+    {
+        try
+        {
+            await Task.Delay(delay, registration.Token);
+            if (_shutdown.IsShuttingDown || IsTimerBlocked(guildId)) return;
+            if (!registration.TryClaimExpiry()) return;
+
+            await onExpired();
+        }
+        catch (OperationCanceledException) when (registration.Token.IsCancellationRequested)
+        {
+            _logger.LogInformation("{TimerKind} timer cancelled for guild {GuildId}.", timerKind, guildId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "{TimerKind} timer failed for guild {GuildId}.", timerKind, guildId);
+        }
+        finally
+        {
+            TryRemoveTimer(timers, guildId, registration);
+            registration.Complete();
+        }
+    }
+
+    private static bool TryRemoveTimer(
+        ConcurrentDictionary<ulong, TimerRegistration> timers,
+        ulong guildId,
+        TimerRegistration expected)
+    {
+        // Conditional key+value removal prevents an old timer's finally block
+        // from deleting a replacement installed for the same guild (ABA race).
+        return ((ICollection<KeyValuePair<ulong, TimerRegistration>>)timers)
+            .Remove(new KeyValuePair<ulong, TimerRegistration>(guildId, expected));
     }
 
     private void CancelEmptyChannelTimer(ulong guildId)
     {
-        if (_emptyChannelTimers.TryRemove(guildId, out var cts))
-        {
-            cts.Cancel();
-            cts.Dispose();
-        }
+        if (_emptyChannelTimers.TryGetValue(guildId, out var timer)) timer.Cancel();
     }
 
     private void CancelIdleTimer(ulong guildId)
     {
-        if (_idleTimers.TryRemove(guildId, out var cts))
+        if (_idleTimers.TryGetValue(guildId, out var timer)) timer.Cancel();
+    }
+
+    /// <summary>
+    /// Prevents new timers for a suspended guild, cancels pending timers, and
+    /// waits for any expiry action that already won the race. The tenant
+    /// lifecycle gate keeps re-admission serialized until this drain completes.
+    /// </summary>
+    public async Task CancelGuildTimersAndDrainAsync(ulong guildId)
+    {
+        _blockedTimerGuilds[guildId] = 0;
+
+        await DrainGuildTimersAsync(guildId);
+    }
+
+    /// <summary>
+    /// Drains timer workers that could target a voice session being replaced by
+    /// an explicit join, without preventing future idle/empty timers.
+    /// </summary>
+    public Task DrainGuildTimersForJoinAsync(ulong guildId) => DrainGuildTimersAsync(guildId);
+
+    private async Task DrainGuildTimersAsync(ulong guildId)
+    {
+        while (true)
         {
-            cts.Cancel();
-            cts.Dispose();
+            var completions = new List<Task>(2);
+            if (_emptyChannelTimers.TryGetValue(guildId, out var emptyTimer))
+            {
+                emptyTimer.Cancel();
+                completions.Add(emptyTimer.Completion);
+            }
+            if (_idleTimers.TryGetValue(guildId, out var idleTimer))
+            {
+                idleTimer.Cancel();
+                completions.Add(idleTimer.Completion);
+            }
+
+            if (completions.Count == 0) return;
+            await Task.WhenAll(completions);
         }
     }
+
+    private void BeginJoinTimerBlock(ulong guildId)
+    {
+        lock (_joinTimerBlocksLock)
+        {
+            _joinTimerBlocks.TryGetValue(guildId, out int count);
+            _joinTimerBlocks[guildId] = checked(count + 1);
+        }
+    }
+
+    private void EndJoinTimerBlock(ulong guildId)
+    {
+        lock (_joinTimerBlocksLock)
+        {
+            if (!_joinTimerBlocks.TryGetValue(guildId, out int count)) return;
+            if (count <= 1) _joinTimerBlocks.Remove(guildId);
+            else _joinTimerBlocks[guildId] = count - 1;
+        }
+    }
+
+    private bool IsTimerBlocked(ulong guildId)
+    {
+        if (_blockedTimerGuilds.ContainsKey(guildId)) return true;
+
+        lock (_joinTimerBlocksLock)
+        {
+            return _joinTimerBlocks.ContainsKey(guildId);
+        }
+    }
+
+    /// <summary>Allows timers again after an explicit tenant admission.</summary>
+    public void AllowGuildTimers(ulong guildId) => _blockedTimerGuilds.TryRemove(guildId, out _);
+
+    /// <summary>Blocks timer creation for a tenant already suspended at startup.</summary>
+    public void BlockGuildTimers(ulong guildId) => _blockedTimerGuilds[guildId] = 0;
 
     public void Dispose()
     {
         foreach (var engine in _playerEngines.CreatedInstances())
         {
             engine.TrackStarted -= OnTrackStarted;
-            engine.TrackEnded -= OnTrackEnded;
+            engine.PlaybackBecameIdle -= OnPlaybackBecameIdle;
         }
         _discordClient.VoiceStateUpdated -= OnVoiceStateUpdatedAsync;
 
-        foreach (var t in _emptyChannelTimers.Values) { t.Cancel(); t.Dispose(); }
-        foreach (var t in _idleTimers.Values) { t.Cancel(); t.Dispose(); }
+        foreach (var t in _emptyChannelTimers.Values) t.Cancel();
+        foreach (var t in _idleTimers.Values) t.Cancel();
     }
 }
