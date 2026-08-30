@@ -206,7 +206,7 @@ Lavalink v4 ships without YouTube support — Google made the previous lavaplaye
 
 Plugin versions break whenever YouTube ships new player JS or changes Innertube client requirements. Common symptoms in Lavalink's logs: `Must find sig function from script`, `This video requires login`, `AllClientsFailedException`. The fix is to bump the version (and sometimes the client list) in `application.yml` and restart Lavalink.
 
-Client list (`IOS`, `ANDROID_VR`, `MUSIC`, `TVHTML5_SIMPLY`) is the current recommended set after YouTube's August 2026 SABR / login-wall rollout. WEB and WEBEMBEDDED currently fail anonymously. Different clients have different rate limits and signature requirements; the plugin tries them in order until one works. We temporarily pin a youtube-source `main` snapshot because tagged 1.18.2 predates those client fixes.
+Client list (`TV`, `IOS`, `ANDROID_VR`, `MUSIC`, `TVHTML5_SIMPLY`) is the current recommended set after YouTube's August 2026 SABR / login-wall rollout. `TV` is first because it is the only client that uses youtube-source OAuth. WEB and WEBEMBEDDED currently fail anonymously. Different clients have different rate limits and signature requirements; the plugin tries them in order until one works. We temporarily pin a youtube-source `main` snapshot because tagged 1.18.2 predates those client fixes. OAuth must use a burner Google account; the refresh token stays in the host's `application.yml` and is never committed.
 
 ## DJ TTS delivery
 

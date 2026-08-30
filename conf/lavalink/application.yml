@@ -16,14 +16,19 @@ server:
 plugins:
   youtube:
     enabled: true
-    # August 2026 client mix. WEB / WEBEMBEDDED currently return UNPLAYABLE
-    # ("Video unavailable" / "Video player configuration error"). IOS is the
-    # most reliable anonymous playback client after the Aug 18 version bump;
-    # ANDROID_VR still works on many residential IPs. MUSIC is search-only
-    # (ytmsearch: / YouTube Music links). TVHTML5_SIMPLY is a last-ditch
-    # playback fallback. Revisit when youtube-source cuts a post-1.18.2
-    # release or SABR/poToken support lands.
-    clients: ["IOS", "ANDROID_VR", "MUSIC", "TVHTML5_SIMPLY"]
+    # August 2026 client mix. TV is first because it is the only client that
+    # sends the OAuth token (required to get past YouTube's login wall).
+    # IOS / ANDROID_VR remain anonymous fallbacks; MUSIC is search-only
+    # (ytmsearch: / YouTube Music links). WEB / WEBEMBEDDED currently return
+    # UNPLAYABLE and are omitted. Revisit when youtube-source cuts a
+    # post-1.18.2 release or SABR/poToken support lands.
+    clients: ["TV", "IOS", "ANDROID_VR", "MUSIC", "TVHTML5_SIMPLY"]
+    # YouTube device-code OAuth. Use a burner Google account — never a
+    # primary. After the first successful login, paste refreshToken below
+    # so restarts skip the device-code flow. Do not commit a real token.
+    oauth:
+      enabled: true
+      # refreshToken: "paste the token from Lavalink logs here"
 
 lavalink:
   plugins:
@@ -76,6 +81,8 @@ logging:
   level:
     root: INFO
     lavalink: INFO
+    # Device-code URL + refresh token are logged here on first OAuth login.
+    dev.lavalink.youtube.http.YoutubeOauth2Handler: INFO
   request:
     enabled: true
   logback:

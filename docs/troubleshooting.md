@@ -109,12 +109,35 @@ If the very latest plugin still has the same error, YouTube cut their update ins
 
 #### `This video requires login` / `AllClientsFailedException` / `The page needs to be reloaded`
 
-YouTube is refusing the configured InnerTube clients (login wall, SABR-gated formats with no URL, or a stale TV/iOS client). Check Lavalink logs for per-client failures.
+YouTube is refusing anonymous InnerTube clients. The remaining workaround is **youtube-source OAuth** (a Google device-code login, not Discord login). `TV` is the only client that sends the token; it must be first in `clients`.
 
-1. Confirm `conf/lavalink/application.yml` matches the repo's current plugin pin and `clients` list (`IOS` first as of the August 2026 workaround).
-2. Restart Lavalink so it downloads the new plugin jar. If a persisted plugins volume still serves the old jar, remove the `earworm-lavalink-plugins` volume and start Lavalink again.
-3. WEB / WEBEMBEDDED currently fail anonymously; do not put them first.
-4. If every client still fails on a datacenter IP, the remaining workaround is youtube-source OAuth with a burner Google account (see the plugin README). Residential IPs more often get past ANDROID_VR / IOS.
+**Use a burner Google account, not your primary.** Upstream warns this can get the account terminated.
+
+1. In `conf/lavalink/application.yml` (Unraid: the bind-mounted copy under appdata), confirm:
+
+```yaml
+plugins:
+  youtube:
+    clients: ["TV", "IOS", "ANDROID_VR", "MUSIC", "TVHTML5_SIMPLY"]
+    oauth:
+      enabled: true
+```
+
+and that logging includes `dev.lavalink.youtube.http.YoutubeOauth2Handler: INFO`.
+
+2. Restart Lavalink and watch its logs:
+
+```fish
+docker logs -f earworm-lavalink
+```
+
+You should see a line telling you to open `https://www.youtube.com/activate` (or `google.com/device`) and enter a short code. Complete that in a browser while signed into the **burner** account.
+
+3. After success, Lavalink logs a `refreshToken`. Paste it into `oauth.refreshToken` in `application.yml` and restart Lavalink again so the device-code flow does not repeat. **Do not commit that token.**
+
+4. If the old plugin jar is still loaded, wipe the `earworm-lavalink-plugins` volume and start Lavalink again.
+
+This is not a silver bullet. High traffic can still rate-limit the account, and YouTube can still reject the TV client.
 
 #### `Video unavailable` / `This video is not available`
 
