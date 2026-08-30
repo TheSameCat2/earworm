@@ -16,19 +16,29 @@ server:
 plugins:
   youtube:
     enabled: true
-    # Currently-recommended client mix (May 2026). MUSIC handles YouTube Music
-    # links; ANDROID_VR is the least rate-limited path for general video
-    # playback; WEB + WEBEMBEDDED fall back for cases the mobile clients can't
-    # cover. ANDROID_TESTSUITE is deprecated upstream and dropped.
-    clients: ["MUSIC", "ANDROID_VR", "WEB", "WEBEMBEDDED"]
+    # August 2026 client mix. WEB / WEBEMBEDDED currently return UNPLAYABLE
+    # ("Video unavailable" / "Video player configuration error"). IOS is the
+    # most reliable anonymous playback client after the Aug 18 version bump;
+    # ANDROID_VR still works on many residential IPs. MUSIC is search-only
+    # (ytmsearch: / YouTube Music links). TVHTML5_SIMPLY is a last-ditch
+    # playback fallback. Revisit when youtube-source cuts a post-1.18.2
+    # release or SABR/poToken support lands.
+    clients: ["IOS", "ANDROID_VR", "MUSIC", "TVHTML5_SIMPLY"]
 
 lavalink:
   plugins:
     # youtube-source plugin replaces the legacy YouTube path. Plugin versions
     # break when YouTube ships new player JS — keep this on a recent release
     # and bump when you see "Must find sig function from script" errors.
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"
-      snapshot: false
+    #
+    # 1.18.2 (latest tagged release, Jul 27) does not include the August
+    # Innertube client fixes. Pin the current main snapshot until 1.18.3
+    # (or equivalent) is published, then switch back to a tagged release
+    # and snapshot: false.
+    # Snapshot f45bbb7: IOS playable, iOS client 21.02.35, TV PS4 UA,
+    # contentLength recovery for SABR-fallback formats.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3"
+      snapshot: true
   server:
     password: "${LAVALINK_SERVER_PASSWORD}"
     sources:

@@ -214,7 +214,12 @@ Edit `conf/lavalink/application.yml`:
 ```yaml
 lavalink:
   plugins:
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"  # bump version
+    # tagged release:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
+      snapshot: false
+    # or a main snapshot when the latest tag is behind YouTube:
+    # - dependency: "dev.lavalink.youtube:youtube-plugin:<full-commit-sha>"
+    #   snapshot: true
 ```
 
 Then:
@@ -223,7 +228,17 @@ Then:
 docker compose restart lavalink
 ```
 
-Lavalink re-downloads the new jar on startup.
+Lavalink re-downloads the new jar on startup. If the plugins volume still loads the old jar, wipe it and recreate:
+
+```bash
+docker compose stop lavalink
+docker volume rm <project>_earworm-lavalink-plugins
+docker compose up -d lavalink
+```
+
+Unraid bind-mounts `application.yml` from appdata, so pull the updated file from the repo into `/mnt/user/appdata/earworm/conf/lavalink/application.yml` before restarting Lavalink — a bot image pull alone will not pick this up.
+
+Latest version: https://github.com/lavalink-devs/youtube-source/releases (snapshots: https://maven.lavalink.dev/snapshots)
 
 ### Rotating the Lavalink password
 

@@ -97,14 +97,24 @@ YouTube updated their player JavaScript and the youtube-source plugin doesn't kn
 ```yaml
 lavalink:
   plugins:
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"  # ← bump this
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"  # ← bump this
+      snapshot: false
 ```
 
-Latest version: https://github.com/lavalink-devs/youtube-source/releases
+If the latest tag still fails, pin a `main` snapshot instead (`snapshot: true` and the full commit SHA from https://maven.lavalink.dev/snapshots). Latest tagged version: https://github.com/lavalink-devs/youtube-source/releases
 
-Then `docker restart earworm-lavalink` (or `docker compose restart lavalink`).
+Then `docker restart earworm-lavalink` (or `docker compose restart lavalink`). Unraid hosts also need to copy the updated `application.yml` into appdata — the Lavalink config is bind-mounted, not baked into the bot image.
 
 If the very latest plugin still has the same error, YouTube cut their update inside the plugin authors' response window. Wait for the next plugin release — usually within hours.
+
+#### `This video requires login` / `AllClientsFailedException` / `The page needs to be reloaded`
+
+YouTube is refusing the configured InnerTube clients (login wall, SABR-gated formats with no URL, or a stale TV/iOS client). Check Lavalink logs for per-client failures.
+
+1. Confirm `conf/lavalink/application.yml` matches the repo's current plugin pin and `clients` list (`IOS` first as of the August 2026 workaround).
+2. Restart Lavalink so it downloads the new plugin jar. If a persisted plugins volume still serves the old jar, remove the `earworm-lavalink-plugins` volume and start Lavalink again.
+3. WEB / WEBEMBEDDED currently fail anonymously; do not put them first.
+4. If every client still fails on a datacenter IP, the remaining workaround is youtube-source OAuth with a burner Google account (see the plugin README). Residential IPs more often get past ANDROID_VR / IOS.
 
 #### `Video unavailable` / `This video is not available`
 

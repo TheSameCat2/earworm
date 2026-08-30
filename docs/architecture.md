@@ -204,9 +204,9 @@ Repositories and the process-wide bridges are **singletons**; the per-guild engi
 
 Lavalink v4 ships without YouTube support — Google made the previous lavaplayer YouTube source impossible to keep working. We use the **`youtube-source` plugin** by lavalink-devs, configured in `conf/lavalink/application.yml`.
 
-Plugin versions break whenever YouTube ships new player JS. The symptom is `Must find sig function from script` in Lavalink's logs. The fix is to bump the version in `application.yml` and restart Lavalink — releases come within hours of YouTube's changes.
+Plugin versions break whenever YouTube ships new player JS or changes Innertube client requirements. Common symptoms in Lavalink's logs: `Must find sig function from script`, `This video requires login`, `AllClientsFailedException`. The fix is to bump the version (and sometimes the client list) in `application.yml` and restart Lavalink.
 
-Client list (`MUSIC`, `ANDROID_VR`, `WEB`, `WEBEMBEDDED`) is the current recommended set. Different clients have different rate limits and different signature requirements; the plugin tries them in order until one works.
+Client list (`IOS`, `ANDROID_VR`, `MUSIC`, `TVHTML5_SIMPLY`) is the current recommended set after YouTube's August 2026 SABR / login-wall rollout. WEB and WEBEMBEDDED currently fail anonymously. Different clients have different rate limits and signature requirements; the plugin tries them in order until one works. We temporarily pin a youtube-source `main` snapshot because tagged 1.18.2 predates those client fixes.
 
 ## DJ TTS delivery
 

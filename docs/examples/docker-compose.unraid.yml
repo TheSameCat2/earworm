@@ -31,6 +31,10 @@
 #   - The lavalink plugin jar persists in a docker-managed volume
 #     (earworm-lavalink-plugins). It's regenerable if you nuke it — Lavalink
 #     re-downloads on startup.
+#   - application.yml is bind-mounted from appdata. A bot image pull does
+#     NOT update it. When the YouTube plugin pin or client list changes,
+#     copy the repo file into /mnt/user/appdata/earworm/conf/lavalink/
+#     and restart lavalink (wipe the plugins volume if the old jar sticks).
 #   - The bot's /live and /health endpoints are published to 127.0.0.1:8080.
 #     If you want to monitor from another machine on the LAN, change to
 #     "0.0.0.0:8080:8080" — but consider whether you actually want that
